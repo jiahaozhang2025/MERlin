@@ -1,4 +1,5 @@
 import os
+import subprocess
 import cv2
 import numpy as np
 
@@ -8,7 +9,10 @@ from merlin.util import aberration
 from merlin.util import imagefilters
 from merlin.data import codebook
 
-from csbdeep.models import CARE
+#from csbdeep.models import CARE
+
+from skimage import transform
+from skimage import io
 
 class Preprocess(analysistask.ParallelAnalysisTask):
 
@@ -281,6 +285,220 @@ class DeconvolutionPreprocess(Preprocess):
             self._deconIterations).astype(np.uint16)
         return deconvolvedImage
 
+
+class DeconvolutionPreprocessDW(Preprocess):
+    
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+            super().__init__(dataSet, parameters, analysisName)
+
+            if 'codebook_index' not in self.parameters:
+                self.parameters['codebook_index'] = 0
+            if 'highpass_sigma' not in self.parameters:
+                self.parameters['highpass_sigma'] = 3
+            # turn off save pixel histogram?
+            # this will assume initial scale factors are = 1 in Optimization
+            if 'save_pixel_histogram' not in self.parameters:
+                self.parameters['save_pixel_histogram'] = False
+            
+            self._highPassSigma = self.parameters['highpass_sigma']
+
+            self.warpTask = self.dataSet.load_analysis_task(
+                self.parameters['warp_task'])
+            
+            # here are params for deconwolf
+
+            if 'dw_path' not in self.parameters: 
+                self.parameters['dw_path'] = 'dw' # assumes dw is in path
+                
+            if 'iterations' not in self.parameters:
+                self.parameters['iterations'] = 15
+
+            if 'use_gpu' not in self.parameters:
+                self.parameters['use_gpu'] = True
+
+            if 'tilesize' not in self.parameters:
+                self.parameters['tilesize'] = 1024
+
+            if 'tilepad' not in self.parameters:
+                self.parameters['tilepad'] = 128
+
+            # find all the wavelengths and channels
+            # but only for bits in codebook
+
+            self.bits = self.get_codebook().get_bit_names()
+            self.channels = [self.dataSet.get_data_organization().get_data_channel_for_bit(b) 
+                             for b in self.bits]
+            self.wavelengths = [self.dataSet.get_data_organization().get_data_channel_color(channel) 
+                            for channel in self.channels]
+            self.wavelengths = set(self.wavelengths)
+
+            # make a dictionary of the PSF paths
+            if 'psf_directory' in self.parameters:
+                
+                self.PSF_paths = {}
+                base_path = self.parameters['psf_directory']
+                for wavelength in self.wavelengths:
+                    fpath = os.path.join(base_path, f'PSF_{wavelength}.tif')
+                    if os.path.isfile(fpath):
+                        self.PSF_paths[wavelength] = fpath
+                    else:
+                        raise ValueError(f'could not find PSF_{wavelength}.tif')
+            else:
+                    raise ValueError(f'no PSFs found')
+            
+            if 'remove_conventional_image' not in self.parameters:
+                self.parameters['remove_conventional_image'] = True # saves space
+            
+    def fragment_count(self):
+        return len(self.dataSet.get_fovs())
+
+    def get_estimated_memory(self):
+        return 16384
+
+    def get_estimated_time(self):
+        return 60
+
+    def get_dependencies(self):
+        return [self.parameters['warp_task']]
+
+    def get_codebook(self) -> codebook.Codebook:
+        return self.dataSet.get_codebook(self.parameters['codebook_index'])
+
+    def get_raw_image_name(self, dataChannel: int) -> str:
+        return f"channel_{dataChannel}_fov_"
+    
+    def get_dw_image_name(self, dataChannel: int) -> str:
+        return "dw_" + self.get_raw_image_name(dataChannel)
+
+    def get_raw_image_path(self, dataChannel: int, fov: int) -> str:
+        imageBaseName = f"channel_{dataChannel}_fov_"
+        return self.dataSet._analysis_image_name(
+                self.analysisName, imageBaseName, fov)
+    
+    def get_dw_image_path(self, dataChannel: int, fov: int) -> str:
+        imageBaseName = f"dw_channel_{dataChannel}_fov_"
+        return self.dataSet._analysis_image_name(
+                self.analysisName, imageBaseName, fov)
+
+    def get_processed_image_set(
+            self, fov, zIndex: int = None,
+            chromaticCorrector: aberration.ChromaticCorrector = None
+    ) -> np.ndarray:
+        
+        if zIndex is None:
+            return np.array([[self.get_processed_image(
+                fov, self.dataSet.get_data_organization()
+                    .get_data_channel_for_bit(b), zIndex, chromaticCorrector)
+                for zIndex in range(len(self.dataSet.get_z_positions()))]
+                for b in self.get_codebook().get_bit_names()])
+        else:
+            return np.array([self.get_processed_image(
+                fov, self.dataSet.get_data_organization()
+                    .get_data_channel_for_bit(b), zIndex, chromaticCorrector)
+                    for b in self.get_codebook().get_bit_names()])
+
+    def get_processed_image(
+            self, fov: int, dataChannel: int, zIndex: int,
+            chromaticCorrector: aberration.ChromaticCorrector = None) -> np.ndarray:
+
+        imagePath = self.get_dw_image_path(dataChannel, fov)
+        inputImage = self.dataSet.load_image(imagePath, zIndex, transform = False) # images are already transformed
+
+        transformation = self.warpTask.get_transformation(fov, dataChannel)
+
+        # this is from the warp class
+        if chromaticCorrector is not None:
+            imageColor = self.dataSet.get_data_organization()\
+                            .get_data_channel_color(dataChannel)
+            outputImage =  transform.warp(chromaticCorrector.transform_image(
+                inputImage, imageColor), transformation, preserve_range=True
+                ).astype(inputImage.dtype)
+        else:
+            outputImage = transform.warp(inputImage, transformation,
+                                  preserve_range=True).astype(inputImage.dtype)
+
+        # here is where the high pass happens
+        outputImage = self._high_pass_filter(outputImage)
+
+        return outputImage
+        
+    def _high_pass_filter(self, inputImage: np.ndarray) -> np.ndarray:
+        highPassFilterSize = int(2 * np.ceil(2 * self._highPassSigma) + 1)
+        hpImage = imagefilters.high_pass_filter(inputImage,
+                                                highPassFilterSize,
+                                                self._highPassSigma)
+        return hpImage.astype(np.float32) # does this need to be cast?
+    
+    def _run_analysis(self, fragmentIndex):
+
+        # define these for later
+        histogramBins = np.arange(0, np.iinfo(np.uint16).max, 1)
+        pixelHistogram = np.zeros(
+                        (self.get_codebook().get_bit_count(), len(histogramBins)-1))
+
+        for bi, b in enumerate(self.bits): # this will only do bits in the codebook
+            dataChannel = self.dataSet.get_data_organization().get_data_channel_for_bit(b)
+            wavelength = self.dataSet.get_data_organization().get_data_channel_color(dataChannel)
+            
+            # first write the raw image zstacks to disk
+            with self.dataSet.writer_for_analysis_images(
+                     self.analysisName,
+                     self.get_raw_image_name(dataChannel), 
+                     fragmentIndex) as outputTif:
+                
+                for zPosition in self.dataSet.get_z_positions():
+                        frame = self.dataSet.get_raw_image(dataChannel, fragmentIndex, zPosition)
+                        outputTif.save(frame, photometric='MINISBLACK')
+
+            # this is the path of the image that was just saved
+            inputImagePath = self.get_raw_image_path(dataChannel, fragmentIndex)
+
+            # compose the dw command
+            dw_command = []
+            dw_command.append(self.parameters['dw_path'])
+            dw_command.append('--iter')
+            dw_command.append(str(self.parameters['iterations']))
+            if self.parameters['use_gpu']:
+                dw_command.append('--gpu')
+            dw_command.append('--overwrite')
+            dw_command.append('--float') # this may be important so the image is not scaled funny...
+            dw_command.append('--tilesize')
+            dw_command.append(str(self.parameters['tilesize']))
+            dw_command.append('--tilepad')
+            dw_command.append(str(self.parameters['tilepad']))
+            #dw_command.append('--out') # don't use
+            #dw_command.append(outputImagePath) # don't use
+            dw_command.append(inputImagePath)
+            dw_command.append(self.PSF_paths[wavelength])
+        
+            if True: # for troubleshooting
+                print('running dw command: ' + ' '.join(dw_command))
+
+            # run dw
+            try:
+                ret = subprocess.run(dw_command, check = True)
+            except subprocess.CalledProcessError as e:
+                raise Exception(f'dw error on channel {dataChannel} fov {fragmentIndex}')
+                # I think this is the correct way to pass this up??
+
+            #if ret.returncode != 0:
+            #    raise Exception(f'dw error on channel {dataChannel} fov {fragmentIndex}')
+
+            # remove the conventional image?
+            if self.parameters['remove_conventional_image']:
+                os.remove(inputImagePath)
+        
+            # calculate pixel histogram?
+            if self.parameters['save_pixel_histogram']:
+
+                imagePath = self.get_dw_image_path(dataChannel, fragmentIndex)
+                preprocessedImage = io.imread(imagePath)
+
+                pixelHistogram[bi, :] += np.histogram(
+                                preprocessedImage, bins=histogramBins)[0]
+
+                self._save_pixel_histogram(pixelHistogram, fragmentIndex)
+        
 
 class DeconvolutionPreprocessGuo(DeconvolutionPreprocess):
 
