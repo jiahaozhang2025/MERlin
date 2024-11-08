@@ -181,7 +181,7 @@ class DeconvolutionPreprocess(Preprocess):
         if 'write_preprocessed_images' not in self.parameters:
             self.parameters['write_preprocessed_images'] = False                
         if 'write_preprocessed_FOV' not in self.parameters:
-            self.parameters['write_preprocessed_FOV'] = [-1]
+            self.parameters['write_preprocessed_FOV'] = list(range(self.fragment_count()))
         if 'save_pixel_histogram' not in self.parameters:
             self.parameters['save_pixel_histogram'] = True
 
@@ -236,14 +236,9 @@ class DeconvolutionPreprocess(Preprocess):
         hpImage = imagefilters.high_pass_filter(inputImage,
                                                 highPassFilterSize,
                                                 self._highPassSigma)
-        return hpImage.astype('float16')
+        return hpImage.astype(np.float32)
 
     def _run_analysis(self, fragmentIndex):
-    
-        # fix me - find a better way to specify which fov to export...
-        if self.parameters['write_preprocessed_images']:
-            if self.parameters['write_preprocessed_FOV'] == [-1]:
-                self.parameters['write_preprocessed_FOV'] = self.dataSet.get_fovs()     
             
         if self.parameters['save_pixel_histogram'] or (fragmentIndex in self.parameters['write_preprocessed_FOV']):
     
@@ -255,7 +250,7 @@ class DeconvolutionPreprocess(Preprocess):
                     (self.get_codebook().get_bit_count(), len(histogramBins)-1))
 
                 # this currently only is to calculate the pixel histograms in order
-                # to estimate the initial scale factors. This is likely unnecessary
+                # to estimate the initial scale factors. This is likely unnecessary?
                 
             with self.dataSet.writer_for_analysis_images(
                      self.analysisName, 'preprocessed_images', fragmentIndex) as outputTif:
@@ -263,6 +258,7 @@ class DeconvolutionPreprocess(Preprocess):
                 for bi, b in enumerate(self.get_codebook().get_bit_names()):
                     dataChannel = self.dataSet.get_data_organization()\
                             .get_data_channel_for_bit(b)
+                    
                     for i in range(len(self.dataSet.get_z_positions())):
                         inputImage = warpTask.get_aligned_image(
                                 fragmentIndex, dataChannel, i)
@@ -298,8 +294,14 @@ class DeconvolutionPreprocessDW(Preprocess):
             # turn off save pixel histogram?
             # this will assume initial scale factors are = 1 in Optimization
             if 'save_pixel_histogram' not in self.parameters:
-                self.parameters['save_pixel_histogram'] = False
-            
+                self.parameters['save_pixel_histogram'] = True
+            if 'histogram_bin_max' not in self.parameters:
+                self.parameters['histogram_bin_max'] = 10000000
+                # due to the way scale factors are calculated
+                # we need to bin at integer amounts
+                # for float 32 we would need ridiculous number of bins...
+                # not sure the best way to overcome this for now...
+
             self._highPassSigma = self.parameters['highpass_sigma']
 
             self.warpTask = self.dataSet.load_analysis_task(
@@ -316,11 +318,18 @@ class DeconvolutionPreprocessDW(Preprocess):
             if 'use_gpu' not in self.parameters:
                 self.parameters['use_gpu'] = True
 
+            if 'overwrite' not in self.parameters:
+                # will enable resumable decon
+                self.parameters['overwrite'] = False 
+            
+            """
+            # TURNOFF TILING it seems incompatible with --float...
             if 'tilesize' not in self.parameters:
                 self.parameters['tilesize'] = 1024
 
             if 'tilepad' not in self.parameters:
                 self.parameters['tilepad'] = 128
+            """
 
             # find all the wavelengths and channels
             # but only for bits in codebook
@@ -366,17 +375,14 @@ class DeconvolutionPreprocessDW(Preprocess):
 
     def get_raw_image_name(self, dataChannel: int) -> str:
         return f"channel_{dataChannel}_fov_"
-    
-    def get_dw_image_name(self, dataChannel: int) -> str:
-        return "dw_" + self.get_raw_image_name(dataChannel)
 
     def get_raw_image_path(self, dataChannel: int, fov: int) -> str:
-        imageBaseName = f"channel_{dataChannel}_fov_"
+        imageBaseName = self.get_raw_image_name(dataChannel)
         return self.dataSet._analysis_image_name(
                 self.analysisName, imageBaseName, fov)
     
     def get_dw_image_path(self, dataChannel: int, fov: int) -> str:
-        imageBaseName = f"dw_channel_{dataChannel}_fov_"
+        imageBaseName = "dw_" + self.get_raw_image_name(dataChannel)
         return self.dataSet._analysis_image_name(
                 self.analysisName, imageBaseName, fov)
 
@@ -427,20 +433,23 @@ class DeconvolutionPreprocessDW(Preprocess):
         hpImage = imagefilters.high_pass_filter(inputImage,
                                                 highPassFilterSize,
                                                 self._highPassSigma)
-        return hpImage.astype(np.float32) # does this need to be cast?
+        return hpImage.astype(np.float32)
     
     def _run_analysis(self, fragmentIndex):
-
-        # define these for later
-        histogramBins = np.arange(0, np.iinfo(np.uint16).max, 1)
-        pixelHistogram = np.zeros(
-                        (self.get_codebook().get_bit_count(), len(histogramBins)-1))
 
         for bi, b in enumerate(self.bits): # this will only do bits in the codebook
             dataChannel = self.dataSet.get_data_organization().get_data_channel_for_bit(b)
             wavelength = self.dataSet.get_data_organization().get_data_channel_color(dataChannel)
             
-            # first write the raw image zstacks to disk
+            #  check if the channel is already deconvolved
+            if self.parameters['overwrite'] == False:
+                dw_image_path = self.get_dw_image_path(dataChannel, fragmentIndex)
+                dw_image_name = os.path.split(dw_image_path)[-1]
+                if os.path.exists(dw_image_path):
+                    print(f'found {dw_image_name}, skipping dw on channel {dataChannel}')
+                    continue # skip the loop
+            
+            # write the raw image zstacks to disk
             with self.dataSet.writer_for_analysis_images(
                      self.analysisName,
                      self.get_raw_image_name(dataChannel), 
@@ -460,17 +469,22 @@ class DeconvolutionPreprocessDW(Preprocess):
             dw_command.append(str(self.parameters['iterations']))
             if self.parameters['use_gpu']:
                 dw_command.append('--gpu')
-            dw_command.append('--overwrite')
+            if self.parameters['overwrite']:
+                dw_command.append('--overwrite')
             dw_command.append('--float') # this may be important so the image is not scaled funny...
-            dw_command.append('--tilesize')
-            dw_command.append(str(self.parameters['tilesize']))
-            dw_command.append('--tilepad')
-            dw_command.append(str(self.parameters['tilepad']))
+
+            # turning off tiling, it seems incompatible with the --float option
+            # also scale does not seem to work...
+            #dw_command.append('--tilesize')
+            #dw_command.append(str(self.parameters['tilesize']))
+            #dw_command.append('--tilepad')
+            #dw_command.append(str(self.parameters['tilepad']))
             #dw_command.append('--out') # don't use
             #dw_command.append(outputImagePath) # don't use
+            
             dw_command.append(inputImagePath)
             dw_command.append(self.PSF_paths[wavelength])
-        
+
             if True: # for troubleshooting
                 print('running dw command: ' + ' '.join(dw_command))
 
@@ -479,7 +493,7 @@ class DeconvolutionPreprocessDW(Preprocess):
                 ret = subprocess.run(dw_command, check = True)
             except subprocess.CalledProcessError as e:
                 raise Exception(f'dw error on channel {dataChannel} fov {fragmentIndex}')
-                # I think this is the correct way to pass this up??
+                # I believe this should get caught by the analysistask
 
             #if ret.returncode != 0:
             #    raise Exception(f'dw error on channel {dataChannel} fov {fragmentIndex}')
@@ -488,16 +502,34 @@ class DeconvolutionPreprocessDW(Preprocess):
             if self.parameters['remove_conventional_image']:
                 os.remove(inputImagePath)
         
-            # calculate pixel histogram?
-            if self.parameters['save_pixel_histogram']:
+        # calculate pixel histogram?
+        if self.parameters['save_pixel_histogram']:
+
+            # see note in params about histogram bin max
+            # annoying to calculate this for float32 images
+
+            histogramBins = np.arange(0, self.parameters['histogram_bin_max'], 1)
+            pixelHistogram = np.zeros(
+                            (len(self.bits),
+                             len(histogramBins)-1))
+
+            for bi, b in enumerate(self.bits): # only do bits in the codebook
+                dataChannel = self.dataSet.get_data_organization().get_data_channel_for_bit(b)
 
                 imagePath = self.get_dw_image_path(dataChannel, fragmentIndex)
-                preprocessedImage = io.imread(imagePath)
+                dw_image = io.imread(imagePath)
+                preprocessedImage = np.array([self._high_pass_filter(im) for im in dw_image])
+                # since this is a lot of data and a lot of bins to histogram
+                # do a max projection
+                preprocessedImage = np.amax(preprocessedImage, axis = 0)
 
-                pixelHistogram[bi, :] += np.histogram(
-                                preprocessedImage, bins=histogramBins)[0]
+                # finally do histogram
+                h, _ = np.histogram(preprocessedImage, bins=histogramBins)
 
-                self._save_pixel_histogram(pixelHistogram, fragmentIndex)
+                # write that to the histogram file
+                pixelHistogram[bi, :] = h
+
+            self._save_pixel_histogram(pixelHistogram, fragmentIndex)
         
 
 class DeconvolutionPreprocessGuo(DeconvolutionPreprocess):

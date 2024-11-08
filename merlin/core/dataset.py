@@ -240,6 +240,15 @@ class DataSet(object):
         else:
             return os.sep.join([destPath, imageBaseName+str(imageIndex)+'.tif'])
 
+    def _analysis_zarr_name(self, analysisTask: TaskOrName,
+                             zarrBaseName: str, index: int) -> str:
+        destPath = self.get_analysis_subdirectory(
+                analysisTask, subdirectory='zarrs')
+        if index is None:
+            return os.sep.join([destPath, zarrBaseName + '.zarr'])
+        else:
+            return os.sep.join([destPath, zarrBaseName + str(index)+'.zarr'])
+
     def _analysis_result_save_path(
             self, resultName: str, analysisTask: TaskOrName,
             resultIndex: int=None, subdirectory: str=None,

@@ -116,6 +116,7 @@ class PixelBasedDecoder(object):
         if backgrounds is None:
             backgrounds = self._backgrounds
 
+        # the dimensions are num_bits x image_rows x image_cols
         filteredImages = np.zeros(imageData.shape, dtype= np.float32)
         filterSize = int(2 * np.ceil(2 * lowPassSigma) + 1)
         for i in range(imageData.shape[0]):
@@ -133,13 +134,13 @@ class PixelBasedDecoder(object):
         normalizedPixelTraces = scaledPixelTraces/pixelMagnitudes # this should be a float32 to save a little mem
 
         neighbors = NearestNeighbors(n_neighbors=1, algorithm='ball_tree')
-        neighbors.fit(self._decodingMatrix)
+        neighbors.fit(self._decodingMatrix) # fit takes n_samples x n_features
 
         if decodeMask is None: # decode the full image
 
-            # pass in num_pix x num_bits array
-
+            
             if use_gpu == False:
+                # sklearn kneighbors wants n_queries x n_features
                 distances, indexes = neighbors.kneighbors(
                         normalizedPixelTraces.reshape(normalizedPixelTraces.shape[0], -1).T,
                         return_distance=True)
@@ -159,7 +160,8 @@ class PixelBasedDecoder(object):
                 distances = []
                 indexes = []
                 for idx in range(start, stop, step):
-                    pixels_to_decode = normalizedPixelTraces_flat[:,idx:idx+step]           
+                    pixels_to_decode = normalizedPixelTraces_flat[:,idx:idx+step]
+                    # cdist wants mA x n and mB x n arrays where n is the number of dimensions ie bits      
                     ds, inds = calculate_distances_gpu(pixels_to_decode.T, # .T here or in function?
                                                     self._decodingMatrix)
                     distances.append(ds)
