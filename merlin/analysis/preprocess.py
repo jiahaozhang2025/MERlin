@@ -9,10 +9,13 @@ from merlin.util import aberration
 from merlin.util import imagefilters
 from merlin.data import codebook
 
-#from csbdeep.models import CARE
-
 from skimage import transform
 from skimage import io
+
+try:
+    from csbdeep.models import CARE
+except ImportError:
+    print('CARE package not found - do not use CAREPreprocess')
 
 class Preprocess(analysistask.ParallelAnalysisTask):
 

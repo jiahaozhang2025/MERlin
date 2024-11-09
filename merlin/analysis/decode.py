@@ -147,6 +147,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         imageShape = self.dataSet.get_image_dimensions()
 
         # get decoded image path for a zarr file
+        # this may be easier way to save
         zarr_path = self.dataSet._analysis_zarr_name(self, "decoded", fragmentIndex)
         zarr_out = zarr.open(zarr_path, mode = 'a',
                           shape = (zPositionCount, 3, *imageShape),
@@ -159,9 +160,6 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         if not decode3d:
             #for zIndex in range(zPositions):
             for zIndex, z in enumerate(zPositions):
-                
-                t0 = time.time()
-                print(f'started decoding fov {fragmentIndex} z-plane {zIndex} at {t0}')
 
                 if zIndex in self.decoded_z_planes:
                     print(f'barcodes in zIndex {zIndex} detected. Skipping plane!')
@@ -179,10 +177,6 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                         zarr_out[zIndex,0,:,:] = di
                         zarr_out[zIndex,1,:,:] = pm
                         zarr_out[zIndex,2,:,:] = d
-
-                t1 = time.time()
-                print(f'finished decoding fov {fragmentIndex} zIndex {zIndex} at {t1}')
-                print(f'total time for fov {fragmentIndex} zIndex {zIndex} was {t1-t0}')
 
         if decode3d:
             # here is where we would need to save all the planes in memory
@@ -225,7 +219,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
 
                 del normalizedPixelTraces
                 
-                # leave this in case of 3d decoding
+                # leave this in case for writing 3d decoding data
                 if self.parameters['write_decoded_images'] and (fragmentIndex in self.parameters['write_decoded_FOVs']):
                     self._save_decoded_images(
                         fragmentIndex, zPositionCount, decodedImages, magnitudeImages,
@@ -240,7 +234,6 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             bcDB.write_barcodes(bc, fov=fragmentIndex)
 
     # finding what z planes are already in the barcode file
-    # 
     def _get_decoded_z_planes(self, fragmentIndex):
             if self.parameters['resumable_z_decoding']:
                     print('resumable decoding enabled!\nbarcode files are not emptied!')
@@ -284,12 +277,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             decoder, di, pm, npt, d, fov, zIndex)
         t3 = time.time()
 
-        print(f'time retrieving fov {fov} zindex {zIndex} was {t1-t0}')
-        print(f'time decoding fov {fov} zindex {zIndex} was {t2-t1}')
-        print(f'time extracting fov {fov} zindex {zIndex} was {t3-t2}')
+        print(f'decoding fov {fov} zslice {zIndex}')
+        print(f'time retrieving fov {fov} zindex {zIndex}: {t1-t0}')
+        print(f'time decoding fov {fov} zindex {zIndex}: {t2-t1}')
+        print(f'time extracting fov {fov} zindex {zIndex}: {t3-t2}')
+        print(f'total time in fov {fov} zindex {zIndex}: {t0-t0}')
 
         return di, pm, d
 
+    # leave this for 3d decoding, currently zarr is used for easier resumable decoding
     def _save_decoded_images(self, fov: int, zPositionCount: int,
                              decodedImages: np.ndarray,
                              magnitudeImages: np.ndarray,
@@ -323,11 +319,11 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         minimumArea = self.parameters['minimum_area']
 
         self.get_barcode_database().write_barcodes(
-            pandas.concat([decoder.extract_barcodes_with_index(
-                i, decodedImage, pixelMagnitudes, pixelTraces, distances, fov,
-                self.cropWidth, zIndex, globalTask, minimumArea)
-                for i in range(self.get_codebook().get_barcode_count())]),
-            fov=fov)
+            decoder.extract_barcodes_with_index(
+                decodedImage, pixelMagnitudes, pixelTraces, distances, fov,
+                self.cropWidth, zIndex, globalTask, minimumArea),
+                fov = fov
+                )
 
     def _remove_z_duplicate_barcodes(self, bc):
         bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(

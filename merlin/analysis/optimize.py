@@ -7,6 +7,7 @@ import pandas
 import random
 import pickle
 import os
+import time
 
 from merlin.analysis import decode
 from merlin.util import decoding
@@ -28,7 +29,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         if 'fov_per_iteration' not in self.parameters:
             self.parameters['fov_per_iteration'] = 50
         if 'area_threshold' not in self.parameters:
-            self.parameters['area_threshold'] = 5
+            self.parameters['area_threshold'] = 4
         if 'optimize_background' not in self.parameters:
             self.parameters['optimize_background'] = False
         if 'optimize_chromatic_correction' not in self.parameters:
@@ -39,7 +40,11 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             # set the random seed
             # make sure to set a different one for each optimize
             np.random.seed(self.parameters['random_seed'])
-         
+
+            # save the optimized images
+        if 'write_decoded_images' not in self.parameters:
+            self.parameters['write_decoded_images'] = True
+
         if 'fov_index' in self.parameters:
             logger = self.dataSet.get_logger(self)
             logger.info('Setting fov_per_iteration to length of fov_index')
@@ -47,7 +52,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             self.parameters['fov_per_iteration'] = \
                 len(self.parameters['fov_index'])
         
-        # specify fovs and zindices separately
+        # specify fovs and zIndices separately
         elif ('fovs' in self.parameters) and ('zIndices' in self.parameters):
         
             self.parameters['fov_index'] = []
@@ -136,10 +141,14 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             np.array([fovIndex, zIndex]), 'select_frame', self.analysisName,
             resultIndex=fragmentIndex)
 
+        t0 = time.time()
+
         chromaticCorrector = aberration.RigidChromaticCorrector(
             chromaticTransformations, self.get_reference_color())
         warpedImages = preprocessTask.get_processed_image_set(
             fovIndex, zIndex=zIndex, chromaticCorrector=chromaticCorrector)
+
+        t1 = time.time()
 
         decoder = decoding.PixelBasedDecoder(codebook)
         areaThreshold = self.parameters['area_threshold']
@@ -154,21 +163,28 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                                             backgrounds,
                                             decodeMask = decodeMask,
                                             use_gpu = self.parameters['use_gpu'])
-            
+        
+        t2 = time.time()
+
         refactors, backgrounds, barcodesSeen = \
             decoder.extract_refactors(
                 di, pm, npt, extractBackgrounds=self.parameters[
                     'optimize_background'])
 
+        t3 = time.time()
+
         # TODO this saves the barcodes under fragment instead of fov
         # the barcodedb should be made more general
         cropWidth = self.parameters['crop_width']
+
         self.get_barcode_database().write_barcodes(
-            pandas.concat([decoder.extract_barcodes_with_index(
-                i, di, pm, npt, d, fovIndex, cropWidth,
-                zIndex, minimumArea=areaThreshold)
-                for i in range(codebook.get_barcode_count())]),
-            fov=fragmentIndex)
+            decoder.extract_barcodes_with_index(
+                    di, pm, npt, d, fovIndex, cropWidth,
+                    zIndex, minimumArea=areaThreshold),
+                fov=fragmentIndex)
+        
+        t4 = time.time()
+
         self.dataSet.save_numpy_analysis_result(
             refactors, 'scale_refactors', self.analysisName,
             resultIndex=fragmentIndex)
@@ -178,6 +194,24 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         self.dataSet.save_numpy_analysis_result(
             barcodesSeen, 'barcode_counts', self.analysisName,
             resultIndex=fragmentIndex)
+        
+        # save the decoded image from optimize
+        if self.parameters['write_decoded_images']:
+            imageDescription = self.dataSet.analysis_tiff_description(1, 3)
+            with self.dataSet.writer_for_analysis_images(
+                    self, 'decoded', fragmentIndex) as outputTif:
+                for im in [di, pm, d]:
+                    outputTif.save(im.astype(np.float32),
+                                   photometric='MINISBLACK',
+                                   contiguous=True,
+                                   metadata=imageDescription)
+
+        print(f'optimize fragment {fragmentIndex} fov {fovIndex} zIndex {zIndex}')
+        print(f'time fetching images: {t1-t0}')
+        print(f'time decoding images: {t2-t1}')
+        print(f'time extracting refactors: {t3-t2}')
+        print(f'time extracing barcodes: {t4-t3}')
+        print(f'total time in optimize{fragmentIndex}: {t4-t0}')
 
     def _get_used_colors(self) -> List[str]:
         dataOrganization = self.dataSet.get_data_organization()
@@ -562,10 +596,9 @@ class OptimizeIterationFOV(OptimizeIteration):
         # the barcodedb should be made more general
         cropWidth = self.parameters['crop_width']
         self.get_barcode_database().write_barcodes(
-            pandas.concat([decoder.extract_barcodes_with_index(
-                i, di, pm, npt, d, fovIndex, cropWidth,
-                zIndex, minimumArea=areaThreshold)
-                for i in range(codebook.get_barcode_count())]),
+            decoder.extract_barcodes_with_index(
+                di, pm, npt, d, fovIndex, cropWidth,
+                zIndex, minimumArea=areaThreshold),
             fov=fragmentIndex)
         self.dataSet.save_numpy_analysis_result(
             refactors, 'scale_refactors', self.analysisName,
