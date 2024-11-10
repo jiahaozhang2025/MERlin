@@ -326,8 +326,13 @@ class PixelBasedDecoder(object):
                     properties = ('area', 'intensity_mean'), # for some reason you cannot call intensity_mean alone
                     cache = False)
 
-        for i in range(npt.shape[-1]):
-            df[f'intensity_{i}'] = properties_npt[f'intensity_mean-{i}'].astype(np.float32)
+        # make a dataframe of the pixel intensities
+        columnNames_intensity = [f'intensity_{i}' for i in range(npt.shape[-1])]
+        df_npt = pandas.DataFrame(np.array(list(properties_npt.values()))[1:].T,
+                     columns = columnNames_intensity)
+
+        # better this way if there are many bits...
+        df = pandas.concat([df, df_npt], axis = 1)
 
         # finally filter with cropwidth
         df = df[(df['x'].between(cropWidth, decodedImage.shape[0] - cropWidth)) &
