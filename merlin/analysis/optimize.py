@@ -541,6 +541,9 @@ class OptimizeIterationFOV(OptimizeIteration):
             self.parameters['optimize_chromatic_correction'] = False
         if 'crop_width' not in self.parameters:
             self.parameters['crop_width'] = 50
+        if 'distance_threshold' not in self.parameters:
+            self.parameters['distance_threshold'] = 0.5176 # this is the default of decoder
+            # maybe should make it bigger?
         if 'z_index' not in self.parameters:
             zpos = self.dataSet.get_data_organization().get_z_positions()
             self.parameters['z_index'] = int(len(zpos)/2)
@@ -584,8 +587,12 @@ class OptimizeIterationFOV(OptimizeIteration):
         decoder = decoding.PixelBasedDecoder(codebook)
         areaThreshold = self.parameters['area_threshold']
         decoder.refactorAreaThreshold = areaThreshold
-        di, pm, npt, d = decoder.decode_pixels(warpedImages, scaleFactors,
-                                               backgrounds)
+        # is it smart to put distance threshold in optimize?
+        di, pm, npt, d = decoder.decode_pixels(warpedImages, 
+                                               scaleFactors,
+                                               backgrounds,
+                                               self.parameters['distance_threshold']
+                                               )
 
         refactors, backgrounds, barcodesSeen = \
             decoder.extract_refactors(
