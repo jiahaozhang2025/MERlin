@@ -3,6 +3,7 @@ import json
 import shutil
 import pandas
 import numpy as np
+import scipy as sp
 import tifffile
 import importlib
 import time
@@ -538,11 +539,18 @@ class DataSet(object):
 
     def load_numpy_analysis_result(
             self, resultName: str, analysisName: str, resultIndex: int = None,
-            subdirectory: str = None) -> np.array:
+            subdirectory: str = None, fileExtension: str = '.npy') -> np.array:
 
         savePath = self._analysis_result_save_path(
-                resultName, analysisName, resultIndex, subdirectory, '.npy')
-        return np.load(savePath, allow_pickle=True)
+                resultName, analysisName, resultIndex, subdirectory, fileExtension)
+        
+        if fileExtension == '.npy':
+            return np.load(savePath, allow_pickle=True)
+        # enable sparse matrix loading
+        elif fileExtension == '.npz':
+            return sp.sparse.load_npz(savePath)
+        else:
+            raise Exception(f"unrecognized numpy file extension: {fileExtension}")
 
     def load_numpy_analysis_result_if_available(
             self, resultName: str, analysisName: str, defaultValue,

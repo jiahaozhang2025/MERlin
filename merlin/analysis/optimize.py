@@ -1,4 +1,5 @@
 import numpy as np
+import scipy as sp
 import itertools
 from skimage import transform
 from typing import Dict
@@ -226,18 +227,20 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         bitCount = self.get_codebook().get_bit_count()
 
         # from Rongxin - setting initial scale factors = 1 if no pixel histograms
+        initialScaleFactors = np.ones(bitCount, dtype = np.float32)
+
         if preprocessTask.parameters['save_pixel_histogram']:
-            initialScaleFactors = np.zeros(bitCount)
             pixelHistograms = preprocessTask.get_pixel_histogram()
             for i in range(bitCount):
-                cumulativeHistogram = np.cumsum(pixelHistograms[i])
+                h = pixelHistograms[i]
+                if isinstance(h, sp.sparse.spmatrix): # allow for sparse matrix
+                    h = h.toarray()
+                cumulativeHistogram = np.cumsum(h)
                 cumulativeHistogram = cumulativeHistogram/cumulativeHistogram[-1]
                 # Add two to match matlab code.
                 # TODO: Does +2 make sense? Used to be consistent with Matlab code
                 initialScaleFactors[i] = \
                     np.argmin(np.abs(cumulativeHistogram-0.9)) + 2
-        else:
-            initialScaleFactors = np.ones(bitCount, dtype = np.float32)
             
         return initialScaleFactors
 
