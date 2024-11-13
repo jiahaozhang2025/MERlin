@@ -281,7 +281,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         print(f'time retrieving fov {fov} zindex {zIndex}: {t1-t0}')
         print(f'time decoding fov {fov} zindex {zIndex}: {t2-t1}')
         print(f'time extracting fov {fov} zindex {zIndex}: {t3-t2}')
-        print(f'total time in fov {fov} zindex {zIndex}: {t0-t0}')
+        print(f'total time in fov {fov} zindex {zIndex}: {t3-t0}')
 
         return di, pm, d
 
