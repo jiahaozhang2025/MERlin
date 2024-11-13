@@ -2,6 +2,7 @@ import os
 import subprocess
 import cv2
 import numpy as np
+import scipy as sp
 
 from merlin.core import analysistask
 from merlin.util import deconvolve
@@ -11,11 +12,6 @@ from merlin.data import codebook
 
 from skimage import transform
 from skimage import io
-
-try:
-    from csbdeep.models import CARE
-except ImportError:
-    print('CARE package not found - do not use CAREPreprocess')
 
 class Preprocess(analysistask.ParallelAnalysisTask):
 
@@ -47,6 +43,13 @@ class Preprocess(analysistask.ParallelAnalysisTask):
 class CAREPreprocess(Preprocess):
     def __init__(self, dataSet, parameters=None, analysisName=None):
             super().__init__(dataSet, parameters, analysisName)
+
+            # do lazy import since this is slow to load...
+            try:
+                from csbdeep.models import CARE
+            except ImportError:
+                raise ImportError('***CARE package (csbdeep.models.CARE) not found***')
+
 
             if 'CARE_model_directory' not in self.parameters:
                 raise ValueError('CARE model path not in parameters')
@@ -510,11 +513,12 @@ class DeconvolutionPreprocessDW(Preprocess):
 
             # see note in params about histogram bin max
             # annoying to calculate this for float32 images
+            # but may be necessary since thats what dw should output
 
             histogramBins = np.arange(0, self.parameters['histogram_bin_max'], 1)
             pixelHistogram = np.zeros(
                             (len(self.bits),
-                             len(histogramBins)-1))
+                             len(histogramBins)-1), np.int32)
 
             for bi, b in enumerate(self.bits): # only do bits in the codebook
                 dataChannel = self.dataSet.get_data_organization().get_data_channel_for_bit(b)
@@ -533,7 +537,18 @@ class DeconvolutionPreprocessDW(Preprocess):
                 pixelHistogram[bi, :] = h
 
             self._save_pixel_histogram(pixelHistogram, fragmentIndex)
-        
+
+    def _save_pixel_histogram(self, histogram, fov):
+        # get a save path
+        savePath = self.dataSet._analysis_result_save_path(
+                'pixel_histogram', 
+                self.analysisName, 
+                fov, 
+                'histograms',
+                '.npz')
+        # convert to spares matrix
+        sparse_matrix = sp.sparse.csr_matrix(histogram)
+        sp.sparse.save_npz(savePath, sparse_matrix)
 
 class DeconvolutionPreprocessGuo(DeconvolutionPreprocess):
 
