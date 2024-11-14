@@ -77,7 +77,7 @@ def remove_zplane_duplicates_single_barcodeid(barcodes: pd.DataFrame,
     graph.add_nodes_from(barcodes.index.values.tolist())
     for z in range(0, len(zPos)):
         zToCompare = [pos for pos, otherZ in enumerate(zPos) if
-                      (pos >= z - zPlanes) & (pos <= z + zPlanes) & ~(pos == z)]
+                      (pos >= z - zPlanes) & (pos <= z + zPlanes) & (pos != z)] # & ~(pos == z)] apparently ~ is depreciated
         treeBC = barcodes[barcodes['z'] == z]
         if len(treeBC) == 0:
             pass

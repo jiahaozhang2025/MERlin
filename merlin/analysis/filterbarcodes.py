@@ -4,6 +4,7 @@ from scipy import optimize
 
 from merlin.core import analysistask
 from merlin.analysis import decode
+from merlin.util import barcodefilters
 
 
 class AbstractFilterBarcodes(decode.BarcodeSavingParallelAnalysisTask):
@@ -338,6 +339,14 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         if 'misidentification_rate' not in self.parameters:
             self.parameters['misidentification_rate'] = 0.05
 
+        if 'remove_z_duplicated_barcodes' not in self.parameters:
+            self.parameters['remove_z_duplicated_barcodes'] = False
+        if self.parameters['remove_z_duplicated_barcodes']:
+            if 'z_duplicate_zPlane_threshold' not in self.parameters:
+                self.parameters['z_duplicate_zPlane_threshold'] = 1
+            if 'z_duplicate_xy_pixel_threshold' not in self.parameters:
+                self.parameters['z_duplicate_xy_pixel_threshold'] = np.sqrt(2)
+
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
 
@@ -372,9 +381,27 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         bcDatabase = self.get_barcode_database()
         currentBarcodes = decodeTask.get_barcode_database()\
             .get_barcodes(fragmentIndex)
+        
+        currentBarcodes = adaptiveTask.extract_barcodes_with_threshold(
+            threshold, currentBarcodes)
+        
+        # do z duplicates after adaptive threshold
+        if self.parameters['remove_z_duplicated_barcodes']:
+            currentBarcodes = self._remove_z_duplicate_barcodes(currentBarcodes)
 
-        bcDatabase.write_barcodes(adaptiveTask.extract_barcodes_with_threshold(
-            threshold, currentBarcodes), fov=fragmentIndex)
+        bcDatabase.write_barcodes(currentBarcodes, fov=fragmentIndex)
+
+
+
+    # lets expose this filtering here, it feels more natural than in decode
+    # I don't want to waste time filtering during the decode step with gpu nodes
+    # same function from decode.py
+    def _remove_z_duplicate_barcodes(self, bc):
+        bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(
+            bc, self.parameters['z_duplicate_zPlane_threshold'],
+            self.parameters['z_duplicate_xy_pixel_threshold'],
+            self.dataSet.get_z_positions())
+        return bc
 
 
 class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
