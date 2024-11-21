@@ -267,17 +267,11 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
     def _get_previous_chromatic_transformations(self)\
             -> Dict[str, Dict[str, transform.SimilarityTransform]]:
         
-        # I believe this should only apply for the first optimization round where previous is not specified
-        if 'previous_iteration' not in self.parameters:
-            usedColors = self._get_used_colors()
-            return {u: {v: transform.SimilarityTransform()
-                        for v in usedColors if v >= u} for u in usedColors}
-        
-        # try to load in a pre-corrected chromatic transformation
+        # try to load in a pre-corrected chromatic transformation first
         # and save it as the chromatic_corrections.pkl file
         # this should avoid doing the majority of the work in _get_chromatic_transformations()
         # however make sure to have parameters['optimize_chromatic_correction'] = true
-        elif 'chromatic_correction_file' in self.parameters:
+        if 'chromatic_correction_file' in self.parameters:
             with open(self.parameters['chromatic_correction_file'], 'rb') as f:
                 chromaticTransformations = pickle.load(f)
             # is it necessary to save?
@@ -288,6 +282,12 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                     chromaticTransformations, 'chromatic_corrections', self.analysisName)
                     
             return chromaticTransformations
+        
+        # I believe this should only apply for the first optimization round where it is not specified
+        if 'previous_iteration' not in self.parameters:
+            usedColors = self._get_used_colors()
+            return {u: {v: transform.SimilarityTransform()
+                        for v in usedColors if v >= u} for u in usedColors}
         
         # this is a time consuming step... see above
         else:
