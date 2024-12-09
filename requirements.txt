@@ -7,7 +7,7 @@ h5py
 matplotlib
 networkx>=3.0
 numexpr
-numpy
+numpy==1.26.4
 opencv-python
 pandas
 pyclustering
