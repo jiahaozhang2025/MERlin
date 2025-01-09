@@ -80,6 +80,7 @@ class GenerateMosaic(analysistask.AnalysisTask):
                 inputImage, transform[:2, :], mosaicDimensions)
 
     def _run_analysis(self):
+
         alignTask = self.dataSet.load_analysis_task(
                 self.parameters['global_align_task'])
         micronExtents = alignTask.get_global_extent()
@@ -111,29 +112,34 @@ class GenerateMosaic(analysistask.AnalysisTask):
         else:
             zIndexes = range(len(self.dataSet.get_z_positions()))
 
-        if not self.parameters['separate_files']:
-            imageDescription = self.dataSet.analysis_tiff_description(
-                len(zIndexes), len(dataChannels))
-            with self.dataSet.writer_for_analysis_images(
-                    self, 'mosaic') as outputTif:
-                for d in dataChannels:
-                    for z in zIndexes:
-                        mosaic = self._prepare_mosaic_slice(
-                            z, d, micronExtents, alignTask, maximumProjection)
-                        outputTif.save(mosaic, photometric='MINISBLACK', contiguous=True,
-                                       metadata=imageDescription)
-        else:
+        print('generating mosaic for \nchannels: {}\nz indexes: {}'.format(dataChannels, zIndexes))
+
+        if self.parameters['separate_files']:
             imageDescription = self.dataSet.analysis_tiff_description(1, 1)
             for d in dataChannels:
                 for z in zIndexes:
                     with self.dataSet.writer_for_analysis_images(
-                        self, 'mosaic_%s_%i'
-                              % (dataOrganization.get_data_channel_name(d), z))\
-                            as outputTif:
+                        self, 
+                        'mosaic_%s_%i' % (dataOrganization.get_data_channel_name(d), z),
+                        imagej = True) as outputTif:
+                            mosaic = self._prepare_mosaic_slice(
+                                z, d, micronExtents, alignTask, maximumProjection)
+                            outputTif.save(mosaic, photometric='MINISBLACK', contiguous=True, 
+                                        metadata=imageDescription)
+
+        else:
+            imageDescription = self.dataSet.analysis_tiff_description(
+                len(zIndexes), len(dataChannels))
+            with self.dataSet.writer_for_analysis_images(
+                    self, 'mosaic', imagej = True) as outputTif:
+                for d in dataChannels:
+                    for z in zIndexes:
+                        print(f'starting data channel {d}, z index {z}.')
                         mosaic = self._prepare_mosaic_slice(
                             z, d, micronExtents, alignTask, maximumProjection)
-                        outputTif.save(mosaic, photometric='MINISBLACK', contiguous=True, 
+                        outputTif.save(mosaic, photometric='MINISBLACK', contiguous=True,
                                        metadata=imageDescription)
+
 
     def _prepare_mosaic_slice(self, zIndex, dataChannel, micronExtents,
                               alignTask, maximumProjection):
