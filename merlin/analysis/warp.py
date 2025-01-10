@@ -8,6 +8,7 @@ import pickle
 from skimage import registration
 from skimage import transform
 from skimage import registration
+from skimage import morphology
 import cv2
 
 from merlin.core import analysistask
@@ -31,6 +32,11 @@ class Warp(analysistask.ParallelAnalysisTask):
 
         self.writeAlignedFiducialImages = self.parameters[
                 'write_fiducial_images']
+
+        # this is an attempt to fix boundary issues for excessive warping
+        # may be useful for long codebooks
+        if 'boundary_smooth' not in self.parameters:
+            self.parameters['boundary_smooth'] = False
 
     def get_aligned_image_set(
             self, fov: int,
@@ -71,15 +77,32 @@ class Warp(analysistask.ParallelAnalysisTask):
         inputImage = self.dataSet.get_raw_image(
             dataChannel, fov, self.dataSet.z_index_to_position(zIndex))
         transformation = self.get_transformation(fov, dataChannel)
+
         if chromaticCorrector is not None:
             imageColor = self.dataSet.get_data_organization()\
-                            .get_data_channel_color(dataChannel)
-            return transform.warp(chromaticCorrector.transform_image(
-                inputImage, imageColor), transformation, preserve_range=True
-                ).astype(inputImage.dtype)
-        else:
-            return transform.warp(inputImage, transformation,
-                                  preserve_range=True).astype(inputImage.dtype)
+                .get_data_channel_color(dataChannel)
+            inputimage = chromaticCorrector.transform_image(
+                inputImage, imageColor)
+
+        # this is the warped image with no padding
+        warped_image = transform.warp(inputImage, transformation,
+            preserve_range=True)
+        
+        # an overly complicated attempt to smooth boundary at poorly warped images
+        if self.parameters['boundary_smooth']:
+            warped_image_blur = transform.warp(inputImage, transformation,
+                preserve_range=True, mode = 'edge')
+            warped_image_blur = cv2.GaussianBlur(warped_image_blur,
+                ksize = (23, 23), 
+                sigmaX = 11, 
+                borderType=cv2.BORDER_REPLICATE)
+            
+            mask = (warped_image == 0)
+            mask = morphology.binary_dilation(mask) # dilate by one pixel
+
+            warped_image[mask] = warped_image_blur[mask]
+            
+        return warped_image.astype(inputImage.dtype)
 
     def _process_transformations(self, transformationList, fov) -> None:
         """
@@ -190,10 +213,17 @@ class FiducialCorrelationWarp(Warp):
         if 'highpass_sigma' not in self.parameters:
             self.parameters['highpass_sigma'] = 3
 
+        # add this parameter to control the next two parameters
+        # if beads are not sparse its probably not necessary...
+            #percentile_pixel_to_keep
+            #edge_width_to_remove
+        if 'sparse_bead_fix' not in self.parameters:
+            self.parameters['sparse_bead_fix'] = False
+
         # xingjie parameters to add
         if 'percentile_pixel_to_keep' not in self.parameters:
             self.parameters['percentile_pixel_to_keep'] = 99
-        if 'edge_width_to_remove' not in self.parameters:
+        if 'edge_width_to_remove' not in self.parameters: # not entirely sure the point of this one...
             self.parameters['edge_width_to_remove'] = 10
 
     def fragment_count(self):
@@ -221,17 +251,20 @@ class FiducialCorrelationWarp(Warp):
         
         # add some features from Xingjie https://github.com/xingjiepan/MERlin/blob/xingjie/merlin/analysis/warp.py
         
-        # Remove the boundaries
-        edge_width_to_remove = self.parameters['edge_width_to_remove']
-        high_passed_img[:edge_width_to_remove] = 0
-        high_passed_img[high_passed_img.shape[0] - edge_width_to_remove:] = 0
-        high_passed_img[:, :edge_width_to_remove] = 0
-        high_passed_img[:, high_passed_img.shape[1] - edge_width_to_remove:] = 0
+        if self.parameters['sparse_bead_fix']:
 
-        # Only keep the most bright pixels
-        percentile_pixel_to_keep = self.parameters['percentile_pixel_to_keep']
-        high_passed_img[high_passed_img <
-                np.percentile(high_passed_img, percentile_pixel_to_keep)] = 0
+            # Remove the boundaries
+            edge_width_to_remove = self.parameters['edge_width_to_remove']
+            high_passed_img[:edge_width_to_remove] = 0
+            high_passed_img[high_passed_img.shape[0] - edge_width_to_remove:] = 0
+            high_passed_img[:, :edge_width_to_remove] = 0
+            high_passed_img[:, high_passed_img.shape[1] - edge_width_to_remove:] = 0
+
+            # Only keep the most bright pixels
+            # this is useful for sparse beads
+            percentile_pixel_to_keep = self.parameters['percentile_pixel_to_keep']
+            high_passed_img[high_passed_img <
+                    np.percentile(high_passed_img, percentile_pixel_to_keep)] = 0
 
         return high_passed_img        
 
