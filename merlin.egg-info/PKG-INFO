@@ -1,0 +1,57 @@
+Metadata-Version: 2.2
+Name: merlin
+Version: 0.1.6
+Summary: MERFISH decoding software
+Author: George Emanuel
+Author-email: emanuega0@gmail.com
+License: Restricted use
+Classifier: Development Status :: 4 - Beta
+Classifier: Natural Language :: English
+Classifier: Operating System :: POSIX
+Classifier: Operating System :: Unix
+Classifier: Operating System :: MacOS :: MacOS X
+Classifier: License  :: Restricted use
+Classifier: Programming Language :: Python :: 3.6
+Classifier: Topic :: Scientific/Engineering :: Bio-Informatics
+Requires-Dist: boto3
+Requires-Dist: cellpose==2.2
+Requires-Dist: cython
+Requires-Dist: docutils
+Requires-Dist: google-cloud-storage
+Requires-Dist: h5py
+Requires-Dist: matplotlib
+Requires-Dist: networkx>=3.0
+Requires-Dist: numexpr
+Requires-Dist: numpy==1.26.4
+Requires-Dist: opencv-python
+Requires-Dist: pandas
+Requires-Dist: pulp==2.7.0
+Requires-Dist: pyclustering
+Requires-Dist: pyqt5
+Requires-Dist: pytest
+Requires-Dist: pytest-cov
+Requires-Dist: python-dotenv
+Requires-Dist: requests
+Requires-Dist: rtree
+Requires-Dist: scikit-image
+Requires-Dist: scikit-learn
+Requires-Dist: scipy
+Requires-Dist: seaborn
+Requires-Dist: setuptools
+Requires-Dist: shapely>=2.0
+Requires-Dist: snakemake
+Requires-Dist: Sphinx
+Requires-Dist: sphinx-rtd-theme
+Requires-Dist: tables
+Requires-Dist: tifffile
+Requires-Dist: urllib3
+Requires-Dist: xmltodict
+Requires-Dist: tensorflow
+Requires-Dist: csbdeep
+Requires-Dist: zarr
+Dynamic: author
+Dynamic: author-email
+Dynamic: classifier
+Dynamic: license
+Dynamic: requires-dist
+Dynamic: summary
