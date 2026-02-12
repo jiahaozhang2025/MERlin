@@ -82,45 +82,6 @@ class PixelBasedDecoder(object):
         # test for if we want to disregard low abundant barcodes in refactors
         # value of zero will not do anything
         self.barcodesSeenThreshold = 0 
-    
-    def decode_spots(self, dfBarcodes: pandas.DataFrame,
-                    scaledPixelMagnitudes: np.ndarray,
-                    normalizedPixelTraces: np.ndarray,
-                    spotSpan: int=1,
-                    distanceThreshold: float=0.5176,
-                    magnitudeThreshold: float=1.0):
-        
-        dfSpots = []
-        spotMagnitudeThreshold = magnitudeThreshold * (2 * spotSpan + 1)**2
-        magnitudeMask = (scaledPixelMagnitudes >= magnitudeThreshold)
-        for _, barcode in dfBarcodes.iterrows():
-            uid = int(barcode['unique_id'])
-            bid = int(barcode['barcode_id'])
-            x = int(np.round(barcode['x']))
-            y = int(np.round(barcode['y']))
-            
-            x0, x1 = x-spotSpan, x+spotSpan
-            y0, y1 = y-spotSpan, y+spotSpan
-            
-            localMask = magnitudeMask[y0:y1, x0:x1]
-            if not np.any(localMask):
-                continue
-            barcodeMagnitude = scaledPixelMagnitudes[y0:y1, x0:x1].sum()
-            
-            normalizedPixelsLocal = normalizedPixelTraces[:, y0:y1, x0:x1]
-            normalizedPixelsMasked = np.moveaxis(normalizedPixelsLocal, 0, -1)[localMask]
-            target = self._decodingMatrix[bid]
-            barcodeDistance = np.linalg.norm(normalizedPixelsMasked - target, axis=-1).mean()
-            
-            if barcodeDistance < distanceThreshold and barcodeMagnitude >= spotMagnitudeThreshold:
-                out = dict(barcode)
-                out['mean_distance'] = barcodeDistance
-                out['mean_intensity'] = barcodeMagnitude
-                dfSpots.append(out)
-            
-        dfSpots = pandas.DataFrame(dfSpots)
-        
-        return dfSpots
                        
     def decode_pixels(self, imageData: np.ndarray,
                       scaleFactors: np.ndarray=None,
@@ -128,11 +89,7 @@ class PixelBasedDecoder(object):
                       distanceThreshold: float=0.5176,
                       magnitudeThreshold: float=1.0,
                       lowPassSigma: float=1.0,
-                      binaryIntensityThreshold = None,
-                      overlapDistanceThreshold = None,
                       distanceMetric = None,
-                      testFlag=False,
-                      returnScaledPixelTraces = False,
                       decodeMask = None,
                       use_gpu = False,
                       tilingFactor = None,
@@ -223,13 +180,14 @@ class PixelBasedDecoder(object):
                     # Recurse for the tile
                     t_di, t_pm, t_npt, t_dist = self.decode_pixels(
                         tile_image_data,
-                        scaleFactors=scaleFactors, backgrounds=backgrounds,
-                        distanceThreshold=distanceThreshold, magnitudeThreshold=magnitudeThreshold,
-                        lowPassSigma=lowPassSigma, binaryIntensityThreshold=binaryIntensityThreshold,
-                        overlapDistanceThreshold=overlapDistanceThreshold, distanceMetric=distanceMetric,
-                        testFlag=testFlag, returnScaledPixelTraces=returnScaledPixelTraces,
+                        scaleFactors=scaleFactors, 
+                        backgrounds=backgrounds,
+                        distanceThreshold=distanceThreshold, 
+                        magnitudeThreshold=magnitudeThreshold,
+                        lowPassSigma=lowPassSigma, 
                         decodeMask=tile_decode_mask,
-                        use_gpu=use_gpu, tilingFactor=None # No further tiling
+                        use_gpu=use_gpu, 
+                        tilingFactor=None 
                     )
                     
                     if on_tile_done is not None:
@@ -284,42 +242,6 @@ class PixelBasedDecoder(object):
                     return_distance=True)
                 distances[magnitudeMask] = distancesMasked
                 indexes[magnitudeMask] = indexesMasked
-                
-                if testFlag:
-                    normalizedPixelTracesReshapedMaskedFiltered = []
-                    distancesMaskedFiltered = []
-                    for trace_id in range(len(normalizedPixelTracesReshapedMasked)):
-                        trace = normalizedPixelTracesReshapedMasked[trace_id]
-                        barcode_id = indexesMasked[trace_id]
-                        norm_barcode = self._decodingMatrix[barcode_id][0]
-                        trace[norm_barcode == 0] = 0
-                        distance = np.linalg.norm(trace - norm_barcode)
-                        distancesMaskedFiltered.append(distance)
-                    distances[magnitudeMask][:,0] = distancesMaskedFiltered
-                
-                if binaryIntensityThreshold is not None:
-                    binaryMask = (scaledPixelTraces >= binaryIntensityThreshold)
-                    binaryPixelTraces = np.where(binaryMask, 1.0, 0.0)
-                    normalizedBinaryPixelTraces = binaryPixelTraces / np.linalg.norm(binaryPixelTraces, axis = 0).astype(np.float32)
-                    normalizedBinaryPixelTracesReshaped = normalizedBinaryPixelTraces.reshape(normalizedPixelTraces.shape[0], -1).T
-                    binaryDistancesMasked, binaryIndexesMasked = neighbors.kneighbors(
-                        normalizedPixelTracesReshaped[magnitudeMask],
-                        return_distance=True)
-                    lowerDistancesMask = (binaryDistancesMasked < distancesMasked)
-                    distances[magnitudeMask][lowerDistancesMask] = binaryDistancesMasked[lowerDistancesMask]
-                    indexes[magnitudeMask][lowerDistancesMask] = binaryIndexesMasked[lowerDistancesMask]
-                    
-                if overlapDistanceThreshold is not None:
-                    neighborsOverlap = NearestNeighbors(n_neighbors=1, algorithm='ball_tree')
-                    neighborsOverlap.fit(self._decodingMatrixOverlap) 
-                    distanceMask = (distances[:,0] >= overlapDistanceThreshold)
-                    magnitudeMask = (pixelMagnitudes.reshape(-1) >= (magnitudeThreshold * 5))
-                    overlapMask = np.logical_and(distanceMask, magnitudeMask)
-                    distancesOverlap, indexesOverlap = neighborsOverlap.kneighbors(
-                        normalizedPixelTracesReshaped[overlapMask],
-                        return_distance=True)
-                    distances[overlapMask] = distancesOverlap
-                    indexes[overlapMask] = indexesOverlap
                 
             else: # gpu decode here
                 # hard coding some numbers here be careful
