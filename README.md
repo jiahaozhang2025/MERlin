@@ -4,6 +4,9 @@
 
 # MERlin - Extensible pipeline for scalable data analysis
 
+Forked from: https://github.com/aaronhalpern/MERlin
+Original source: https://github.com/emanuega/MERlin
+
 MERlin is an extensible data analysis pipeline for reproducible and scalable analysis of large 
 datasets. Each MERlin workflow consists of a set of analysis tasks, each of which can be run as 
 single task or split among many subtasks that can be executed in parallel. MERlin is able to 
@@ -12,8 +15,6 @@ execute workflows on a single computer, on a high performance cluster, or on the
 
 If MERlin is useful for your research, consider citing:
 Emanuel, G., Eichhorn, S. W., Zhuang, X. 2020, MERlin - scalable and extensible MERFISH analysis software, v0.1.6, Zenodo, doi:10.5281/zenodo.3758540 
-
-Please find the most recent version of MERlin [here](https://github.com/emanuega/merlin).
 
 ## MERFISH data analysis
 
