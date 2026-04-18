@@ -5,8 +5,9 @@
 # MERlin - Extensible pipeline for scalable data analysis
 
 This repository is adapted from (git history is lost): 
-Forked from: https://github.com/aaronhalpern/MERlin
-Original source: https://github.com/emanuega/MERlin
+
+Forked: https://github.com/aaronhalpern/MERlin
+Original: https://github.com/emanuega/MERlin
 
 MERlin is an extensible data analysis pipeline for reproducible and scalable analysis of large 
 datasets. Each MERlin workflow consists of a set of analysis tasks, each of which can be run as 
