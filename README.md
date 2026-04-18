@@ -4,6 +4,7 @@
 
 # MERlin - Extensible pipeline for scalable data analysis
 
+This repository is adapted from (git history is lost): 
 Forked from: https://github.com/aaronhalpern/MERlin
 Original source: https://github.com/emanuega/MERlin
 
