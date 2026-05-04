@@ -34,6 +34,8 @@ Parameters:
 * decon\_sigma -- The standard deviation to use for the Lucy-Richardson deconvolution.
 * decon\_iterations -- The number of Lucy-Richardson deconvolution iterations to perform on each image.
 * decon\_filter\_size -- The size of the gaussian filter to use for the deconvolution. It is not recommended to set this parameter manually.
+* threshold\_subtract\_n -- Scalar factor ``n`` used for global threshold subtraction. Set to 0 to disable.
+* threshold\_subtract\_mode -- Which global image statistic to use for subtraction: ``none``, ``mean``, ``std``, or ``both``. The subtraction is ``n * mean``, ``n * std``, or ``n * (mean + std)``.
 
 preprocess.DeconvolutionPreprocessGuo
 --------------------------------------
@@ -47,6 +49,8 @@ Parameters:
 * decon\_sigma -- The standard deviation to use for the Lucy-Richardson deconvolution.
 * decon\_iterations -- The number of Lucy-Richardson deconvolution iterations to perform on each image. The default value is 2.
 * decon\_filter\_size -- The size of the gaussian filter to use for the deconvolution. It is not recommended to set this parameter manually.
+* threshold\_subtract\_n -- Scalar factor ``n`` used for global threshold subtraction. Set to 0 to disable.
+* threshold\_subtract\_mode -- Which global image statistic to use for subtraction: ``none``, ``mean``, ``std``, or ``both``. The subtraction is ``n * mean``, ``n * std``, or ``n * (mean + std)``.
  
 optimize.Optimize
 ------------------

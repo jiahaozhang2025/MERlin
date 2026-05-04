@@ -2,12 +2,26 @@ import cv2
 import numpy as np
 from scipy import ndimage
 
-from merlin.util import matlab
-
 """
 This module containts utility functions for performing deconvolution on
 images.
 """
+
+
+def _gaussian_kernel(shape=(3, 3), sigma=0.5) -> np.ndarray:
+    """Return a normalized 2D Gaussian kernel.
+
+    This preserves the previous MATLAB-compatible kernel generation while
+    keeping the implementation local to the deconvolution code that uses it.
+    """
+    m, n = [(axis - 1.0) / 2.0 for axis in shape]
+    y, x = np.ogrid[-m:m + 1, -n:n + 1]
+    kernel = np.exp(-(x * x + y * y) / (2.0 * sigma * sigma))
+    kernel[kernel < np.finfo(kernel.dtype).eps * kernel.max()] = 0
+    kernel_sum = kernel.sum()
+    if kernel_sum != 0:
+        kernel /= kernel_sum
+    return kernel
 
 
 def calculate_projectors(windowSize: int, sigmaG: float) -> list:
@@ -25,8 +39,7 @@ def calculate_projectors(windowSize: int, sigmaG: float) -> list:
         A list containing the forward and backward projectors to use for
         Lucy-Richardson deconvolution.
     """
-    pf = matlab.matlab_gauss2D(shape=(windowSize, windowSize),
-                               sigma=sigmaG)
+    pf = _gaussian_kernel(shape=(windowSize, windowSize), sigma=sigmaG)
     pfFFT = np.fft.fft2(pf)
 
     # Wiener-Butterworth back projector.
@@ -101,8 +114,8 @@ def deconvolve_lucyrichardson(image: np.ndarray,
     l = 0
 
     if windowSize % 2 != 1:
-        gaussianFilter = matlab.matlab_gauss2D(shape=(windowSize, windowSize),
-                                               sigma=sigmaG)
+        gaussianFilter = _gaussian_kernel(shape=(windowSize, windowSize),
+                                          sigma=sigmaG)
 
     for i in range(iterationCount):
         if i > 1:

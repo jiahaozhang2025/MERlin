@@ -7,8 +7,6 @@ from skimage import measure
 from pyclustering.cluster import kmedoids
 from typing import Tuple
 
-from merlin.util import matlab
-
 """
 This module contains utility functions for preparing imagmes for 
 watershed segmentation.

@@ -98,6 +98,19 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # distance metric
         if 'distance_metric' not in self.parameters:
             self.parameters['distance_metric'] = None
+        if 'softmax_temperature' not in self.parameters:
+            self.parameters['softmax_temperature'] = 0.15
+        if 'decode_chunk_size' not in self.parameters:
+            self.parameters['decode_chunk_size'] = 65536
+             
+        # threads for tile decoding
+        if 'num_threads' not in self.parameters:
+            self.parameters['num_threads'] = 1
+        # optional single z-index decode
+        if 'decode_z_index' not in self.parameters:
+            self.parameters['decode_z_index'] = None
+        if 'extract_intensity_traces' not in self.parameters:
+            self.parameters['extract_intensity_traces'] = False
             
         self.cropWidth = self.parameters['crop_width']
         self.imageSize = dataSet.get_image_dimensions()
@@ -136,12 +149,11 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 self.parameters['preprocess_task'])
         optimizeTask = self.dataSet.load_analysis_task(
                 self.parameters['optimize_task'])
-        decode3d = self.parameters['decode_3d']
 
         lowPassSigma = self.parameters['lowpass_sigma']
         
         codebook = self.get_codebook()
-        decoder = decoding.PixelBasedDecoder(codebook, calculateOverlap=(self.parameters['overlap_distance_threshold'] is not None))
+        decoder = decoding.PixelBasedDecoder(codebook)
 
         # for single FOV optimization
         if self.parameters['single_fov_optimization']:
@@ -176,7 +188,8 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # find what z planes exist in the barcode file already
         self.decoded_z_planes = self._get_decoded_z_planes(fragmentIndex)
         
-        for zIndex, z in enumerate(zPositions):
+        decodeZIndexes = self._get_z_indexes_to_decode(zPositionCount)
+        for zIndex in decodeZIndexes:
 
             if zIndex in self.decoded_z_planes:
                 print(f'barcodes in zIndex {zIndex} detected. Skipping plane!')
@@ -200,6 +213,17 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 bcDB.get_barcodes(fov=fragmentIndex))
             bcDB.empty_database(fragmentIndex)
             bcDB.write_barcodes(bc, fov=fragmentIndex)
+
+    def _get_z_indexes_to_decode(self, zPositionCount: int) -> list[int]:
+        decodeZIndex = self.parameters.get('decode_z_index')
+        if decodeZIndex is None:
+            return list(range(zPositionCount))
+        decodeZIndex = int(decodeZIndex)
+        if decodeZIndex < 0 or decodeZIndex >= zPositionCount:
+            raise ValueError(
+                f'decode_z_index {decodeZIndex} out of range for '
+                f'{zPositionCount} z-positions')
+        return [decodeZIndex]
 
     # finding what z planes are already in the barcode file
     def _get_decoded_z_planes(self, fragmentIndex):
@@ -233,37 +257,39 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         if self.parameters['use_segmentation_mask']:
             decodeMask = self._get_segmentation_mask(fov, zIndex)
         
-        accumulate_pixel_traces = True
-        on_tile_done = None
+        accumulatePixelTraces = self.parameters['extract_intensity_traces']
+        onTileDone = None
         dfs = []
         
         # If tiling is used, we want to extract barcodes per tile to avoid memory overhead
         if self.parameters['tiling_factor'] is not None and self.parameters['tiling_factor'] > 1:
-            accumulate_pixel_traces = False
+            accumulatePixelTraces = False
+            tileResults = []
             
-            def process_tile(t_di, t_pm, t_npt, t_d, slice_info):
-                h_start, h_end, w_start, w_end = slice_info
+            def process_tile(tDi, tPm, tNpt, tD, sliceInfo, validBBox):
                 # We need to extract barcodes from the tile
-                # Note: cropWidth must be 0 for tiles, filtering happens later
+                # cropWidth is set to 0 here because we handle the overlap/validity manually using valid_bbox
                 outputLabels = self.parameters['write_unique_id_images']
                 minimumArea = self.parameters['minimum_area']
 
-                tile_barcode_output = decoder.extract_overlapping_barcodes_with_index(
-                    t_di, t_pm, t_npt, t_d, fov, cropWidth=0, zIndex=zIndex,
-                    globalAligner=None, minimumArea=minimumArea, outputLabels=outputLabels)
+                tileBarcodeOutput = decoder.extract_barcodes_with_index(
+                    tDi, tPm, tNpt, tD, fov, cropWidth=0, zIndex=zIndex,
+                    globalAligner=None, minimumArea=minimumArea,
+                    outputLabels=outputLabels,
+                    extractIntensityTraces=self.parameters[
+                        'extract_intensity_traces'])
 
+                labels = None
                 if outputLabels:
-                    df_tile, _ = tile_barcode_output # we ignore tile labels map for now
+                    dfTile, labels = tileBarcodeOutput 
                 else:
-                    df_tile = tile_barcode_output
+                    dfTile = tileBarcodeOutput
                 
-                # Adjust coordinates
-                if len(df_tile) > 0:
-                    df_tile['x'] += w_start
-                    df_tile['y'] += h_start
-                    dfs.append(df_tile)
+                # Store strictly local data for sequential post-processing
+                # This avoids concurrency issues with ID generation
+                tileResults.append((dfTile, labels, sliceInfo, validBBox))
                     
-            on_tile_done = process_tile
+            onTileDone = process_tile
 
         di, pm, npt, d = decoder.decode_pixels(
             imageSet, scaleFactors, backgrounds,
@@ -271,15 +297,73 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             magnitudeThreshold=self.parameters['magnitude_threshold'],
             distanceThreshold=self.parameters['distance_threshold'],
             distanceMetric=self.parameters['distance_metric'],
+            softmaxTemperature=self.parameters['softmax_temperature'],
+            decodeChunkSize=self.parameters['decode_chunk_size'],
+            nnAlgorithm=self.parameters.get('nn_algorithm', 'brute'),
             decodeMask = decodeMask,
-            use_gpu = self.parameters['use_gpu'],
+            numThreads = self.parameters['num_threads'],
+            useGpu = self.parameters['use_gpu'],
             tilingFactor = self.parameters['tiling_factor'],
-            accumulate_pixel_traces = accumulate_pixel_traces,
-            on_tile_done = on_tile_done)
+            accumulatePixelTraces = accumulatePixelTraces,
+            onTileDone = onTileDone)
         
         t2 = time.time()
         
+        uid = None
         if self.parameters['tiling_factor'] is not None and self.parameters['tiling_factor'] > 1:
+            dfs = []
+            currentMaxId = 0
+            if self.parameters['write_unique_id_images']:
+                uid = np.zeros_like(di, dtype=np.int32)
+            
+            for res in tileResults:
+                dfTile, labels, sliceInfo, validBBox = res
+                hStart, hEnd, wStart, wEnd = sliceInfo
+                vHMin, vHMax, vWMin, vWMax = validBBox
+                
+                if len(dfTile) > 0:
+                     # Filter DataFrame for overlap (using local coords) based on centroids
+                     validMask = (
+                        (dfTile['y'] >= vHMin) & (dfTile['y'] < vHMax) &
+                        (dfTile['x'] >= vWMin) & (dfTile['x'] < vWMax)
+                     )
+                     dfTile = dfTile[validMask].copy()
+                
+                if len(dfTile) > 0:
+                     # Generate global unique IDs
+                     oldIds = dfTile['unique_id'].values
+                     newIds = np.arange(currentMaxId + 1, currentMaxId + 1 + len(dfTile), dtype=np.int32)
+                     
+                     # Map IDs in DataFrame
+                     dfTile['unique_id'] = newIds
+                     currentMaxId += len(dfTile)
+                     
+                     # Map IDs in Label Image (if needed)
+                     if uid is not None and labels is not None:
+                         # Crop to valid region
+                         lCrop = labels[vHMin:vHMax, vWMin:vWMax]
+                         
+                         # Create LUT for fast mapping
+                         # Pixels not in old_ids (i.e. outside valid_bbox centroids) become 0
+                         maxLabel = labels.max()
+                         if maxLabel > 0:
+                             lut = np.zeros(maxLabel + 1, dtype=np.int32)
+                             lut[oldIds] = newIds
+                             lMapped = lut[lCrop]
+                             
+                             # Paste into global image
+                             gHStart = hStart + vHMin
+                             gHEnd = hStart + vHMax
+                             gWStart = wStart + vWMin
+                             gWEnd = wStart + vWMax
+                             
+                             uid[gHStart:gHEnd, gWStart:gWEnd] = lMapped
+
+                     # Adjust coordinates to global image frame
+                     dfTile.loc[:, 'x'] += wStart
+                     dfTile.loc[:, 'y'] += hStart
+                     dfs.append(dfTile)
+                     
             if len(dfs) > 0:
                 df = pandas.concat(dfs, ignore_index=True)
                 
@@ -292,7 +376,6 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 # Apply global alignment
                 globalTask = self.dataSet.load_analysis_task(self.parameters['global_align_task'])
                 # Calculate global coordinates
-                # We need to reconstruct centroids array (z, x, y)
                 if len(df) > 0:
                      centroids = np.zeros([len(df), 3], dtype=np.float32)
                      centroids[:, 0] = df['z'].values
@@ -304,34 +387,21 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                      df['global_x'] = g[:, 1]
                      df['global_y'] = g[:, 2]
                 
-                if self.parameters['write_unique_id_images']:
-                     # Recreate unique_id image if needed (computationally expensive?) or just skip?
-                     # Since we didn't accumulate the label image, we might need to rely on 'di'
-                     # But 'di' is just barcode index.
-                     # If  really need the unique_id image, we might need to stitch labels map too.
-                     # For now, let's assuming recreating uid map is not critical or done differently
-                     # Actually, standard behavior returns (df, uid)
-                     # We can reconstruct it or simply say uid images are not supported with tiling + low memory for now?
-                     # Let's try to pass None for uid if we can't easily make it.
-                     pass 
             else:
                 df = pandas.DataFrame()
 
-            # IMPORTANT: Skipping standard extract_and_save because we did it per tile
-            # But we still need to write to DB
+            # Save barcodes
             self.get_barcode_database().write_barcodes(df, fov=fov)
-                 
-            # If write_unique_id_images is True, we have a problem: we didn't stitch the unique ID image.
-            # But the user asked for memory savings.
-            # We return di, pm, d. 'uid' is missing.
+            
             barcodeOutputs = df
 
         else:
              barcodeOutputs = self._extract_and_save_barcodes(
                 decoder, di, pm, npt, d, fov, zIndex)
+        
         if self.parameters['write_unique_id_images']:
             if self.parameters['tiling_factor'] is not None and self.parameters['tiling_factor'] > 1:
-                 uid = np.zeros_like(di) # Placeholder
+                 # uid is already constructed above
                  return di, pm, d, uid
             else:
                  df, uid = barcodeOutputs 
@@ -339,13 +409,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         else:
             df = barcodeOutputs 
         t3 = time.time()
-
-        print(f'decoding fov {fov} zslice {zIndex}')
         print(f'time retrieving fov {fov} zindex {zIndex}: {t1-t0}')
         print(f'time decoding fov {fov} zindex {zIndex}: {t2-t1}')
+        if getattr(decoder, 'last_decode_timings', None):
+            for stageName, stageTime in decoder.last_decode_timings.items():
+                print(
+                    f'decode stage {stageName} fov {fov} zindex {zIndex}: '
+                    f'{stageTime}'
+                )
         print(f'time extracting fov {fov} zindex {zIndex}: {t3-t2}')
-        if self.parameters['decode_spots']:
-            print(f'time spot decoding fov {fov} zindex {zIndex}: {t4-t3}')
         print(f'total time in fov {fov} zindex {zIndex}: {t3-t0}')
         
         if self.parameters['write_unique_id_images']:
@@ -386,17 +458,17 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         minimumArea = self.parameters['minimum_area']
         outputLabels = self.parameters['write_unique_id_images']
         
-        barcodeOutput = decoder.extract_overlapping_barcodes_with_index(
+        barcodeOutput = decoder.extract_barcodes_with_index(
             decodedImage, pixelMagnitudes, pixelTraces, distances, fov,
-            self.cropWidth, zIndex, globalTask, minimumArea, outputLabels)
+            self.cropWidth, zIndex, globalTask, minimumArea, outputLabels,
+            extractIntensityTraces=self.parameters['extract_intensity_traces'])
         
         if outputLabels:
             df, uid = barcodeOutput
         else:
             df = barcodeOutput
             
-        if not self.parameters['decode_spots']:
-            self.get_barcode_database().write_barcodes(df, fov = fov)
+        self.get_barcode_database().write_barcodes(df, fov = fov)
         
         return barcodeOutput
         
@@ -406,4 +478,3 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             self.parameters['z_duplicate_xy_pixel_threshold'],
             self.dataSet.get_z_positions())
         return bc
-

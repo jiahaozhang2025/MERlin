@@ -175,6 +175,8 @@ class DeconvolutionPreprocess(Preprocess):
 
         if 'highpass_sigma' not in self.parameters:
             self.parameters['highpass_sigma'] = 3
+        if 'lowpass_sigma' not in self.parameters:
+            self.parameters['lowpass_sigma'] = None
         if 'decon_sigma' not in self.parameters:
             self.parameters['decon_sigma'] = 2
         if 'decon_filter_size' not in self.parameters:
@@ -194,10 +196,25 @@ class DeconvolutionPreprocess(Preprocess):
             self.parameters['save_pixel_histogram'] = True
         if 'deconvolve_after_highpass' not in self.parameters:
             self.parameters['deconvolve_after_highpass'] = True
+        if 'preprocess_z_index' not in self.parameters:
+            self.parameters['preprocess_z_index'] = None
+        if 'threshold_subtract_n' not in self.parameters:
+            self.parameters['threshold_subtract_n'] = 0.0
+        if 'threshold_subtract_mode' not in self.parameters:
+            self.parameters['threshold_subtract_mode'] = 'none'
 
         self._highPassSigma = self.parameters['highpass_sigma']
+        self._lowPassSigma = self.parameters['lowpass_sigma']
         self._deconSigma = self.parameters['decon_sigma']
         self._deconIterations = self.parameters['decon_iterations']
+        self._thresholdSubtractN = float(self.parameters['threshold_subtract_n'])
+        self._thresholdSubtractMode = str(
+            self.parameters['threshold_subtract_mode']).lower()
+        validSubtractModes = {'none', 'mean', 'std', 'both'}
+        if self._thresholdSubtractMode not in validSubtractModes:
+            raise ValueError(
+                'threshold_subtract_mode must be one of '
+                f'{sorted(validSubtractModes)}')
 
         self.warpTask = self.dataSet.load_analysis_task(
             self.parameters['warp_task'])
@@ -250,6 +267,17 @@ class DeconvolutionPreprocess(Preprocess):
                                                     self._highPassSigma)
         return hpImage.astype(np.float32)
 
+    def _lowpass_filter(self, inputImage: np.ndarray) -> np.ndarray:
+        lpImage = inputImage.astype(np.float32, copy=False)
+        if self._lowPassSigma is None or self._lowPassSigma == 0:
+            return lpImage
+        lowPassFilterSize = int(2 * np.ceil(2 * self._lowPassSigma) + 1)
+        return cv2.GaussianBlur(
+            lpImage,
+            (lowPassFilterSize, lowPassFilterSize),
+            self._lowPassSigma,
+            borderType=cv2.BORDER_REPLICATE).astype(np.float32)
+
     def _run_analysis(self, fragmentIndex):
             
         if self.parameters['save_pixel_histogram'] or (fragmentIndex in self.parameters['write_preprocessed_FOVs']):
@@ -265,11 +293,12 @@ class DeconvolutionPreprocess(Preprocess):
                 # to estimate the initial scale factors. This is likely unnecessary?
             
             outputTif = None
+            zIndexes = self._get_z_indexes_to_preprocess()
             for bi, b in enumerate(self.get_codebook().get_bit_names()):
                 dataChannel = self.dataSet.get_data_organization()\
                         .get_data_channel_for_bit(b)
                 
-                for i in range(len(self.dataSet.get_z_positions())):
+                for i in zIndexes:
                     inputImage = warpTask.get_aligned_image(
                             fragmentIndex, dataChannel, i)
                     if self.parameters['deconvolve_after_highpass']:
@@ -290,10 +319,24 @@ class DeconvolutionPreprocess(Preprocess):
                 outputTif.__exit__(None, None, None)
             
             self._save_pixel_histogram(pixelHistogram, fragmentIndex)
+
+    def _get_z_indexes_to_preprocess(self) -> list[int]:
+        zPositionCount = len(self.dataSet.get_z_positions())
+        zIndex = self.parameters.get('preprocess_z_index')
+        if zIndex is None:
+            return list(range(zPositionCount))
+        zIndex = int(zIndex)
+        if zIndex < 0 or zIndex >= zPositionCount:
+            raise ValueError(
+                f'preprocess_z_index {zIndex} out of range for '
+                f'{zPositionCount} z-positions')
+        return [zIndex]
     
     def _preprocess_image(self, inputImage: np.ndarray) -> np.ndarray:
         deconFilterSize = self.parameters['decon_filter_size']
         filteredImage = self._highpass_filter(inputImage.astype(np.float32))
+        filteredImage = self._subtract_global_threshold(filteredImage)
+        filteredImage = self._lowpass_filter(filteredImage)
         deconvolvedImage = deconvolve.deconvolve_lucyrichardson(
             filteredImage, deconFilterSize, self._deconSigma,
             self._deconIterations)
@@ -305,7 +348,29 @@ class DeconvolutionPreprocess(Preprocess):
             inputImage.astype(np.float32), deconFilterSize, self._deconSigma,
             self._deconIterations)
         filteredImage = self._highpass_filter(deconvolvedImage)
+        filteredImage = self._subtract_global_threshold(filteredImage)
+        filteredImage = self._lowpass_filter(filteredImage)
         return filteredImage
+
+    def _subtract_global_threshold(self, inputImage: np.ndarray) -> np.ndarray:
+        mode = self._thresholdSubtractMode
+        nFactor = self._thresholdSubtractN
+        imageFloat = inputImage.astype(np.float32, copy=False)
+
+        if mode == 'none' or nFactor == 0:
+            return imageFloat
+
+        imageMean = float(np.mean(imageFloat))
+        imageStd = float(np.std(imageFloat))
+
+        if mode == 'mean':
+            threshold = nFactor * imageMean
+        elif mode == 'std':
+            threshold = nFactor * imageStd
+        else:
+            threshold = nFactor * (imageMean + imageStd)
+
+        return np.maximum(imageFloat - threshold, 0.0).astype(np.float32)
 
 class DeconvolutionPreprocessDW(Preprocess):
     
@@ -587,8 +652,11 @@ class DeconvolutionPreprocessGuo(DeconvolutionPreprocess):
         
     def _preprocess_image(self, inputImage: np.ndarray) -> np.ndarray:
         deconFilterSize = self.parameters['decon_filter_size']
-        filteredImage = self._highpass_filter(inputImage)
+        filteredImage = self._highpass_filter(inputImage.astype(np.float32))
+        filteredImage = self._subtract_global_threshold(filteredImage)
+        filteredImage = self._lowpass_filter(filteredImage)
         deconvolvedImage = deconvolve.deconvolve_lucyrichardson_guo(
             filteredImage, deconFilterSize, self._deconSigma,
-            self._deconIterations).astype(np.uint16)
+            self._deconIterations)
+        deconvolvedImage = deconvolvedImage.astype(np.uint16)
         return deconvolvedImage

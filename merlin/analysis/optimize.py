@@ -27,6 +27,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
+        if 'distance_metric' not in self.parameters:
+            self.parameters['distance_metric'] = 'euclidean'
         if 'fov_per_iteration' not in self.parameters:
             self.parameters['fov_per_iteration'] = 50
         if 'area_threshold' not in self.parameters:
@@ -39,6 +41,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             self.parameters['optimize_chromatic_correction'] = False
         if 'crop_width' not in self.parameters:
             self.parameters['crop_width'] = 100
+        if 'lowpass_sigma' not in self.parameters:
+            self.parameters['lowpass_sigma'] = 1
         if 'random_seed' in self.parameters:
             # set the random seed
             # make sure to set a different one for each optimize
@@ -176,8 +180,10 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                                             scaleFactors,
                                             backgrounds,
                                             decodeMask = decodeMask,
+                                            lowPassSigma = self.parameters['lowpass_sigma'],
                                             distanceThreshold = distance_threshold,
-                                            use_gpu = self.parameters['use_gpu'],
+                                            distanceMetric = self.parameters['distance_metric'],
+                                            useGpu = self.parameters['use_gpu'],
                                             tilingFactor = self.parameters['tiling_factor'])
         
         t2 = time.time()
@@ -606,11 +612,13 @@ class OptimizeIterationFOV(OptimizeIteration):
         areaThreshold = self.parameters['area_threshold']
         decoder.refactorAreaThreshold = areaThreshold
         # is it smart to put distance threshold in optimize?
-        di, pm, npt, d = decoder.decode_pixels(warpedImages, 
-                                               scaleFactors,
-                                               backgrounds,
-                                               self.parameters['distance_threshold']
-                                               )
+        di, pm, npt, d = decoder.decode_pixels(
+            warpedImages,
+            scaleFactors,
+            backgrounds,
+            lowPassSigma=self.parameters['lowpass_sigma'],
+            distanceThreshold=self.parameters['distance_threshold'],
+            distanceMetric=self.parameters['distance_metric'])
 
         refactors, backgrounds, barcodesSeen = \
             decoder.extract_refactors(

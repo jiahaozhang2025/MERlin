@@ -1,10 +1,208 @@
 import numpy as np
 import pandas
-from scipy import optimize
+from scipy import optimize, special
 
 from merlin.core import analysistask
 from merlin.analysis import decode
 from merlin.util import barcodefilters
+
+
+def _extract_finite_threshold_candidates(blank_fraction_hist: np.ndarray,
+                                         max_points: int = 2048
+                                         ) -> np.ndarray:
+    """Return sorted finite threshold candidates from a blank-fraction histogram."""
+    finite_values = blank_fraction_hist[np.isfinite(blank_fraction_hist)]
+    finite_values = finite_values[finite_values >= 0]
+    if finite_values.size == 0:
+        return np.array([], dtype=float)
+    finite_values = np.unique(np.sort(finite_values.astype(float)))
+    if finite_values.size > max_points:
+        idx = np.linspace(0, finite_values.size - 1, max_points, dtype=int)
+        finite_values = finite_values[idx]
+    return finite_values
+
+
+def _threshold_from_cumulative_bins(blank_hist: np.ndarray,
+                                    coding_hist: np.ndarray,
+                                    blank_fraction_hist: np.ndarray,
+                                    target_misidentification_rate: float,
+                                    blank_barcode_count: int,
+                                    coding_barcode_count: int) -> float:
+    """
+    Select threshold by sorting bins by normalized blank fraction, then
+    cumulatively including bins until estimated misidentification exceeds target.
+    """
+    valid = (
+        np.isfinite(blank_fraction_hist)
+        & (blank_fraction_hist >= 0)
+        & (coding_hist > 0)
+    )
+    if not np.any(valid):
+        return np.nan
+
+    ratios = blank_fraction_hist[valid].astype(float)
+    blank_vals = blank_hist[valid].astype(float)
+    coding_vals = coding_hist[valid].astype(float)
+
+    order = np.argsort(ratios)
+    ratios = ratios[order]
+    blank_vals = blank_vals[order]
+    coding_vals = coding_vals[order]
+
+    cum_blank = np.cumsum(blank_vals)
+    cum_coding = np.cumsum(coding_vals)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        cumulative_misid = ((cum_blank / blank_barcode_count)
+                            / (cum_coding / coding_barcode_count))
+
+    finite = np.isfinite(cumulative_misid)
+    if not np.any(finite):
+        return np.nan
+
+    finite_idx = np.where(finite)[0]
+    valid_idx = finite_idx[cumulative_misid[finite_idx]
+                           <= target_misidentification_rate]
+
+    if valid_idx.size > 0:
+        selected_idx = int(valid_idx[-1])
+        return float(np.nextafter(ratios[selected_idx], np.inf))
+
+    min_idx = int(finite_idx[0])
+    return float(np.nextafter(ratios[min_idx], np.inf))
+
+
+def _threshold_from_newton(error_fn, tolerance: float) -> float:
+    """Original Newton/secant style threshold solver."""
+    return float(optimize.newton(
+        error_fn, 0.2, tol=tolerance, x1=0.3, disp=False))
+
+
+def _get_intensity_transform_method(parameters: dict) -> str:
+    """Return configured intensity transform method."""
+    transformMethod = str(parameters.get('intensity_transform', 'log10')).lower()
+    validMethods = {'log10', 'linear'}
+    if transformMethod not in validMethods:
+        raise ValueError(
+            'intensity_transform must be one of '
+            + str(sorted(validMethods)))
+    return transformMethod
+
+
+def _transform_intensity_values(values: np.ndarray, transformMethod: str) -> np.ndarray:
+    if transformMethod == 'linear':
+        return values
+    return np.log10(values)
+
+
+def _build_intensity_bins(maxIntensity: float,
+                          intensityBinCount: int,
+                          transformMethod: str) -> np.ndarray:
+    if transformMethod == 'linear':
+        upper = 2 * maxIntensity
+    else:
+        upper = 2 * np.log10(maxIntensity)
+
+    if not np.isfinite(upper) or upper <= 0:
+        upper = 1.0
+    return np.linspace(0, upper, intensityBinCount + 1)
+
+
+def _standardize_logistic_features(features: np.ndarray
+                                   ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    centers = np.nanmean(features, axis=0).astype(float)
+    scales = np.nanstd(features, axis=0).astype(float)
+    scales[~np.isfinite(scales) | (scales == 0)] = 1.0
+    return (features - centers) / scales, centers, scales
+
+
+def _fit_logistic_regression(features: np.ndarray,
+                             labels: np.ndarray,
+                             l2_regularization: float,
+                             max_iterations: int
+                             ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
+    standardized, centers, scales = _standardize_logistic_features(features)
+    design = np.column_stack((np.ones(standardized.shape[0]), standardized))
+    labels = labels.astype(float)
+    l2 = float(max(l2_regularization, 0.0))
+
+    def objective(beta: np.ndarray) -> tuple[float, np.ndarray]:
+        logits = design @ beta
+        loss_terms = np.logaddexp(0.0, logits) - labels * logits
+        residual = special.expit(logits) - labels
+        grad = design.T @ residual
+        if l2 > 0:
+            loss_terms = loss_terms.sum() + 0.5 * l2 * np.sum(beta[1:] ** 2)
+            grad[1:] += l2 * beta[1:]
+        else:
+            loss_terms = loss_terms.sum()
+        return float(loss_terms), grad
+
+    initial = np.zeros(design.shape[1], dtype=float)
+    blank_fraction = np.clip(labels.mean(), 1e-6, 1 - 1e-6)
+    initial[0] = np.log(blank_fraction / (1 - blank_fraction))
+    result = optimize.minimize(
+        lambda b: objective(b)[0],
+        initial,
+        jac=lambda b: objective(b)[1],
+        method='L-BFGS-B',
+        options={'maxiter': int(max_iterations)})
+    return result.x.astype(float), centers, scales, bool(result.success)
+
+
+def _score_logistic_regression(features: np.ndarray,
+                               coefficients: np.ndarray,
+                               centers: np.ndarray,
+                               scales: np.ndarray) -> np.ndarray:
+    standardized = (features - centers) / scales
+    design = np.column_stack((np.ones(standardized.shape[0]), standardized))
+    return special.expit(design @ coefficients)
+
+
+def _select_logistic_probability_threshold(scores: np.ndarray,
+                                           is_blank: np.ndarray,
+                                           blank_barcode_count: int,
+                                           coding_barcode_count: int,
+                                           target_misidentification_rate: float
+                                           ) -> tuple[float, dict]:
+    order = np.argsort(scores, kind='mergesort')
+    sorted_scores = scores[order]
+    sorted_blank = is_blank[order].astype(int)
+    cumulative_blank = np.cumsum(sorted_blank)
+    cumulative_coding = np.cumsum(1 - sorted_blank)
+
+    with np.errstate(divide='ignore', invalid='ignore'):
+        misidentification = (
+            (cumulative_blank / blank_barcode_count)
+            / (cumulative_coding / coding_barcode_count))
+
+    finite = np.isfinite(misidentification) & (cumulative_coding > 0)
+    valid = finite & (misidentification <= target_misidentification_rate)
+    if np.any(valid):
+        selected = int(np.flatnonzero(valid)[-1])
+    elif np.any(finite):
+        selected = int(np.flatnonzero(finite)[0])
+    else:
+        return -np.inf, {
+            'selected_count': 0,
+            'selected_blank_count': 0,
+            'selected_coding_count': 0,
+            'estimated_misidentification_rate': np.nan}
+
+    threshold = float(np.nextafter(sorted_scores[selected], np.inf))
+    selected_blank = int(cumulative_blank[selected])
+    selected_coding = int(cumulative_coding[selected])
+    if selected_coding == 0:
+        estimated_misid = np.nan
+    else:
+        estimated_misid = float(
+            (selected_blank / blank_barcode_count)
+            / (selected_coding / coding_barcode_count))
+    return threshold, {
+        'selected_count': int(selected + 1),
+        'selected_blank_count': selected_blank,
+        'selected_coding_count': selected_coding,
+        'estimated_misidentification_rate': estimated_misid}
 
 
 class AbstractFilterBarcodes(decode.BarcodeSavingParallelAnalysisTask):
@@ -84,6 +282,10 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
             self.parameters['distance_bins'] = 66
         if 'area_bins' not in self.parameters:
             self.parameters['area_bins'] = 33
+        if 'threshold_solver_method' not in self.parameters:
+            self.parameters['threshold_solver_method'] = 'newton'
+        if 'intensity_transform' not in self.parameters:
+            self.parameters['intensity_transform'] = 'log10'
         
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -184,14 +386,32 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         Returns: the normalized blank fraction threshold that achieves
             targetMisidentificationRate
         """
-        tolerance = self.parameters['tolerance']
-        def misidentification_rate_error_for_threshold(x, targetError):
-            return self.calculate_misidentification_rate_for_threshold(x) \
-                - targetError
-        return optimize.newton(
-            misidentification_rate_error_for_threshold, 0.2,
-            args=[targetMisidentificationRate], tol=tolerance, x1=0.3,
-            disp=False)
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        codebook = decodeTask.get_codebook()
+        blankBarcodeCount = len(codebook.get_blank_indexes())
+        codingBarcodeCount = len(codebook.get_coding_indexes())
+        solverMethod = self.parameters.get(
+            'threshold_solver_method', 'newton')
+        if solverMethod == 'cumulative_bins':
+            return _threshold_from_cumulative_bins(
+                self.get_blank_count_histogram(),
+                self.get_coding_count_histogram(),
+                self.get_blank_fraction_histogram(),
+                targetMisidentificationRate,
+                blankBarcodeCount,
+                codingBarcodeCount)
+        if solverMethod == 'newton':
+            tolerance = self.parameters['tolerance']
+
+            def misidentification_rate_error_for_threshold(x):
+                return self.calculate_misidentification_rate_for_threshold(x) \
+                    - targetMisidentificationRate
+
+            return _threshold_from_newton(
+                misidentification_rate_error_for_threshold, tolerance)
+        raise ValueError('Unrecognized threshold_solver_method: '
+                         + str(solverMethod))
 
     def calculate_barcode_count_for_threshold(self, threshold: float) -> float:
         """ Calculate the number of barcodes remaining after applying
@@ -212,7 +432,9 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                                         ) -> pandas.DataFrame:
         selectData = barcodeSet[
             ['mean_intensity', 'min_distance', 'area']].values
-        selectData[:, 0] = np.log10(selectData[:, 0])
+        intensityTransform = _get_intensity_transform_method(self.parameters)
+        selectData[:, 0] = _transform_intensity_values(
+            selectData[:, 0], intensityTransform)
         blankFractionHistogram = self.get_blank_fraction_histogram()
 
         barcodeBins = np.array(
@@ -233,11 +455,12 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         thresholdedBlankFraction = blankFractionHistogram < blankThreshold
         return barcodeSet[np.take(thresholdedBlankFraction, raveledIndexes)]
 
-    @staticmethod
-    def _extract_counts(barcodes, intensityBins, distanceBins, areaBins):
+    def _extract_counts(self, barcodes, intensityBins, distanceBins, areaBins):
         barcodeData = barcodes[
             ['mean_intensity', 'min_distance', 'area']].values
-        barcodeData[:, 0] = np.log10(barcodeData[:, 0])
+        intensityTransform = _get_intensity_transform_method(self.parameters)
+        barcodeData[:, 0] = _transform_intensity_values(
+            barcodeData[:, 0], intensityTransform)
         return np.histogramdd(
             barcodeData, bins=(intensityBins, distanceBins, areaBins))[0]
 
@@ -246,7 +469,6 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
             self.parameters['decode_task'])
         codebook = decodeTask.get_codebook()
         barcodeDB = decodeTask.get_barcode_database()
-
         completeFragments = \
             self.dataSet.load_numpy_analysis_result_if_available(
                 'complete_fragments', self, [False]*self.fragment_count())
@@ -256,9 +478,11 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
 
         areaBins = self.dataSet.load_numpy_analysis_result_if_available(
             'area_bins', self, np.arange(1, self.parameters['area_bins'] + 2))
+        defaultDistanceBins = np.linspace(
+            0, decodeTask.parameters['distance_threshold'] + 0.01,
+            self.parameters['distance_bins'] + 1)
         distanceBins = self.dataSet.load_numpy_analysis_result_if_available(
-            'distance_bins', self,
-            np.linspace(0, decodeTask.parameters['distance_threshold'] + 0.01, self.parameters['distance_bins'] + 1))
+            'distance_bins', self, defaultDistanceBins)
         intensityBins = self.dataSet.load_numpy_analysis_result_if_available(
             'intensity_bins', self, None)
 
@@ -269,12 +493,13 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
 
         self.dataSet.save_numpy_analysis_result(
             areaBins, 'area_bins', self)
-        self.dataSet.save_numpy_analysis_result(
-            distanceBins, 'distance_bins', self)
+        if distanceBins is not None:
+            self.dataSet.save_numpy_analysis_result(
+                distanceBins, 'distance_bins', self)
 
         updated = False
         while not all(completeFragments):
-            if (intensityBins is None or
+            if (intensityBins is None or distanceBins is None or
                     blankCounts is None or codingCounts is None):
                 for i in range(self.fragment_count()):
                     if not pendingFragments[i] and decodeTask.is_complete(i):
@@ -283,15 +508,19 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                 if np.sum(pendingFragments) >= min(20, self.fragment_count()):
                     def extreme_values(inputData: pandas.Series):
                         return inputData.min(), inputData.max()
+                    sampleSize = min(20, np.sum(pendingFragments))
                     sampledFragments = np.random.choice(
                             [i for i, p in enumerate(pendingFragments) if p],
-                            size=20)
+                            size=sampleSize, replace=False)
                     intensityExtremes = [
                         extreme_values(barcodeDB.get_barcodes(
                             i, columnList=['mean_intensity'])['mean_intensity'])
                         for i in sampledFragments]
-                    maxIntensity = np.log10(np.max([x[1] for x in intensityExtremes]))
-                    intensityBins = np.linspace(0, 2 * maxIntensity, self.parameters['intensity_bins'] + 1)
+                    maxIntensity = np.max([x[1] for x in intensityExtremes])
+                    intensityBins = _build_intensity_bins(
+                        maxIntensity,
+                        self.parameters['intensity_bins'],
+                        _get_intensity_transform_method(self.parameters))
                     self.dataSet.save_numpy_analysis_result(
                         intensityBins, 'intensity_bins', self)
 
@@ -380,6 +609,10 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
 
         threshold = adaptiveTask.calculate_threshold_for_misidentification_rate(
             self.parameters['misidentification_rate'])
+        if not np.isfinite(threshold):
+            raise RuntimeError('Adaptive threshold is non-finite. '
+                               'Check threshold histograms and codebook '
+                               'blank/coding assignments.')
 
         bcDatabase = self.get_barcode_database()
         currentBarcodes = decodeTask.get_barcode_database()\
@@ -402,6 +635,160 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
     # lets expose this filtering here, it feels more natural than in decode
     # I don't want to waste time filtering during the decode step with gpu nodes
     # same function from decode.py
+    def _remove_z_duplicate_barcodes(self, bc):
+        bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(
+            bc, self.parameters['z_duplicate_zPlane_threshold'],
+            self.parameters['z_duplicate_xy_pixel_threshold'],
+            self.dataSet.get_z_positions())
+        return bc
+
+
+class LogisticFilterBarcodes(AbstractFilterBarcodes):
+
+    """
+    A per-FOV barcode filter that fits a logistic model to distinguish blank
+    from coding barcodes using mean intensity, minimum distance, and area.
+    """
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+
+        if 'misidentification_rate' not in self.parameters:
+            self.parameters['misidentification_rate'] = 0.05
+        if 'l2_regularization' not in self.parameters:
+            self.parameters['l2_regularization'] = 1.0
+        if 'max_iterations' not in self.parameters:
+            self.parameters['max_iterations'] = 200
+        if 'remove_z_duplicated_barcodes' not in self.parameters:
+            self.parameters['remove_z_duplicated_barcodes'] = False
+        if self.parameters['remove_z_duplicated_barcodes']:
+            if 'z_duplicate_zPlane_threshold' not in self.parameters:
+                self.parameters['z_duplicate_zPlane_threshold'] = 1
+            if 'z_duplicate_xy_pixel_threshold' not in self.parameters:
+                self.parameters['z_duplicate_xy_pixel_threshold'] = np.sqrt(2)
+
+    def fragment_count(self):
+        return len(self.dataSet.get_fovs())
+
+    def get_estimated_memory(self):
+        return 1000
+
+    def get_estimated_time(self):
+        return 60
+
+    def get_dependencies(self):
+        return [self.parameters['decode_task']]
+
+    def _run_analysis(self, fragmentIndex):
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        codebook = decodeTask.get_codebook()
+        blankIndexes = set(codebook.get_blank_indexes())
+        codingIndexes = set(codebook.get_coding_indexes())
+        blankBarcodeCount = len(blankIndexes)
+        codingBarcodeCount = len(codingIndexes)
+
+        currentBarcodes = decodeTask.get_barcode_database()\
+            .get_barcodes(fragmentIndex)
+        featureColumns = ['mean_intensity', 'min_distance', 'area']
+        validBarcodeMask = currentBarcodes['barcode_id'].isin(
+            list(blankIndexes | codingIndexes)).values
+        finiteFeatureMask = np.isfinite(
+            currentBarcodes.loc[:, featureColumns].values.astype(float)
+        ).all(axis=1)
+        fitMask = validBarcodeMask & finiteFeatureMask
+        fitBarcodes = currentBarcodes.loc[fitMask, :]
+
+        bcDatabase = self.get_barcode_database()
+        if fitBarcodes.empty:
+            bcDatabase.write_barcodes(currentBarcodes.iloc[0:0],
+                                      fov=fragmentIndex)
+            self._save_filter_summary(
+                fragmentIndex, currentBarcodes, currentBarcodes.iloc[0:0],
+                None, np.nan, {
+                    'selected_count': 0,
+                    'selected_blank_count': 0,
+                    'selected_coding_count': 0,
+                    'estimated_misidentification_rate': np.nan},
+                False, 'no finite barcodes to fit')
+            return
+
+        features = fitBarcodes.loc[:, featureColumns].values.astype(float)
+        isBlank = fitBarcodes['barcode_id'].isin(blankIndexes).values
+        if np.unique(isBlank).size < 2:
+            if np.any(isBlank):
+                selectedMask = np.zeros(len(currentBarcodes), dtype=bool)
+                reason = 'only blank barcodes available'
+            else:
+                selectedMask = fitMask
+                reason = 'only coding barcodes available'
+            selectedBarcodes = currentBarcodes.loc[selectedMask, :]
+            bcDatabase.write_barcodes(selectedBarcodes, fov=fragmentIndex)
+            self._save_filter_summary(
+                fragmentIndex, currentBarcodes, selectedBarcodes, None, np.nan,
+                {
+                    'selected_count': int(len(selectedBarcodes)),
+                    'selected_blank_count': 0,
+                    'selected_coding_count': int(len(selectedBarcodes)),
+                    'estimated_misidentification_rate': 0.0},
+                False, reason)
+            return
+
+        coefficients, centers, scales, fitSuccess = _fit_logistic_regression(
+            features, isBlank.astype(int),
+            self.parameters['l2_regularization'],
+            self.parameters['max_iterations'])
+        blankProbability = _score_logistic_regression(
+            features, coefficients, centers, scales)
+        threshold, selectionSummary = _select_logistic_probability_threshold(
+            blankProbability, isBlank, blankBarcodeCount, codingBarcodeCount,
+            self.parameters['misidentification_rate'])
+
+        keepFitRows = blankProbability <= threshold
+        selectedBarcodes = fitBarcodes.loc[keepFitRows, :].copy()
+
+        if self.parameters['remove_z_duplicated_barcodes']:
+            selectedBarcodes = self._remove_z_duplicate_barcodes(
+                selectedBarcodes)
+
+        bcDatabase.write_barcodes(selectedBarcodes, fov=fragmentIndex)
+        model = {
+            'feature_columns': featureColumns,
+            'coefficients': coefficients.tolist(),
+            'feature_centers': centers.tolist(),
+            'feature_scales': scales.tolist()}
+        self._save_filter_summary(
+            fragmentIndex, currentBarcodes, selectedBarcodes, model, threshold,
+            selectionSummary, fitSuccess, 'ok')
+
+    def _save_filter_summary(self, fragmentIndex, inputBarcodes,
+                             selectedBarcodes, model, threshold,
+                             selectionSummary, fitSuccess, reason):
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        codebook = decodeTask.get_codebook()
+        blankIndexes = set(codebook.get_blank_indexes())
+        inputBlank = int(inputBarcodes['barcode_id'].isin(blankIndexes).sum())
+        outputBlank = int(selectedBarcodes['barcode_id'].isin(blankIndexes).sum())
+        summary = {
+            'fov': int(fragmentIndex),
+            'decode_task': self.parameters['decode_task'],
+            'misidentification_rate': self.parameters['misidentification_rate'],
+            'l2_regularization': self.parameters['l2_regularization'],
+            'fit_success': bool(fitSuccess),
+            'reason': reason,
+            'probability_threshold': threshold,
+            'input_count': int(len(inputBarcodes)),
+            'input_blank_count': inputBlank,
+            'input_coding_count': int(len(inputBarcodes) - inputBlank),
+            'output_count': int(len(selectedBarcodes)),
+            'output_blank_count': outputBlank,
+            'output_coding_count': int(len(selectedBarcodes) - outputBlank),
+            'selection': selectionSummary,
+            'model': model}
+        self.dataSet.save_json_analysis_result(
+            summary, 'logistic_filter_summary', self, fragmentIndex)
+
     def _remove_z_duplicate_barcodes(self, bc):
         bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(
             bc, self.parameters['z_duplicate_zPlane_threshold'],
@@ -434,6 +821,16 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
 
         if 'neighbors' not in self.parameters:
             self.parameters['neighbors'] = 15
+        if 'intensity_bins' not in self.parameters:
+            self.parameters['intensity_bins'] = 199
+        if 'area_bins' not in self.parameters:
+            self.parameters['area_bins'] = 33
+        if 'distance_bins' not in self.parameters:
+            self.parameters['distance_bins'] = 66
+        if 'threshold_solver_method' not in self.parameters:
+            self.parameters['threshold_solver_method'] = 'newton'
+        if 'intensity_transform' not in self.parameters:
+            self.parameters['intensity_transform'] = 'log10'
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -545,14 +942,32 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
         Returns: the normalized blank fraction threshold that achieves
             targetMisidentificationRate
         """
-        tolerance = self.parameters['tolerance']
-        def misidentification_rate_error_for_threshold(x, targetError):
-            return self.calculate_misidentification_rate_for_threshold(x, fragmentIndex) \
-                - targetError
-        return optimize.newton(
-            misidentification_rate_error_for_threshold, 0.2,
-            args=[targetMisidentificationRate], tol=tolerance, x1=0.3,
-            disp=False)
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        codebook = decodeTask.get_codebook()
+        blankBarcodeCount = len(codebook.get_blank_indexes())
+        codingBarcodeCount = len(codebook.get_coding_indexes())
+        solverMethod = self.parameters.get(
+            'threshold_solver_method', 'newton')
+        if solverMethod == 'cumulative_bins':
+            return _threshold_from_cumulative_bins(
+                self.get_blank_count_histogram(fragmentIndex),
+                self.get_coding_count_histogram(fragmentIndex),
+                self.get_blank_fraction_histogram(fragmentIndex),
+                targetMisidentificationRate,
+                blankBarcodeCount,
+                codingBarcodeCount)
+        if solverMethod == 'newton':
+            tolerance = self.parameters['tolerance']
+
+            def misidentification_rate_error_for_threshold(x):
+                return self.calculate_misidentification_rate_for_threshold(
+                    x, fragmentIndex) - targetMisidentificationRate
+
+            return _threshold_from_newton(
+                misidentification_rate_error_for_threshold, tolerance)
+        raise ValueError('Unrecognized threshold_solver_method: '
+                         + str(solverMethod))
 
     def calculate_barcode_count_for_threshold(self, threshold: float, fragmentIndex) -> float:
         """ Calculate the number of barcodes remaining after applying
@@ -575,7 +990,9 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
                                         ) -> pandas.DataFrame:
         selectData = barcodeSet[
             ['mean_intensity', 'min_distance', 'area']].values
-        selectData[:, 0] = np.log10(selectData[:, 0])
+        intensityTransform = _get_intensity_transform_method(self.parameters)
+        selectData[:, 0] = _transform_intensity_values(
+            selectData[:, 0], intensityTransform)
         blankFractionHistogram = self.get_blank_fraction_histogram(fragmentIndex)
 
         barcodeBins = np.array(
@@ -596,11 +1013,12 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
         thresholdedBlankFraction = blankFractionHistogram < blankThreshold
         return barcodeSet[np.take(thresholdedBlankFraction, raveledIndexes)]
 
-    @staticmethod
-    def _extract_counts(barcodes, intensityBins, distanceBins, areaBins):
+    def _extract_counts(self, barcodes, intensityBins, distanceBins, areaBins):
         barcodeData = barcodes[
             ['mean_intensity', 'min_distance', 'area']].values
-        barcodeData[:, 0] = np.log10(barcodeData[:, 0])
+        intensityTransform = _get_intensity_transform_method(self.parameters)
+        barcodeData[:, 0] = _transform_intensity_values(
+            barcodeData[:, 0], intensityTransform)
         return np.histogramdd(
             barcodeData, bins=(intensityBins, distanceBins, areaBins))[0]
 
@@ -610,16 +1028,15 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
             self.parameters['decode_task'])
         codebook = decodeTask.get_codebook()
         barcodeDB = decodeTask.get_barcode_database()
-
-
         areaBins = self.dataSet.load_numpy_analysis_result_if_available(
-            'area_bins', self, np.arange(1, 35), fragmentIndex)
+            'area_bins', self,
+            np.arange(1, self.parameters['area_bins'] + 2),
+            fragmentIndex)
         
+        defaultDistanceBins = np.arange(
+            0, decodeTask.parameters['distance_threshold'] + 0.02, 0.01)
         distanceBins = self.dataSet.load_numpy_analysis_result_if_available(
-            'distance_bins', self,
-            np.arange(
-                0, decodeTask.parameters['distance_threshold']+0.02, 0.01),
-                fragmentIndex)
+            'distance_bins', self, defaultDistanceBins, fragmentIndex)
         
         intensityBins = self.dataSet.load_numpy_analysis_result_if_available(
             'intensity_bins', self, None,
@@ -632,8 +1049,9 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
 
         self.dataSet.save_numpy_analysis_result(
             areaBins, 'area_bins', self, fragmentIndex)
-        self.dataSet.save_numpy_analysis_result(
-            distanceBins, 'distance_bins', self, fragmentIndex)
+        if distanceBins is not None:
+            self.dataSet.save_numpy_analysis_result(
+                distanceBins, 'distance_bins', self, fragmentIndex)
 
         def extreme_values(inputData: pandas.Series):
             return inputData.min(), inputData.max()
@@ -647,10 +1065,11 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
                 i, columnList=['mean_intensity'])['mean_intensity'])
             for i in sampledFragments]
         
-        maxIntensity = np.log10(
-                np.max([x[1] for x in intensityExtremes]))
-        intensityBins = np.arange(0, 2 * maxIntensity,
-                                    maxIntensity / 100)
+        maxIntensity = np.max([x[1] for x in intensityExtremes])
+        intensityBins = _build_intensity_bins(
+            maxIntensity,
+            self.parameters['intensity_bins'],
+            _get_intensity_transform_method(self.parameters))
         
         self.dataSet.save_numpy_analysis_result(
             intensityBins, 'intensity_bins', self, fragmentIndex)
@@ -714,6 +1133,10 @@ class AdaptiveFilterBarcodesLocal(AdaptiveFilterBarcodes):
         threshold = adaptiveTask.calculate_threshold_for_misidentification_rate(
             self.parameters['misidentification_rate'],
             fragmentIndex)
+        if not np.isfinite(threshold):
+            raise RuntimeError('Adaptive threshold is non-finite. '
+                               'Check threshold histograms and codebook '
+                               'blank/coding assignments.')
 
         bcDatabase = self.get_barcode_database()
         currentBarcodes = decodeTask.get_barcode_database()\
