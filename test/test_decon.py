@@ -3,7 +3,6 @@ import numpy as np
 import random
 
 import merlin.util.deconvolve as deconvolve
-import merlin.util.matlab as matlab
 
 
 decon_sigma = 2

@@ -41,4 +41,3 @@ For more information on installation and usage, please see the [documentation](h
 
 Contributions are welcome! Please see the 
 [documentation](https://emanuega.github.io/MERlin/contributing.html) for contribution guidelines.
-

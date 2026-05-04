@@ -262,5 +262,15 @@ class PyTablesBarcodeDB(BarcodeDB):
                 'a', 'barcode_data', self._analysisTask, fov, 'barcodes'
         ) as pandasHDF:
             tablesType = self._get_bc_column_types()
-            pandasHDF.append('barcodes', barcodeInformation.astype(tablesType),
-                             format='table')
+            barcodeInformation = barcodeInformation.copy()
+            missingColumns = [
+                column for column in tablesType
+                if column not in barcodeInformation.columns
+            ]
+            for column in missingColumns:
+                barcodeInformation[column] = np.nan
+
+            pandasHDF.append(
+                'barcodes',
+                barcodeInformation.astype(tablesType),
+                format='table')

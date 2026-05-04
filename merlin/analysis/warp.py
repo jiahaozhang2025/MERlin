@@ -187,7 +187,13 @@ class Warp(analysistask.ParallelAnalysisTask):
                         metadata=imageDescription)
         
         if self.parameters['write_fiducial_images']:
-            if self.parameters['write_fiducial_FOVs'] == [-1] or (fov in self.parameters['write_fiducial_FOVs']):
+            fiducialFOVs = self.parameters['write_fiducial_FOVs']
+            if isinstance(fiducialFOVs, np.ndarray):
+                fiducialFOVs = fiducialFOVs.tolist()
+            elif not isinstance(fiducialFOVs, list):
+                fiducialFOVs = list(fiducialFOVs)
+
+            if fiducialFOVs == [-1] or (fov in fiducialFOVs):
                 fiducialImageDescription = self.dataSet.analysis_tiff_description(
                     1, len(dataChannels))
                     
