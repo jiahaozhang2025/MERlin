@@ -25,6 +25,8 @@ Snakemake and a cluster scheduler. The pipeline covers image registration,
 preprocessing, barcode decoding and filtering, cell segmentation, and export
 of spatial features and barcode data.
 
+![Image of MERlin](docs/_static/merlin_headline.png "MERlin - the MERFISH decoding software")
+
 See [DETAILED_CHANGES.md](DETAILED_CHANGES.md) for the module-by-module
 tree comparison, parameters, caveats, and exact history boundary.
 
