@@ -1,4 +1,4 @@
-# Detailed changes from the `gpu_decoding` baseline
+# Detailed changes from the forked baseline
 
 ## Scope and comparison point
 
@@ -8,40 +8,6 @@ This document describes the functional differences between:
   from `aaronhalpern/MERlin:gpu_decoding`.
 - **Documented code snapshot:** commit
   `a81de98e618acb253c5865ea952f964bc763d373` on `main`.
-
-The functional comparison is based on the two Git tree snapshots. Generated
-Python bytecode, packaging metadata, line-ending changes, and executable-bit
-changes are not treated as functional software changes.
-
-## History boundary
-
-The source provenance is known, but the histories are not connected. Commit
-`5dbbd02` is a root commit with no parent, while `forked` retains Aaron
-Halpern's complete `gpu_decoding` ancestry. Git therefore cannot prove a
-commit-by-commit path from `15ce55f` to the imported local snapshot.
-
-This repository preserves both sides explicitly:
-
-- `forked` records the upstream baseline and its history.
-- `main` records the imported local snapshot and every subsequent commit that
-  remains available.
-
-The retained commits on `main` through the documented snapshot are:
-
-| Commit | Subject |
-| --- | --- |
-| `5dbbd02` | `my changes` |
-| `21f757f` | `cleaning` |
-| `b3bdd73` | `Update README with source and fork information` |
-| `0833c53` | `Document repository origin and adaptation details` |
-| `53946b5` | `Update README with corrected fork and original links` |
-| `dfd532e` | `cleaning` |
-| `88b881c` | `update` |
-| `a81de98` | `Save current MERlin working tree` |
-
-Because several commit subjects are intentionally broad and the pre-import
-history is unavailable, the module-level tree comparison below is the
-authoritative description of behavior.
 
 ## 1. Decoding pipeline
 
@@ -166,76 +132,7 @@ without additional configuration.
   Lucy–Richardson/Guo processing.
 - High-pass filtering is exposed as a shared image utility.
 
-## 4. Cell segmentation
-
-### `merlin/analysis/segment.py`
-
-`CellPoseSegmentMultiChannel` is a new segmentation task that:
-
-- Loads multiple named data channels for each field of view.
-- Supports built-in Cellpose models or a user-supplied model.
-- Exposes Cellpose diameter, channel mapping, model type, minimum size, GPU,
-  flow-threshold, and cell-probability settings.
-- Can save preprocessed image stacks and segmented masks for inspection.
-- Combines adjacent 2D masks into 3D objects using overlap criteria.
-- Converts the resulting labels into MERlin `SpatialFeature` objects in
-  global coordinates.
-
-Existing segmentation and cell-boundary cleanup code was also updated for the
-newer geometry and graph-library APIs.
-
-## 5. Registration and 3D fiducials
-
-### `merlin/analysis/warp.py`
-
-`FiducialCorrelationWarp3D` was expanded to combine three corrections:
-
-1. XY piezo-drift correction using calibration functions.
-2. Standard 2D fiducial-frame registration.
-3. XYZ registration from 3D fiducial bead stacks.
-
-The task saves a per-field-of-view transformation table containing channel,
-original and corrected z positions, x/y shifts, and raw z shifts. Aligned
-images interpolate between neighboring z planes before applying XY and
-optional chromatic corrections.
-
-The 2D warp path also contains updates to transformation processing and edge
-handling.
-
-### `merlin/data/dataorganization.py`
-
-The data-organization model now supports fields and accessors for:
-
-- 3D fiducial filenames
-- 3D fiducial stack frame indices
-- 3D fiducial stack z positions
-
-These values feed the 3D registration workflow.
-
-## 6. Data access, image formats, and compatibility
-
-### `merlin/util/imagereader.py`
-
-- Adds an experimental local `ZarrReader`.
-- Recognizes `.zarr` inputs through the reader factory.
-- Adds optional TIFF-frame casting to unsigned 16-bit data.
-
-### `merlin/util/dataportal.py`
-
-- Google Cloud Storage imports are optional until GCS functionality is used.
-- GCS reads use retry/backoff logic for transient failures.
-
-### Other compatibility changes
-
-- Spatial-feature graph access was updated for NetworkX 3 APIs.
-- Geometry handling was adjusted for current Shapely behavior.
-- Barcode database, image, and data-organization code contains related
-  compatibility fixes.
-- The repository continues to use the dependency constraints already present
-  at the `gpu_decoding` baseline, including `numpy==1.26.4`,
-  `networkx>=3.0`, `shapely>=2.0`, `pulp==2.7.0`, and `cellpose==2.2`.
-
-## 7. Repository-level changes
+## 4. Repository-level changes
 
 Relative to the baseline:
 
