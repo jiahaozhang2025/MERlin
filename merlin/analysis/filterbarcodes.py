@@ -22,54 +22,126 @@ def _extract_finite_threshold_candidates(blank_fraction_hist: np.ndarray,
     return finite_values
 
 
-def _threshold_from_cumulative_bins(blank_hist: np.ndarray,
-                                    coding_hist: np.ndarray,
-                                    blank_fraction_hist: np.ndarray,
-                                    target_misidentification_rate: float,
-                                    blank_barcode_count: int,
-                                    coding_barcode_count: int) -> float:
-    """
-    Select threshold by sorting bins by normalized blank fraction, then
-    cumulatively including bins until estimated misidentification exceeds target.
-    """
+def _cumulative_misid_curve(blank_hist: np.ndarray,
+                            coding_hist: np.ndarray,
+                            blank_fraction_hist: np.ndarray,
+                            blank_barcode_count: int,
+                            coding_barcode_count: int):
+    """Sort bins by normalized blank fraction and return
+    (ratios_sorted, cumulative_misid, finite_indices), or None if empty.
+
+    cumulative_misid[k] is the misidentification rate achieved by keeping every
+    bin whose blank fraction is <= ratios_sorted[k] (a whole-bin selection). The
+    curve is monotonically non-decreasing in k."""
     valid = (
         np.isfinite(blank_fraction_hist)
         & (blank_fraction_hist >= 0)
         & (coding_hist > 0)
     )
     if not np.any(valid):
-        return np.nan
-
+        return None
     ratios = blank_fraction_hist[valid].astype(float)
     blank_vals = blank_hist[valid].astype(float)
     coding_vals = coding_hist[valid].astype(float)
-
     order = np.argsort(ratios)
     ratios = ratios[order]
     blank_vals = blank_vals[order]
     coding_vals = coding_vals[order]
-
     cum_blank = np.cumsum(blank_vals)
     cum_coding = np.cumsum(coding_vals)
-
     with np.errstate(divide='ignore', invalid='ignore'):
         cumulative_misid = ((cum_blank / blank_barcode_count)
                             / (cum_coding / coding_barcode_count))
-
     finite = np.isfinite(cumulative_misid)
     if not np.any(finite):
+        return None
+    return ratios, cumulative_misid, np.where(finite)[0]
+
+
+def cumulative_bins_bracketing(blank_hist: np.ndarray,
+                               coding_hist: np.ndarray,
+                               blank_fraction_hist: np.ndarray,
+                               target_misidentification_rate: float,
+                               blank_barcode_count: int,
+                               coding_barcode_count: int) -> dict:
+    """Report the two whole-bin blank-fraction thresholds that bracket the target
+    misidentification rate: the largest achievable misid that is <= target
+    (``below``) and the smallest achievable misid that is > target (``above``),
+    along with the misid each achieves. A side is None when it does not exist."""
+    report = {
+        'target_misidentification_rate': float(target_misidentification_rate),
+        'below_threshold': None, 'below_misid': None,
+        'above_threshold': None, 'above_misid': None}
+    curve = _cumulative_misid_curve(
+        blank_hist, coding_hist, blank_fraction_hist,
+        blank_barcode_count, coding_barcode_count)
+    if curve is None:
+        return report
+    ratios, cumulative_misid, finite_idx = curve
+    below = finite_idx[cumulative_misid[finite_idx]
+                       <= target_misidentification_rate]
+    above = finite_idx[cumulative_misid[finite_idx]
+                       > target_misidentification_rate]
+    if below.size > 0:
+        i = int(below[-1])
+        report['below_threshold'] = float(np.nextafter(ratios[i], np.inf))
+        report['below_misid'] = float(cumulative_misid[i])
+    if above.size > 0:
+        i = int(above[0])
+        report['above_threshold'] = float(np.nextafter(ratios[i], np.inf))
+        report['above_misid'] = float(cumulative_misid[i])
+    return report
+
+
+def _threshold_from_cumulative_bins(blank_hist: np.ndarray,
+                                    coding_hist: np.ndarray,
+                                    blank_fraction_hist: np.ndarray,
+                                    target_misidentification_rate: float,
+                                    blank_barcode_count: int,
+                                    coding_barcode_count: int,
+                                    overshoot_toward_target: bool = False,
+                                    overshoot_tolerance: float = 0.20) -> float:
+    """
+    Select threshold by sorting bins by normalized blank fraction, then
+    cumulatively including whole bins. Both this method and the newton solver
+    only ever keep whole bins (a barcode is kept iff its bin's blank fraction is
+    below the returned threshold); the threshold is just the blank-fraction
+    cutoff, not a sub-bin boundary.
+
+    By default the largest whole-bin set with misid <= target is returned, which
+    undershoots the target (the next whole bin would push misid over target).
+    If ``overshoot_toward_target`` is True, and adding that next bin lands closer
+    to the target than stopping short (|misid_over - target| < |target -
+    misid_under|) AND stays within ``overshoot_tolerance`` (misid_over <=
+    target*(1+overshoot_tolerance)), the next bin is included instead (a slight
+    overshoot that is nearer the target).
+    """
+    curve = _cumulative_misid_curve(
+        blank_hist, coding_hist, blank_fraction_hist,
+        blank_barcode_count, coding_barcode_count)
+    if curve is None:
         return np.nan
+    ratios, cumulative_misid, finite_idx = curve
+    below = finite_idx[cumulative_misid[finite_idx]
+                       <= target_misidentification_rate]
+    above = finite_idx[cumulative_misid[finite_idx]
+                       > target_misidentification_rate]
 
-    finite_idx = np.where(finite)[0]
-    valid_idx = finite_idx[cumulative_misid[finite_idx]
-                           <= target_misidentification_rate]
+    if below.size == 0:
+        # nothing reaches at/under the target; fall back to the lowest-misid bin
+        return float(np.nextafter(ratios[int(finite_idx[0])], np.inf))
 
-    if valid_idx.size > 0:
-        selected_idx = int(valid_idx[-1])
-        return float(np.nextafter(ratios[selected_idx], np.inf))
-
-    min_idx = int(finite_idx[0])
-    return float(np.nextafter(ratios[min_idx], np.inf))
+    chosen_idx = int(below[-1])
+    if overshoot_toward_target and above.size > 0:
+        over_idx = int(above[0])
+        under_mag = target_misidentification_rate - cumulative_misid[chosen_idx]
+        over_mag = cumulative_misid[over_idx] - target_misidentification_rate
+        within_tolerance = (
+            cumulative_misid[over_idx]
+            <= target_misidentification_rate * (1.0 + overshoot_tolerance))
+        if (over_mag < under_mag) and within_tolerance:
+            chosen_idx = over_idx
+    return float(np.nextafter(ratios[chosen_idx], np.inf))
 
 
 def _threshold_from_newton(error_fn, tolerance: float) -> float:
@@ -283,10 +355,16 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         if 'area_bins' not in self.parameters:
             self.parameters['area_bins'] = 33
         if 'threshold_solver_method' not in self.parameters:
-            self.parameters['threshold_solver_method'] = 'newton'
+            self.parameters['threshold_solver_method'] = 'cumulative_bins'
         if 'intensity_transform' not in self.parameters:
             self.parameters['intensity_transform'] = 'log10'
-        
+        if 'overshoot_toward_target' not in self.parameters:
+            self.parameters['overshoot_toward_target'] = False
+        if 'overshoot_tolerance' not in self.parameters:
+            self.parameters['overshoot_tolerance'] = 0.20
+        if 'report_bracketing_thresholds' not in self.parameters:
+            self.parameters['report_bracketing_thresholds'] = False
+
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
 
@@ -393,6 +471,15 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         codingBarcodeCount = len(codebook.get_coding_indexes())
         solverMethod = self.parameters.get(
             'threshold_solver_method', 'newton')
+        if self.parameters.get('report_bracketing_thresholds', False):
+            self.dataSet.save_json_analysis_result(
+                cumulative_bins_bracketing(
+                    self.get_blank_count_histogram(),
+                    self.get_coding_count_histogram(),
+                    self.get_blank_fraction_histogram(),
+                    targetMisidentificationRate,
+                    blankBarcodeCount, codingBarcodeCount),
+                'threshold_bracketing', self)
         if solverMethod == 'cumulative_bins':
             return _threshold_from_cumulative_bins(
                 self.get_blank_count_histogram(),
@@ -400,7 +487,11 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                 self.get_blank_fraction_histogram(),
                 targetMisidentificationRate,
                 blankBarcodeCount,
-                codingBarcodeCount)
+                codingBarcodeCount,
+                overshoot_toward_target=self.parameters.get(
+                    'overshoot_toward_target', False),
+                overshoot_tolerance=self.parameters.get(
+                    'overshoot_tolerance', 0.20))
         if solverMethod == 'newton':
             tolerance = self.parameters['tolerance']
 
@@ -461,8 +552,24 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         intensityTransform = _get_intensity_transform_method(self.parameters)
         barcodeData[:, 0] = _transform_intensity_values(
             barcodeData[:, 0], intensityTransform)
-        return np.histogramdd(
-            barcodeData, bins=(intensityBins, distanceBins, areaBins))[0]
+        shape = (len(intensityBins) - 1, len(distanceBins) - 1,
+                 len(areaBins) - 1)
+        counts = np.zeros(shape, dtype=float)
+        if barcodeData.shape[0] == 0:
+            return counts
+        # Bin identically to extract_barcodes_with_threshold: digitize + clip so
+        # out-of-range barcodes are counted in the edge bins instead of being
+        # dropped (as np.histogramdd would). This keeps the histogram used to
+        # pick the threshold consistent with how the threshold is later applied,
+        # so the achieved misidentification rate matches the target estimate.
+        iBin = np.clip(np.digitize(barcodeData[:, 0], intensityBins,
+                                   right=True) - 1, 0, shape[0] - 1)
+        dBin = np.clip(np.digitize(barcodeData[:, 1], distanceBins,
+                                   right=True) - 1, 0, shape[1] - 1)
+        aBin = np.clip(np.digitize(barcodeData[:, 2], areaBins) - 1,
+                       0, shape[2] - 1)
+        np.add.at(counts, (iBin, dBin, aBin), 1)
+        return counts
 
     def _run_analysis(self):
         decodeTask = self.dataSet.load_analysis_task(
@@ -828,9 +935,15 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
         if 'distance_bins' not in self.parameters:
             self.parameters['distance_bins'] = 66
         if 'threshold_solver_method' not in self.parameters:
-            self.parameters['threshold_solver_method'] = 'newton'
+            self.parameters['threshold_solver_method'] = 'cumulative_bins'
         if 'intensity_transform' not in self.parameters:
             self.parameters['intensity_transform'] = 'log10'
+        if 'overshoot_toward_target' not in self.parameters:
+            self.parameters['overshoot_toward_target'] = False
+        if 'overshoot_tolerance' not in self.parameters:
+            self.parameters['overshoot_tolerance'] = 0.20
+        if 'report_bracketing_thresholds' not in self.parameters:
+            self.parameters['report_bracketing_thresholds'] = False
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -949,6 +1062,15 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
         codingBarcodeCount = len(codebook.get_coding_indexes())
         solverMethod = self.parameters.get(
             'threshold_solver_method', 'newton')
+        if self.parameters.get('report_bracketing_thresholds', False):
+            self.dataSet.save_json_analysis_result(
+                cumulative_bins_bracketing(
+                    self.get_blank_count_histogram(fragmentIndex),
+                    self.get_coding_count_histogram(fragmentIndex),
+                    self.get_blank_fraction_histogram(fragmentIndex),
+                    targetMisidentificationRate,
+                    blankBarcodeCount, codingBarcodeCount),
+                'threshold_bracketing', self, fragmentIndex)
         if solverMethod == 'cumulative_bins':
             return _threshold_from_cumulative_bins(
                 self.get_blank_count_histogram(fragmentIndex),
@@ -956,7 +1078,11 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
                 self.get_blank_fraction_histogram(fragmentIndex),
                 targetMisidentificationRate,
                 blankBarcodeCount,
-                codingBarcodeCount)
+                codingBarcodeCount,
+                overshoot_toward_target=self.parameters.get(
+                    'overshoot_toward_target', False),
+                overshoot_tolerance=self.parameters.get(
+                    'overshoot_tolerance', 0.20))
         if solverMethod == 'newton':
             tolerance = self.parameters['tolerance']
 
@@ -1019,8 +1145,24 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
         intensityTransform = _get_intensity_transform_method(self.parameters)
         barcodeData[:, 0] = _transform_intensity_values(
             barcodeData[:, 0], intensityTransform)
-        return np.histogramdd(
-            barcodeData, bins=(intensityBins, distanceBins, areaBins))[0]
+        shape = (len(intensityBins) - 1, len(distanceBins) - 1,
+                 len(areaBins) - 1)
+        counts = np.zeros(shape, dtype=float)
+        if barcodeData.shape[0] == 0:
+            return counts
+        # Bin identically to extract_barcodes_with_threshold: digitize + clip so
+        # out-of-range barcodes are counted in the edge bins instead of being
+        # dropped (as np.histogramdd would). This keeps the histogram used to
+        # pick the threshold consistent with how the threshold is later applied,
+        # so the achieved misidentification rate matches the target estimate.
+        iBin = np.clip(np.digitize(barcodeData[:, 0], intensityBins,
+                                   right=True) - 1, 0, shape[0] - 1)
+        dBin = np.clip(np.digitize(barcodeData[:, 1], distanceBins,
+                                   right=True) - 1, 0, shape[1] - 1)
+        aBin = np.clip(np.digitize(barcodeData[:, 2], areaBins) - 1,
+                       0, shape[2] - 1)
+        np.add.at(counts, (iBin, dBin, aBin), 1)
+        return counts
 
     def _run_analysis(self, fragmentIndex):
 
