@@ -54,10 +54,26 @@ class Decode(BarcodeSavingParallelAnalysisTask):
 
         if 'crop_width' not in self.parameters:
             self.parameters['crop_width'] = 100
+        if 'crop_in_image_space' not in self.parameters:
+            # When True, crop_width is applied in IMAGE space (the image is
+            # cropped by crop_width on every edge BEFORE decoding) and ALL
+            # decoded barcodes are kept (no barcode-space edge filter). Local
+            # x,y stay in the cropped frame; crop_width is added back only when
+            # computing global coordinates.
+            # Default is image-space: it places the FOV corner at raw pixel
+            # (0,0) (crop_offset = +crop_width), matching how segmentation and
+            # stage positions are defined. The barcode-space path (False)
+            # assumes stage positions are calibrated to pixel (crop_width,
+            # crop_width) and subtracts crop_width, which shifts barcodes by
+            # -crop_width*mpp relative to the segmentation -> mispartitioning.
+            self.parameters['crop_in_image_space'] = True
         if 'write_decoded_images' not in self.parameters:
             self.parameters['write_decoded_images'] = True
         if 'write_decoded_FOVs' not in self.parameters:
             self.parameters['write_decoded_FOVs'] = list(range(self.fragment_count()))
+        if 'write_decoded_z' not in self.parameters:
+            # None = save all z; otherwise list of zIndexes to write images for
+            self.parameters['write_decoded_z'] = None
         if 'minimum_area' not in self.parameters:
             self.parameters['minimum_area'] = 0
         if 'distance_threshold' not in self.parameters:
@@ -169,6 +185,10 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         zPositionCount = len(zPositions)
         bitCount = codebook.get_bit_count()
         imageShape = self.dataSet.get_image_dimensions()
+        # image-space cropping: decoded images (and zarr) follow the cropped size
+        if self.parameters['crop_in_image_space'] and self.cropWidth > 0:
+            cw = self.cropWidth
+            imageShape = (imageShape[0] - 2 * cw, imageShape[1] - 2 * cw)
         
         # get decoded image path for a zarr file
         # this may be easier way to save
@@ -200,7 +220,10 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                     fragmentIndex, zIndex, chromaticCorrector, scaleFactors,
                     backgrounds, preprocessTask, decoder)
                     
-                if self.parameters['write_decoded_images'] and (fragmentIndex in self.parameters['write_decoded_FOVs']):
+                _zsel = self.parameters['write_decoded_z']
+                if self.parameters['write_decoded_images'] \
+                        and (fragmentIndex in self.parameters['write_decoded_FOVs']) \
+                        and (_zsel is None or zIndex in _zsel):
                     zarr_out[zIndex,0,:,:] = outputImages[0]
                     zarr_out[zIndex,1,:,:] = outputImages[1]
                     zarr_out[zIndex,2,:,:] = outputImages[2]
@@ -251,6 +274,10 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             fov, zIndex, chromaticCorrector)
         imageSet = imageSet.reshape(
             (imageSet.shape[0], imageSet.shape[-2], imageSet.shape[-1]))
+        # image-space crop: trim crop_width pixels from every edge before decoding
+        if self.parameters['crop_in_image_space'] and self.cropWidth > 0:
+            cw = self.cropWidth
+            imageSet = imageSet[:, cw:imageSet.shape[1] - cw, cw:imageSet.shape[2] - cw]
         t1 = time.time()
 
         decodeMask = None
@@ -377,11 +404,20 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 globalTask = self.dataSet.load_analysis_task(self.parameters['global_align_task'])
                 # Calculate global coordinates
                 if len(df) > 0:
+                     # FOV corner = raw pixel (0,0), matching segmentation and
+                     # positions.csv. In image-space mode the image was trimmed by
+                     # cropWidth before decoding, so cropWidth is added back; in
+                     # barcode-space mode x,y are already full-frame, so no offset.
+                     # Matches the equivalent cropOffset logic in _extract_and_save_barcodes.
+                     if self.parameters['crop_in_image_space'] and cw > 0:
+                         cropOffset = cw
+                     else:
+                         cropOffset = 0
                      centroids = np.zeros([len(df), 3], dtype=np.float32)
                      centroids[:, 0] = df['z'].values
-                     centroids[:, 1] = df['x'].values # col
-                     centroids[:, 2] = df['y'].values # row
-                     
+                     centroids[:, 1] = df['x'].values + cropOffset # col
+                     centroids[:, 2] = df['y'].values + cropOffset # row
+
                      g = globalTask.fov_coordinate_array_to_global(fov, centroids)
                      df['global_z'] = g[:, 0]
                      df['global_x'] = g[:, 1]
@@ -458,10 +494,19 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         minimumArea = self.parameters['minimum_area']
         outputLabels = self.parameters['write_unique_id_images']
         
+        if self.parameters['crop_in_image_space'] and self.cropWidth > 0:
+            effCropWidth, cropOffset = 0, self.cropWidth   # keep all barcodes; image already cropped
+        else:
+            # Barcode-space: image is NOT cropped; x,y are full-frame and edge
+            # barcodes are removed via effCropWidth. FOV corner = raw pixel (0,0)
+            # (same convention as segmentation and positions.csv), so no offset
+            # is applied to global coordinates.
+            effCropWidth, cropOffset = self.cropWidth, 0
         barcodeOutput = decoder.extract_barcodes_with_index(
             decodedImage, pixelMagnitudes, pixelTraces, distances, fov,
-            self.cropWidth, zIndex, globalTask, minimumArea, outputLabels,
-            extractIntensityTraces=self.parameters['extract_intensity_traces'])
+            effCropWidth, zIndex, globalTask, minimumArea, outputLabels,
+            extractIntensityTraces=self.parameters['extract_intensity_traces'],
+            crop_offset=cropOffset)
         
         if outputLabels:
             df, uid = barcodeOutput

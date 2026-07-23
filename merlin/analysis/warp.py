@@ -29,6 +29,11 @@ class Warp(analysistask.ParallelAnalysisTask):
             self.parameters['write_fiducial_images'] = False
         if 'write_aligned_images' not in self.parameters:
             self.parameters['write_aligned_images'] = False
+        if 'write_aligned_FOVs' not in self.parameters:
+            self.parameters['write_aligned_FOVs'] = [-1]
+        if 'write_aligned_z' not in self.parameters:
+            # None = save all z; otherwise list of zIndexes to write
+            self.parameters['write_aligned_z'] = None
         if 'write_averaged_aligned_images' not in self.parameters:
             self.parameters['write_averaged_aligned_images'] = False
         if 'write_averaged_lowpass_sigma' not in self.parameters:
@@ -125,7 +130,10 @@ class Warp(analysistask.ParallelAnalysisTask):
 
         dataChannels = self.dataSet.get_data_organization().get_data_channels()
 
-        if self.parameters['write_aligned_images']:
+        _alignedFOVs = self.parameters['write_aligned_FOVs']
+        _alignedZ = self.parameters['write_aligned_z']
+        if self.parameters['write_aligned_images'] \
+                and (_alignedFOVs == [-1] or fov in _alignedFOVs):
             zPositions = self.dataSet.get_z_positions()
             imageDescription = self.dataSet.analysis_tiff_description(
                 len(zPositions), len(dataChannels))
@@ -133,7 +141,9 @@ class Warp(analysistask.ParallelAnalysisTask):
             with self.dataSet.writer_for_analysis_images(
                 self, 'aligned_images', fov) as outputTif:
                 for t, x in zip(transformationList, dataChannels):
-                    for z in zPositions:
+                    for zi, z in enumerate(zPositions):
+                        if _alignedZ is not None and zi not in _alignedZ:
+                            continue
                         inputImage = self.dataSet.get_raw_image(x, fov, z)
                         transformedImage = transform.warp(
                             inputImage, t, preserve_range=True).astype(inputImage.dtype)
@@ -261,6 +271,12 @@ class FiducialCorrelationWarp(Warp):
 
         if 'highpass_sigma' not in self.parameters:
             self.parameters['highpass_sigma'] = 3
+        if 'clip_negative_after_highpass' not in self.parameters:
+            self.parameters['clip_negative_after_highpass'] = False
+        # 3x3 median pre-filter on the fiducial image to suppress hot pixels.
+        # Default True (prior behaviour); set False to match runs that skip it.
+        if 'median_filter' not in self.parameters:
+            self.parameters['median_filter'] = True
 
         # add this parameter to control the next two parameters
         # if beads are not sparse its probably not necessary...
@@ -294,12 +310,16 @@ class FiducialCorrelationWarp(Warp):
         else:
             highPassFilterSize = int(2 * np.ceil(2 * highPassSigma) + 1)
 
-            # median filter to deal with hot pixels
-            inputImage = cv2.medianBlur(inputImage.astype(np.uint16), ksize = 3)
+            # median filter to deal with hot pixels (optional)
+            if self.parameters['median_filter']:
+                inputImage = cv2.medianBlur(inputImage.astype(np.uint16), ksize = 3)
     
             high_passed_img = inputImage.astype(float) - cv2.GaussianBlur(
                 inputImage, (highPassFilterSize, highPassFilterSize),
                 highPassSigma, borderType=cv2.BORDER_REPLICATE)
+
+            if self.parameters['clip_negative_after_highpass']:
+                high_passed_img[high_passed_img < 0] = 0
     
         # add some features from Xingjie https://github.com/xingjiepan/MERlin/blob/xingjie/merlin/analysis/warp.py
         

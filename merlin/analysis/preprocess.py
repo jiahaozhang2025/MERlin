@@ -66,6 +66,9 @@ class CAREPreprocess(Preprocess):
                 self.parameters['save_pixel_histogram'] = False
             if 'write_preprocessed_FOVs' not in self.parameters:
                 self.parameters['write_preprocessed_FOVs'] = [-1]
+            if 'write_preprocessed_z' not in self.parameters:
+                # None = save all z; otherwise list of zIndexes to write
+                self.parameters['write_preprocessed_z'] = None
             
             self._highPassSigma = self.parameters['highpass_sigma']
 
@@ -163,8 +166,10 @@ class CAREPreprocess(Preprocess):
 
                         pixelHistogram[bi, :] += np.histogram(
                                 outputImage, bins=histogramBins)[0]
-                        
-                        outputTif.save(outputImage,photometric='MINISBLACK')
+
+                        _zsel = self.parameters.get('write_preprocessed_z')
+                        if _zsel is None or i in _zsel:
+                            outputTif.save(outputImage,photometric='MINISBLACK')
 
             self._save_pixel_histogram(pixelHistogram, fragmentIndex)
 
