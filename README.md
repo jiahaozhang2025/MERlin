@@ -1,8 +1,7 @@
-# MERlin — Jiahao Zhang research fork
+# MERlin 
 
 This repository is a research fork of **MERlin**, an extensible pipeline for
-decoding and analyzing MERFISH data. It is maintained for the workflows and
-datasets used by Jiahao Zhang.
+decoding and analyzing MERFISH data. 
 
 ## Provenance
 
@@ -18,13 +17,6 @@ The project lineage is:
 4. [jiahaozhang2025/MERlin](https://github.com/jiahaozhang2025/MERlin) — this
    repository, containing the subsequent adaptations.
 
-The Git histories are separate. The `forked` branch preserves Aaron's
-`gpu_decoding` history and is pinned to its baseline commit. The local history
-on `main` begins with root commit `5dbbd02`, so Git cannot connect the earlier
-adaptation work to Aaron's commits even though that fork was its source. The
-`main` branch contains the current code and the subsequent commits that are
-still available.
-
 ## What MERlin does
 
 MERlin organizes a MERFISH workflow as a collection of analysis tasks. Tasks
@@ -33,38 +25,8 @@ Snakemake and a cluster scheduler. The pipeline covers image registration,
 preprocessing, barcode decoding and filtering, cell segmentation, and export
 of spatial features and barcode data.
 
-## Main differences in this fork
-
-Compared with the `forked` baseline, `main` includes:
-
-- **More scalable decoding:** chunked NumPy or PyTorch similarity decoding,
-  image tiling with overlap handling, optional GPU execution, per-z decoding,
-  resumable Zarr output, unique-ID images, optional intensity-trace export,
-  and additional confidence and distance controls.
-- **Expanded barcode filtering:** more robust blank-fraction threshold
-  selection, global and local adaptive filtering updates, logistic-regression
-  filtering, optional z-duplicate removal, and saved filtering summaries.
-- **Additional preprocessing:** configurable global-threshold subtraction,
-  reversed preprocessing paths, updated deconvolution helpers, and a
-  model-restoration preprocessing task.
-- **Segmentation additions:** multi-channel Cellpose segmentation with
-  optional custom models, preprocessing/image dumps, and 2D-to-3D mask
-  combination.
-- **3D registration support:** fiducial-stack registration, piezo-drift
-  correction, z-dependent transforms, and interpolation between z planes.
-- **I/O and compatibility updates:** Zarr image reading, more tolerant Google
-  Cloud reads, TIFF casting controls, and updates for newer NumPy, NetworkX,
-  Shapely, Cellpose, and related packages.
-
 See [DETAILED_CHANGES.md](DETAILED_CHANGES.md) for the module-by-module
 tree comparison, parameters, caveats, and exact history boundary.
-
-## Branches
-
-| Branch | Purpose |
-| --- | --- |
-| `main` | Current Jiahao Zhang research version and default branch |
-| `forked` | Unmodified baseline from Aaron Halpern's `gpu_decoding` branch at `15ce55f` |
 
 ## Installation
 
@@ -77,11 +39,6 @@ git clone https://github.com/jiahaozhang2025/MERlin.git
 cd MERlin
 pip install -e .
 ```
-
-GPU decoding requires a PyTorch installation compatible with the local CUDA
-runtime. The model-restoration task additionally depends on an external model
-package, checkpoint, and calibration files that are not distributed in this
-repository.
 
 ## Configuration and use
 
@@ -132,7 +89,7 @@ If MERlin is useful for your research, cite:
 > extensible MERFISH analysis software*, v0.1.6.
 > [doi:10.5281/zenodo.3758540](https://doi.org/10.5281/zenodo.3758540)
 
-This fork also acknowledges Aaron Halpern's GPU-decoding work, from which the
+This fork also acknowledges Aaron Halpern's additional work, from which the
 current branch descends.
 
 ## License
