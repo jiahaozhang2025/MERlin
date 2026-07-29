@@ -18,7 +18,6 @@ additional output products.
 
 Notable behavior and parameters include:
 
-- `use_gpu` selects the PyTorch decoding path when available.
 - `decode_chunk_size` bounds the number of pixel traces processed in one
   similarity calculation.
 - `tiling_factor` divides an image into overlapping tiles to reduce peak
