@@ -149,6 +149,10 @@ def merlin():
                 # checking completion creates the .done file for parallel tasks
                 # where completion has not yet been checked
                 if task.is_complete():
+                    # single place in the DAG where every fragment is finished
+                    # and nothing downstream has started -- aggregate here so
+                    # downstream jobs never race to recompute the same result
+                    task.finalize()
                     print('Task %s is complete' % args.analysis_task)
                 else:
                     print('Task %s is not complete' % args.analysis_task)

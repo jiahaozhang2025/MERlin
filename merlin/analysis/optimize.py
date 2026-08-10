@@ -10,7 +10,10 @@ import pickle
 import os
 import time
 
+from concurrent.futures import ThreadPoolExecutor
+
 from merlin.analysis import decode
+from merlin.core import analysistask
 from merlin.util import decoding
 from merlin.util import registration
 from merlin.util import aberration
@@ -41,8 +44,57 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             self.parameters['optimize_chromatic_correction'] = False
         if 'crop_width' not in self.parameters:
             self.parameters['crop_width'] = 100
-        if 'lowpass_sigma' not in self.parameters:
-            self.parameters['lowpass_sigma'] = 1
+        # See the matching note in decode.Decode: all image filtering is done by
+        # the preprocess task, so Optimize decodes exactly the pixels Decode
+        # will decode.
+        if 'lowpass_sigma' in self.parameters:
+            raise ValueError(
+                'lowpass_sigma is no longer an OptimizeIteration parameter -- '
+                'set it on the preprocess task instead.')
+        if 'tile_overlap' not in self.parameters:
+            self.parameters['tile_overlap'] = 20
+        # threads for the nearest-neighbour decode (sklearn n_jobs); must be
+        # matched by the cpus requested for this task
+        if 'num_threads' not in self.parameters:
+            self.parameters['num_threads'] = 1
+        # threads for estimating this iteration's chromatic corrections, which
+        # fan out over independent (fov, z) groups. Set the cpus on the
+        # ChromaticCorrection task that drives it, not on this one.
+        if 'chromatic_threads' not in self.parameters:
+            self.parameters['chromatic_threads'] = 1
+        # Caps on how much data the chromatic fit consumes. 0 = no cap, which
+        # reproduces the previous behaviour exactly. See the sampling note in
+        # _get_chromatic_transformations for why capping costs no precision.
+        if 'chromatic_max_barcodes_per_group' not in self.parameters:
+            self.parameters['chromatic_max_barcodes_per_group'] = 0
+        if 'chromatic_max_groups' not in self.parameters:
+            self.parameters['chromatic_max_groups'] = 0
+        # remove per-fragment results once finalize() has aggregated them
+        if 'cleanup_fragment_results' not in self.parameters:
+            self.parameters['cleanup_fragment_results'] = False
+        # Measure the chromatic displacement samples inside each fragment,
+        # which already holds that (fov, z)'s images and barcodes, instead of
+        # re-loading everything in one job afterwards. Fragments save raw
+        # SAMPLES, not fitted transforms -- finalize() pools them, which
+        # reproduces the single-job fit exactly. Averaging per-fragment fits
+        # would not: a fragment with few barcodes gives a badly conditioned
+        # rotation/scale estimate that contaminates the mean.
+        if 'chromatic_from_fragments' not in self.parameters:
+            self.parameters['chromatic_from_fragments'] = False
+        # Which images the fragment measures on. The preprocessed set is already
+        # in memory (free); the raw-warped set costs an extra load but is what
+        # the single-job path uses. They are NOT interchangeable -- both
+        # high-pass steps clip negatives, which is asymmetric and shifts
+        # centroids.
+        if 'chromatic_on_preprocessed' not in self.parameters:
+            self.parameters['chromatic_on_preprocessed'] = False
+        # Optimize decodes the FULL frame and discards barcodes within
+        # crop_width of the edge (barcode space, not image space). With
+        # adaptive_crop the discarded margin is this FOV's own invalid region
+        # instead of a fixed worst-case border, so the scale factors and the
+        # chromatic samples are fit on valid pixels only.
+        if 'adaptive_crop' not in self.parameters:
+            self.parameters['adaptive_crop'] = False
         if 'random_seed' in self.parameters:
             # set the random seed
             # make sure to set a different one for each optimize
@@ -118,6 +170,108 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
     def fragment_count(self):
         return self.parameters['fov_per_iteration']
 
+    def _measure_chromatic_samples(self, images, barcodes):
+        """Per-colour-pair (position, displacement) samples for one (fov, z).
+
+        Shared by the per-fragment path and the single-job path so both measure
+        identically; only where it runs and which images it sees differ.
+        """
+        codebook = self.get_codebook()
+        org = self.dataSet.get_data_organization()
+        usedColors = self._get_used_colors()
+        out = {u: {v: ([], []) for v in usedColors if v >= u} for u in usedColors}
+        X = barcodes['x'].to_numpy(float)
+        Y = barcodes['y'].to_numpy(float)
+        B = barcodes['barcode_id'].to_numpy(int)
+        hLimit = images.shape[1] - 10
+        wLimit = images.shape[2] - 10
+        for bx, by, bid in zip(X, Y, B):
+            if not (bx > 10 and by > 10 and hLimit > bx and wLimit > by):
+                continue
+            onBits = np.where(codebook.get_barcode(bid))[0]
+            refined = np.array([registration.refine_position(images[i], bx, by)
+                                for i in onBits])
+            for p in itertools.combinations(enumerate(onBits), 2):
+                c1 = org.get_data_channel_color(p[0][1])
+                c2 = org.get_data_channel_color(p[1][1])
+                if c1 < c2:
+                    out[c1][c2][0].append((bx, by))
+                    out[c1][c2][1].append(refined[p[1][0]] - refined[p[0][0]])
+                else:
+                    out[c2][c1][0].append((bx, by))
+                    out[c2][c1][1].append(refined[p[0][0]] - refined[p[1][0]])
+        # Two compact (N, 2) arrays per pair. Storing a list of 2-element numpy
+        # arrays instead meant pickling ~200k tiny objects per fragment (179 MB
+        # an iteration), which cost more than the measurement it was saving.
+        return {c1: {c2: (np.asarray(v[0], dtype=np.float64).reshape(-1, 2),
+                          np.asarray(v[1], dtype=np.float64).reshape(-1, 2))
+                     for c2, v in inner.items()}
+                for c1, inner in out.items()}
+
+    def finalize(self) -> None:
+        """Compute this iteration's aggregates once, in the Done rule.
+
+        All three of these are lazy-on-cache-miss, and nothing triggers them
+        until the next iteration's fragments ask -- at which point all of them
+        ask at once, all miss, and all recompute. The chromatic estimate is the
+        expensive one by orders of magnitude; the other two are a median over
+        small per-fragment .npy files. Results are written under this task's own
+        directory, so Optimize{N}/chromatic_corrections.pkl is where they live.
+        """
+        self._get_chromatic_transformations()
+        self.get_scale_factors()
+        self.get_backgrounds()
+        self._merge_barcode_counts()
+        if self.parameters['cleanup_fragment_results']:
+            self._cleanup_fragment_results()
+
+    def _merge_barcode_counts(self) -> None:
+        """Collapse the per-fragment barcode counts into a single array.
+
+        These are the one per-fragment result a LATER iteration still reads:
+        get_barcode_count_history() walks back through every previous iteration.
+        Merging them here is what makes cleanup possible at all.
+        """
+        try:
+            self.dataSet.load_numpy_analysis_result(
+                'barcode_counts_merged', self.analysisName)
+            return
+        except (FileNotFoundError, OSError, ValueError):
+            pass
+        countsMean = np.mean([self.dataSet.load_numpy_analysis_result(
+            'barcode_counts', self.analysisName, resultIndex=i)
+            for i in range(self.parameters['fov_per_iteration'])], axis=0)
+        self.dataSet.save_numpy_analysis_result(
+            countsMean, 'barcode_counts_merged', self.analysisName)
+
+    def _cleanup_fragment_results(self) -> None:
+        """Delete per-fragment results whose aggregates are now on disk.
+
+        Only files that provably have no remaining reader are removed:
+        scale_refactors/previous_scale_factors are folded into scale_factors,
+        background_refactors/previous_backgrounds into backgrounds, and
+        barcode_counts into barcode_counts_merged. select_frame is kept -- it
+        records which (fov, z) each fragment used, which is the provenance you
+        want when a fit looks wrong, and it is a two-element array.
+        """
+        merged = {'scale_factors', 'backgrounds', 'barcode_counts_merged'}
+        for name in merged:                       # refuse to delete without them
+            self.dataSet.load_numpy_analysis_result(name, self.analysisName)
+        stale = ['scale_refactors', 'previous_scale_factors',
+                 'background_refactors', 'previous_backgrounds',
+                 'barcode_counts']
+        removed = 0
+        for i in range(self.parameters['fov_per_iteration']):
+            for name in stale:
+                path = self.dataSet._analysis_result_save_path(
+                    name, self.analysisName, resultIndex=i,
+                    fileExtension='.npy')
+                if os.path.exists(path):
+                    os.remove(path)
+                    removed += 1
+        self.dataSet.get_logger(self).info(
+            'Removed %i per-fragment result files after aggregation', removed)
+
     def get_codebook(self) -> Codebook:
         preprocessTask = self.dataSet.load_analysis_task(
             self.parameters['preprocess_task'])
@@ -180,7 +334,9 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                                             scaleFactors,
                                             backgrounds,
                                             decodeMask = decodeMask,
-                                            lowPassSigma = self.parameters['lowpass_sigma'],
+                                            lowPassSigma = 0,
+                                            overlap = self.parameters['tile_overlap'],
+                                            numThreads = self.parameters['num_threads'],
                                             distanceThreshold = distance_threshold,
                                             distanceMetric = self.parameters['distance_metric'],
                                             useGpu = self.parameters['use_gpu'],
@@ -199,11 +355,19 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         # the barcodedb should be made more general
         cropWidth = self.parameters['crop_width']
 
-        self.get_barcode_database().write_barcodes(
-            decoder.extract_barcodes_with_index(
-                    di, pm, npt, d, fovIndex, cropWidth,
-                    zIndex, minimumArea=areaThreshold),
-                fov=fragmentIndex)
+        extracted = decoder.extract_barcodes_with_index(
+            di, pm, npt, d, fovIndex,
+            0 if self.parameters['adaptive_crop'] else cropWidth,
+            zIndex, minimumArea=areaThreshold)
+        if self.parameters['adaptive_crop']:
+            r0, r1, c0, c1 = decode.compute_crop_bounds(
+                self.dataSet, self.parameters['warp_task'], fovIndex,
+                cropWidth, True)
+            # x is a column, y is a row
+            extracted = extracted[extracted['x'].between(c0, c1)
+                                  & extracted['y'].between(r0, r1)]
+        self.get_barcode_database().write_barcodes(extracted,
+                                                   fov=fragmentIndex)
         
         t4 = time.time()
 
@@ -216,7 +380,29 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         self.dataSet.save_numpy_analysis_result(
             barcodesSeen, 'barcode_counts', self.analysisName,
             resultIndex=fragmentIndex)
-        
+
+        if self.parameters['chromatic_from_fragments']:
+            # This fragment already holds its (fov, z) images and barcodes, so
+            # measuring here avoids the single-job path re-loading and
+            # re-warping all 24 images per group afterwards.
+            ownBarcodes = self.get_barcode_database().get_barcodes(
+                fov=fragmentIndex)
+            if self.parameters['chromatic_on_preprocessed']:
+                chromaticImages = warpedImages      # already in memory, free
+            else:
+                warpTask = self.dataSet.load_analysis_task(
+                    self.parameters['warp_task'])
+                chromaticImages = np.array([warpTask.get_aligned_image(
+                    fovIndex,
+                    self.dataSet.get_data_organization()
+                        .get_data_channel_for_bit(b),
+                    int(zIndex), chromaticCorrector)
+                    for b in codebook.get_bit_names()])
+            self.dataSet.save_pickle_analysis_result(
+                self._measure_chromatic_samples(chromaticImages, ownBarcodes),
+                'chromatic_samples', self.analysisName,
+                resultIndex=fragmentIndex)
+
         # save the decoded image from optimize
         if self.parameters['write_decoded_images']:
             imageDescription = self.dataSet.analysis_tiff_description(1, 3)
@@ -322,6 +508,18 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
     def get_reference_color(self):
         return min(self._get_used_colors())
 
+    def get_previous_chromatic_corrector(self) -> aberration.ChromaticCorrector:
+        """The corrector this iteration's own fragments decoded under.
+
+        This iteration's scale factors were fit on images corrected with these
+        transformations, not with the ones estimated afterwards from this
+        iteration's barcodes. Downstream tasks that consume the scale factors
+        should use this to stay self-consistent.
+        """
+        return aberration.RigidChromaticCorrector(
+            self._get_previous_chromatic_transformations(),
+            self.get_reference_color())
+
     def get_chromatic_corrector(self) -> aberration.ChromaticCorrector:
         """Get the chromatic corrector estimated from this optimization
         iteration
@@ -362,6 +560,30 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             # most parts could be included in a chromatic aberration class
             previousTransformations = \
                 self._get_previous_chromatic_transformations()
+
+            if self.parameters['chromatic_from_fragments']:
+                # Pool the samples the fragments already measured. Pooling (not
+                # averaging their fits) makes this identical to the single-job
+                # result for the same images.
+                usedColors = self._get_used_colors()
+                acc = {u: {v: ([], []) for v in usedColors if v >= u}
+                       for u in usedColors}
+                for i in range(self.parameters['fov_per_iteration']):
+                    part = self.dataSet.load_pickle_analysis_result(
+                        'chromatic_samples', self.analysisName, resultIndex=i)
+                    for c1 in part:
+                        for c2 in part[c1]:
+                            pos, disp = part[c1][c2]
+                            acc[c1][c2][0].append(pos)
+                            acc[c1][c2][1].append(disp)
+                pooled = {c1: {c2: (np.concatenate(v[0]) if v[0] else
+                                    np.zeros((0, 2), np.float64),
+                                    np.concatenate(v[1]) if v[1] else
+                                    np.zeros((0, 2), np.float64))
+                               for c2, v in inner.items()}
+                          for c1, inner in acc.items()}
+                return self._fit_color_pairs(pooled, previousTransformations)
+
             previousCorrector = aberration.RigidChromaticCorrector(
                 previousTransformations, self.get_reference_color())
             codebook = self.get_codebook()
@@ -376,68 +598,126 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             colorPairDisplacements = {u: {v: [] for v in usedColors if v >= u}
                                       for u in usedColors}
 
-            for fov in uniqueFOVs:
+            # Each (fov, z) group is independent: it loads its own 24 warped
+            # images and contributes displacement samples that are pooled into
+            # one least-squares fit per colour pair at the end. Order of the
+            # samples does not affect the fit, but results are merged in group
+            # order anyway so the output is reproducible regardless of thread
+            # scheduling.
+            groups = [(int(fov), z)
+                      for fov in uniqueFOVs
+                      for z in np.unique(barcodes[barcodes['fov'] == fov]['z'])]
 
-                fovBarcodes = barcodes[barcodes['fov'] == fov]
-                zIndexes = np.unique(fovBarcodes['z'])
-                for z in zIndexes:
-                    currentBarcodes = fovBarcodes[fovBarcodes['z'] == z]
-                    # TODO this can be moved to the run function for the task
-                    # so not as much repeated work is done when it is called
-                    # from many different tasks in parallel
-                    warpedImages = np.array([warpTask.get_aligned_image(
-                        fov, dataOrganization.get_data_channel_for_bit(b),
-                        int(z),  previousCorrector)
-                        for b in codebook.get_bit_names()])
+            def measure_group(group):
+                fov, z = group
+                local = {u: {v: [] for v in usedColors if v >= u}
+                         for u in usedColors}
+                currentBarcodes = barcodes[(barcodes['fov'] == fov)
+                                           & (barcodes['z'] == z)]
+                # The fit is a 4-DOF similarity transform per colour pair, so
+                # its precision saturates after a few thousand samples: the
+                # standard error goes as sigma/sqrt(N), which at sigma ~0.5 px
+                # is already 0.006 px by N=8000, against chromatic offsets of
+                # order 0.1-1 px. Everything past that is 300 us per barcode
+                # (four refine_position calls) bought for nothing.
+                maxBC = self.parameters['chromatic_max_barcodes_per_group']
+                if maxBC and len(currentBarcodes) > maxBC:
+                    currentBarcodes = currentBarcodes.sample(
+                        n=maxBC, random_state=int(self.parameters
+                                                  .get('random_seed', 0)))
+                warpedImages = np.array([warpTask.get_aligned_image(
+                    fov, dataOrganization.get_data_channel_for_bit(b),
+                    int(z),  previousCorrector)
+                    for b in codebook.get_bit_names()])
 
-                    for i, cBC in currentBarcodes.iterrows():
-                        onBits = np.where(
-                            codebook.get_barcode(cBC['barcode_id']))[0]
+                # pandas iterrows costs 14.5 us per row against 0.1 us for a
+                # plain numpy column read, which is real money next to the
+                # ~300 us of refinement it wraps
+                bcX = currentBarcodes['x'].to_numpy(float)
+                bcY = currentBarcodes['y'].to_numpy(float)
+                bcId = currentBarcodes['barcode_id'].to_numpy(int)
+                hLimit = warpedImages.shape[1] - 10
+                wLimit = warpedImages.shape[2] - 10
+                for bx, by, bid in zip(bcX, bcY, bcId):
+                    onBits = np.where(codebook.get_barcode(bid))[0]
 
-                        # TODO this can be done by crop width when decoding
-                        if cBC['x'] > 10 and cBC['y'] > 10 \
-                                and warpedImages.shape[1]-cBC['x'] > 10 \
-                                and warpedImages.shape[2]-cBC['y'] > 10:
+                    # TODO this can be done by crop width when decoding
+                    if bx > 10 and by > 10 and hLimit > bx and wLimit > by:
 
-                            refinedPositions = np.array(
-                                [registration.refine_position(
-                                    warpedImages[i, :, :], cBC['x'], cBC['y'])
-                                    for i in onBits])
-                            for p in itertools.combinations(
-                                    enumerate(onBits), 2):
-                                c1 = dataOrganization.get_data_channel_color(
-                                    p[0][1])
-                                c2 = dataOrganization.get_data_channel_color(
-                                    p[1][1])
+                        refinedPositions = np.array(
+                            [registration.refine_position(
+                                warpedImages[i, :, :], bx, by)
+                                for i in onBits])
+                        for p in itertools.combinations(
+                                enumerate(onBits), 2):
+                            c1 = dataOrganization.get_data_channel_color(
+                                p[0][1])
+                            c2 = dataOrganization.get_data_channel_color(
+                                p[1][1])
 
-                                if c1 < c2:
-                                    colorPairDisplacements[c1][c2].append(
-                                        [np.array([cBC['x'], cBC['y']]),
-                                         refinedPositions[p[1][0]]
-                                         - refinedPositions[p[0][0]]])
-                                else:
-                                    colorPairDisplacements[c2][c1].append(
-                                        [np.array([cBC['x'], cBC['y']]),
-                                         refinedPositions[p[0][0]]
-                                         - refinedPositions[p[1][0]]])
+                            if c1 < c2:
+                                local[c1][c2].append(
+                                    [np.array([bx, by]),
+                                     refinedPositions[p[1][0]]
+                                     - refinedPositions[p[0][0]]])
+                            else:
+                                local[c2][c1].append(
+                                    [np.array([bx, by]),
+                                     refinedPositions[p[0][0]]
+                                     - refinedPositions[p[1][0]]])
+                return local
 
-            tForms = {}
-            for k, v in colorPairDisplacements.items():
-                tForms[k] = {}
-                for k2, v2 in v.items():
-                    tForm = transform.SimilarityTransform()
-                    goodIndexes = [i for i, x in enumerate(v2) if
-                                   not any(np.isnan(x[1])) and not any(
-                                       np.isinf(x[1]))]
-                    tForm.estimate(
-                        np.array([v2[i][0] for i in goodIndexes]),
-                        np.array([v2[i][0] + v2[i][1] for i in goodIndexes]))
-                    tForms[k][k2] = tForm + previousTransformations[k][k2]
+            maxGroups = self.parameters['chromatic_max_groups']
+            if maxGroups and len(groups) > maxGroups:
+                # evenly spaced rather than the first N, so the sample spans the
+                # whole set of fovs the iteration touched
+                pick = np.linspace(0, len(groups) - 1, maxGroups).astype(int)
+                groups = [groups[i] for i in pick]
 
-            self.dataSet.save_pickle_analysis_result(
-                tForms, 'chromatic_corrections', self.analysisName)
+            threads = max(1, int(self.parameters['chromatic_threads']))
+            if threads > 1 and len(groups) > 1:
+                with ThreadPoolExecutor(
+                        max_workers=min(threads, len(groups))) as pool:
+                    perGroup = list(pool.map(measure_group, groups))
+            else:
+                perGroup = [measure_group(g) for g in groups]
 
-            return tForms
+            acc = {u: {v: ([], []) for v in usedColors if v >= u}
+                   for u in usedColors}
+            for local in perGroup:
+                for c1, inner in local.items():
+                    for c2, (pos, disp) in inner.items():
+                        acc[c1][c2][0].append(pos)
+                        acc[c1][c2][1].append(disp)
+            colorPairDisplacements = {
+                c1: {c2: (np.concatenate(v[0]) if v[0] else
+                          np.zeros((0, 2), np.float64),
+                          np.concatenate(v[1]) if v[1] else
+                          np.zeros((0, 2), np.float64))
+                     for c2, v in inner.items()}
+                for c1, inner in acc.items()}
+
+            return self._fit_color_pairs(colorPairDisplacements,
+                                         previousTransformations)
+
+    def _fit_color_pairs(self, colorPairDisplacements, previousTransformations):
+        """Fit one similarity transform per colour pair and compose it onto the
+        previous iteration's, then cache. Shared by the single-job and
+        per-fragment paths so the two differ only in where the samples came
+        from, never in how they are fitted."""
+        tForms = {}
+        for k, v in colorPairDisplacements.items():
+            tForms[k] = {}
+            for k2, (pos, disp) in v.items():
+                tForm = transform.SimilarityTransform()
+                good = np.isfinite(disp).all(axis=1)
+                tForm.estimate(pos[good], pos[good] + disp[good])
+                tForms[k][k2] = tForm + previousTransformations[k][k2]
+
+        self.dataSet.save_pickle_analysis_result(
+            tForms, 'chromatic_corrections', self.analysisName)
+
+        return tForms
 
     def get_scale_factors(self) -> np.ndarray:
         """Get the final, optimized scale factors.
@@ -534,9 +814,17 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             barcode count corresponding to the i'th barcode in the j'th
             iteration.
         """
-        countsMean = np.mean([self.dataSet.load_numpy_analysis_result(
-            'barcode_counts', self.analysisName, resultIndex=i)
-            for i in range(self.parameters['fov_per_iteration'])], axis=0)
+        # finalize() merges the per-fragment counts into one array so that
+        # this -- the only consumer, via PlotPerformance's optimization plot --
+        # does not have to re-read fragment_count() files from every earlier
+        # iteration, and so those files can be cleaned up afterwards.
+        try:
+            countsMean = self.dataSet.load_numpy_analysis_result(
+                'barcode_counts_merged', self.analysisName)
+        except (FileNotFoundError, OSError, ValueError):
+            countsMean = np.mean([self.dataSet.load_numpy_analysis_result(
+                'barcode_counts', self.analysisName, resultIndex=i)
+                for i in range(self.parameters['fov_per_iteration'])], axis=0)
 
         if 'previous_iteration' not in self.parameters:
             return np.array([countsMean])
@@ -616,7 +904,8 @@ class OptimizeIterationFOV(OptimizeIteration):
             warpedImages,
             scaleFactors,
             backgrounds,
-            lowPassSigma=self.parameters['lowpass_sigma'],
+            lowPassSigma=0,
+            overlap=self.parameters['tile_overlap'],
             distanceThreshold=self.parameters['distance_threshold'],
             distanceMetric=self.parameters['distance_metric'])
 

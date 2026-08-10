@@ -30,6 +30,13 @@ of spatial features and barcode data.
 See [DETAILED_CHANGES.md](DETAILED_CHANGES.md) for the module-by-module
 tree comparison, parameters, caveats, and exact history boundary.
 
+The August 10, 2026 update adds centralized preprocessing filters,
+per-FOV adaptive decode cropping, faster optimize-stage aggregation and
+chromatic sampling, optional filtered decoded-image outputs, and a fix for
+two-channel Cellpose segmentation. See the "Latest update (August 10, 2026)"
+section in `DETAILED_CHANGES.md` for the operational details and new
+parameters.
+
 ## Installation
 
 This is research software with environment-specific components. Create an

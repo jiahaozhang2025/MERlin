@@ -475,7 +475,7 @@ class PixelBasedDecoder(object):
             pixelMagnitudes: np.ndarray, pixelTraces: np.ndarray,
             distances: np.ndarray, fov: int, cropWidth: int, zIndex: int = None,
             globalAligner=None, minimumArea: int = 1, outputLabels: bool = False,
-            extractIntensityTraces: bool = False, crop_offset: int = 0
+            extractIntensityTraces: bool = False, crop_offset=(0, 0)
     ) -> pandas.DataFrame:
         """Extract the barcode information from the decoded image for barcodes
         that were decoded to the specified barcode index.
@@ -589,8 +589,12 @@ class PixelBasedDecoder(object):
 
             if globalAligner is not None:
                 # crop_offset adds back the image-space crop so global coords
-                # are in the full-FOV frame while local x,y stay cropped.
-                centroids = np.stack([z, x + crop_offset, y + crop_offset], axis=1)
+                # are in the full-FOV frame while local x,y stay cropped. It is
+                # (x, y) = (colStart, rowStart): with an asymmetric per-FOV crop
+                # the two axes differ, so a single scalar would skew every
+                # barcode by the difference.
+                offX, offY = crop_offset
+                centroids = np.stack([z, x + offX, y + offY], axis=1)
                 globalCentroids = globalAligner.fov_coordinate_array_to_global(
                     fov, centroids)
                 data['global_z'] = globalCentroids[:, 0]
