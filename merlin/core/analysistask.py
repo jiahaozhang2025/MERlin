@@ -213,6 +213,23 @@ class AnalysisTask(ABC):
         """
         return self.dataSet.check_analysis_done(self)
 
+    def finalize(self) -> None:
+        """Aggregate this task's per-fragment results, once, after it completes.
+
+        Called by `merlin --check-done`, which is the shell the snakemake
+        'Done' rule runs for every parallel task -- so this executes exactly
+        once per task, in the DAG position where all fragments are finished and
+        nothing downstream has started.
+
+        Subclasses use it for aggregates that would otherwise be computed
+        lazily, on cache miss, by whichever downstream job asks first. When
+        those jobs all launch together they all miss and all recompute; see
+        OptimizeIteration, where that cost 195 of the MB3 reference run's 304
+        core-hours. Implementations must be idempotent -- a failed Done rule is
+        retried, and the underlying getters cache.
+        """
+        pass
+
     def is_started(self):
         """Determines if this analysis has started.
         

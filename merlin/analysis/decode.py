@@ -13,6 +13,31 @@ from merlin.data.codebook import Codebook
 from merlin.util import barcodefilters
 
 
+def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
+    """(rowStart, rowEnd, colStart, colEnd) of the valid region of one FOV.
+
+    crop_width is applied first, then the adaptive margin on top.
+    transform.warp maps output->input, so output (r, c) samples input
+    (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many on
+    the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM. A fixed crop_width has
+    to be sized for the worst FOV in the dataset and discards that from every
+    other one; this charges each FOV only what it owes.
+    """
+    h, w = dataSet.get_image_dimensions()
+    top = bottom = left = right = 0
+    if adaptive:
+        warpTask = dataSet.load_analysis_task(warpTaskName)
+        tforms = warpTask.get_transformation(fov)
+        tx = np.array([t.params[0, 2] for t in tforms])
+        ty = np.array([t.params[1, 2] for t in tforms])
+        left = int(np.ceil(max(0.0, float((-tx).max()))))
+        right = int(np.ceil(max(0.0, float(tx.max()))))
+        top = int(np.ceil(max(0.0, float((-ty).max()))))
+        bottom = int(np.ceil(max(0.0, float(ty.max()))))
+    return (top + cropWidth, h - bottom - cropWidth,
+            left + cropWidth, w - right - cropWidth)
+
+
 class BarcodeSavingParallelAnalysisTask(analysistask.ParallelAnalysisTask):
 
     """
@@ -52,6 +77,16 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                  parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
+        # Image filtering now lives entirely in the preprocess task, so that
+        # Optimize and Decode cannot disagree about how the pixels were
+        # filtered. A lowpass_sigma here is an error rather than a silent
+        # no-op, because old configs that set it would otherwise change meaning
+        # without warning. Checked first so the message is what the user sees.
+        if 'lowpass_sigma' in self.parameters:
+            raise ValueError(
+                'lowpass_sigma is no longer a Decode parameter -- set it on the '
+                'preprocess task instead, where Optimize sees it too.')
+
         if 'crop_width' not in self.parameters:
             self.parameters['crop_width'] = 100
         if 'crop_in_image_space' not in self.parameters:
@@ -78,8 +113,17 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             self.parameters['minimum_area'] = 0
         if 'distance_threshold' not in self.parameters:
             self.parameters['distance_threshold'] = 0.5167
-        if 'lowpass_sigma' not in self.parameters:
-            self.parameters['lowpass_sigma'] = 1
+        # Buffer added around each tile so objects spanning a tile edge survive.
+        if 'tile_overlap' not in self.parameters:
+            self.parameters['tile_overlap'] = 20
+        # Crop each FOV to its own valid region, on top of crop_width.
+        # transform.warp maps output->input, so output (r, c) samples input
+        # (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many
+        # on the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM. A fixed
+        # crop_width has to be sized for the worst FOV in the dataset and throws
+        # that away from every other one; here each FOV pays only what it owes.
+        if 'adaptive_crop' not in self.parameters:
+            self.parameters['adaptive_crop'] = False
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
@@ -138,6 +182,13 @@ class Decode(BarcodeSavingParallelAnalysisTask):
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
 
+    def _crop_bounds(self, fov: int):
+        warpTaskName = self.dataSet.load_analysis_task(
+            self.parameters['preprocess_task']).parameters['warp_task']
+        return compute_crop_bounds(self.dataSet, warpTaskName, fov,
+                                   self.cropWidth,
+                                   self.parameters['adaptive_crop'])
+
     def get_estimated_memory(self):
         return 2048
 
@@ -166,8 +217,6 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         optimizeTask = self.dataSet.load_analysis_task(
                 self.parameters['optimize_task'])
 
-        lowPassSigma = self.parameters['lowpass_sigma']
-        
         codebook = self.get_codebook()
         decoder = decoding.PixelBasedDecoder(codebook)
 
@@ -179,16 +228,20 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             scaleFactors = optimizeTask.get_scale_factors()
             backgrounds = optimizeTask.get_backgrounds()
         
-        chromaticCorrector = optimizeTask.get_chromatic_corrector()
+        # The corrections the optimize task DECODED UNDER, not the ones estimated
+        # afterwards from its own barcodes: its scale factors were fit on images
+        # corrected with these, so this is the self-consistent pairing. It is
+        # also already cached, so no decode job ever triggers an estimate.
+        chromaticCorrector = optimizeTask.get_previous_chromatic_corrector()
 
         zPositions = self.dataSet.get_z_positions()
         zPositionCount = len(zPositions)
         bitCount = codebook.get_bit_count()
         imageShape = self.dataSet.get_image_dimensions()
         # image-space cropping: decoded images (and zarr) follow the cropped size
-        if self.parameters['crop_in_image_space'] and self.cropWidth > 0:
-            cw = self.cropWidth
-            imageShape = (imageShape[0] - 2 * cw, imageShape[1] - 2 * cw)
+        if self.parameters['crop_in_image_space']:
+            r0, r1, c0, c1 = self._crop_bounds(fragmentIndex)
+            imageShape = (r1 - r0, c1 - c0)
         
         # get decoded image path for a zarr file
         # this may be easier way to save
@@ -274,10 +327,10 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             fov, zIndex, chromaticCorrector)
         imageSet = imageSet.reshape(
             (imageSet.shape[0], imageSet.shape[-2], imageSet.shape[-1]))
-        # image-space crop: trim crop_width pixels from every edge before decoding
-        if self.parameters['crop_in_image_space'] and self.cropWidth > 0:
-            cw = self.cropWidth
-            imageSet = imageSet[:, cw:imageSet.shape[1] - cw, cw:imageSet.shape[2] - cw]
+        # image-space crop: trim the invalid margin before decoding
+        if self.parameters['crop_in_image_space']:
+            r0, r1, c0, c1 = self._crop_bounds(fov)
+            imageSet = imageSet[:, r0:r1, c0:c1]
         t1 = time.time()
 
         decodeMask = None
@@ -320,7 +373,8 @@ class Decode(BarcodeSavingParallelAnalysisTask):
 
         di, pm, npt, d = decoder.decode_pixels(
             imageSet, scaleFactors, backgrounds,
-            lowPassSigma=self.parameters['lowpass_sigma'],
+            lowPassSigma=0,
+            overlap=self.parameters['tile_overlap'],
             magnitudeThreshold=self.parameters['magnitude_threshold'],
             distanceThreshold=self.parameters['distance_threshold'],
             distanceMetric=self.parameters['distance_metric'],
@@ -494,14 +548,18 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         minimumArea = self.parameters['minimum_area']
         outputLabels = self.parameters['write_unique_id_images']
         
-        if self.parameters['crop_in_image_space'] and self.cropWidth > 0:
-            effCropWidth, cropOffset = 0, self.cropWidth   # keep all barcodes; image already cropped
+        if self.parameters['crop_in_image_space']:
+            # keep all barcodes; the image is already cropped. x is a column and
+            # y is a row, so the offsets that put them back in the full frame are
+            # colStart and rowStart respectively -- not one shared value.
+            r0, _, c0, _ = self._crop_bounds(fov)
+            effCropWidth, cropOffset = 0, (c0, r0)
         else:
             # Barcode-space: image is NOT cropped; x,y are full-frame and edge
             # barcodes are removed via effCropWidth. FOV corner = raw pixel (0,0)
             # (same convention as segmentation and positions.csv), so no offset
             # is applied to global coordinates.
-            effCropWidth, cropOffset = self.cropWidth, 0
+            effCropWidth, cropOffset = self.cropWidth, (0, 0)
         barcodeOutput = decoder.extract_barcodes_with_index(
             decodedImage, pixelMagnitudes, pixelTraces, distances, fov,
             effCropWidth, zIndex, globalTask, minimumArea, outputLabels,

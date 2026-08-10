@@ -3,6 +3,8 @@ import subprocess
 import cv2
 import numpy as np
 import scipy as sp
+import scipy.fft as sp_fft
+from concurrent.futures import ThreadPoolExecutor
 
 from merlin.core import analysistask
 from merlin.util import deconvolve
@@ -180,8 +182,16 @@ class DeconvolutionPreprocess(Preprocess):
 
         if 'highpass_sigma' not in self.parameters:
             self.parameters['highpass_sigma'] = 3
+        # Frequency-domain high pass applied BEFORE the spatial high pass. The
+        # transfer function is 1 - exp(-|k|^2 / (2 sigma^2)) with |k| measured in
+        # FFT bins from the centred spectrum, matching the fft_hp3 filter that
+        # won the M1 preprocessing comparison. Off by default; 0 disables it.
+        if 'fft_highpass_sigma' not in self.parameters:
+            self.parameters['fft_highpass_sigma'] = 0
+        # All image filtering lives here now, so this carries the default that
+        # Decode used to hold. 0 disables it.
         if 'lowpass_sigma' not in self.parameters:
-            self.parameters['lowpass_sigma'] = None
+            self.parameters['lowpass_sigma'] = 1
         if 'decon_sigma' not in self.parameters:
             self.parameters['decon_sigma'] = 2
         if 'decon_filter_size' not in self.parameters:
@@ -207,8 +217,15 @@ class DeconvolutionPreprocess(Preprocess):
             self.parameters['threshold_subtract_n'] = 0.0
         if 'threshold_subtract_mode' not in self.parameters:
             self.parameters['threshold_subtract_mode'] = 'none'
+        # Bits of one FOV are filtered independently, so they can be fanned out
+        # over threads. Must be matched by the cpus requested for this task and
+        # for any task that calls get_processed_image_set (Optimize, Decode).
+        if 'preprocess_threads' not in self.parameters:
+            self.parameters['preprocess_threads'] = 1
 
         self._highPassSigma = self.parameters['highpass_sigma']
+        self._fftHighPassSigma = self.parameters['fft_highpass_sigma']
+        self._fftTransfer = None            # cached per image shape
         self._lowPassSigma = self.parameters['lowpass_sigma']
         self._deconSigma = self.parameters['decon_sigma']
         self._deconIterations = self.parameters['decon_iterations']
@@ -243,17 +260,42 @@ class DeconvolutionPreprocess(Preprocess):
             self, fov, zIndex: int = None,
             chromaticCorrector: aberration.ChromaticCorrector = None
     ) -> np.ndarray:
-        if zIndex is None:
-            return np.array([[self.get_processed_image(
-                fov, self.dataSet.get_data_organization()
-                    .get_data_channel_for_bit(b), zIndex, chromaticCorrector)
-                for zIndex in range(len(self.dataSet.get_z_positions()))]
-                for b in self.get_codebook().get_bit_names()])
+        """Read, warp and filter every bit of one FOV.
+
+        This is the hot loop of the whole pipeline: Optimize and Decode both go
+        through it, and preprocessing dominates their runtime. The bits are
+        independent, so preprocess_threads > 1 fans them out over a thread pool.
+        Threads (not processes) because the heavy steps -- the FFT, the OpenCV
+        blurs and the warp -- all release the GIL, and the results stay in
+        shared memory instead of being pickled back.
+        """
+        org = self.dataSet.get_data_organization()
+        channels = [org.get_data_channel_for_bit(b)
+                    for b in self.get_codebook().get_bit_names()]
+        zIndexes = ([zIndex] if zIndex is not None
+                    else list(range(len(self.dataSet.get_z_positions()))))
+
+        # Build the cached transfer function once, before any fan-out, so the
+        # workers never race to populate it.
+        if self._fftHighPassSigma:
+            self._fft_transfer(tuple(self.dataSet.get_image_dimensions()))
+
+        jobs = [(c, z) for c in channels for z in zIndexes]
+        threads = max(1, int(self.parameters['preprocess_threads']))
+        if threads > 1 and len(jobs) > 1:
+            with ThreadPoolExecutor(max_workers=min(threads, len(jobs))) as pool:
+                flat = list(pool.map(
+                    lambda job: self.get_processed_image(
+                        fov, job[0], job[1], chromaticCorrector), jobs))
         else:
-            return np.array([self.get_processed_image(
-                fov, self.dataSet.get_data_organization()
-                    .get_data_channel_for_bit(b), zIndex, chromaticCorrector)
-                    for b in self.get_codebook().get_bit_names()])
+            flat = [self.get_processed_image(fov, c, z, chromaticCorrector)
+                    for c, z in jobs]
+
+        stack = np.array(flat)
+        if zIndex is None:
+            return stack.reshape(len(channels), len(zIndexes),
+                                 *stack.shape[-2:])
+        return stack
 
     def get_processed_image(
             self, fov: int, dataChannel: int, zIndex: int,
@@ -271,6 +313,49 @@ class DeconvolutionPreprocess(Preprocess):
                                                     highPassFilterSize,
                                                     self._highPassSigma)
         return hpImage.astype(np.float32)
+
+    def _fft_transfer(self, shape) -> np.ndarray:
+        if self._fftTransfer is None or self._fftTransfer.shape != shape:
+            height, width = shape
+            u = np.arange(height) - height // 2
+            v = np.arange(width) - width // 2
+            vv, uu = np.meshgrid(v, u)
+            sigma = float(self._fftHighPassSigma)
+            lowpass = np.exp(-(uu ** 2 + vv ** 2) / (2.0 * sigma ** 2))
+            # float32 to match the complex64 spectrum -- a float64 transfer
+            # would silently promote the product back to complex128
+            self._fftTransfer = (1.0 - lowpass).astype(np.float32)
+        return self._fftTransfer
+
+    def _fft_highpass_filter(self, inputImage: np.ndarray) -> np.ndarray:
+        """Frequency-domain high pass, negatives clipped to 0.
+
+        Matches run_low_data_filter_decode_compare.fft_highpass so that a MERlin
+        run with fft_highpass_sigma=3, highpass_sigma=3, lowpass_sigma=0.5
+        reproduces the standalone fft_hp3_hp3_lp05 pipeline.
+
+        scipy.fft is used rather than numpy.fft because numpy always promotes to
+        complex128, which costs 2.7x the time and twice the memory for a
+        transform whose input is float32 to begin with. scipy keeps float32 ->
+        complex64, agreeing with the float64 result to ~2e-7 relative.
+        """
+        if self._fftHighPassSigma is None or self._fftHighPassSigma == 0:
+            return inputImage.astype(np.float32, copy=False)
+        image = np.asarray(inputImage, dtype=np.float32)
+        spectrum = sp_fft.fftshift(sp_fft.fft2(image))
+        spectrum *= self._fft_transfer(image.shape)
+        output = np.real(sp_fft.ifft2(sp_fft.ifftshift(spectrum))).astype(np.float32)
+        np.maximum(output, 0.0, out=output)
+        return output
+
+    def _deconvolve(self, inputImage: np.ndarray) -> np.ndarray:
+        # deconvolve_lucyrichardson allocates ~10 full-size buffers before its
+        # loop, so a 0-iteration call is an expensive no-op on 3200^2 frames.
+        if not self._deconIterations or not self._deconSigma:
+            return inputImage.astype(np.float32, copy=False)
+        return deconvolve.deconvolve_lucyrichardson(
+            inputImage, self.parameters['decon_filter_size'],
+            self._deconSigma, self._deconIterations)
 
     def _lowpass_filter(self, inputImage: np.ndarray) -> np.ndarray:
         lpImage = inputImage.astype(np.float32, copy=False)
@@ -338,21 +423,16 @@ class DeconvolutionPreprocess(Preprocess):
         return [zIndex]
     
     def _preprocess_image(self, inputImage: np.ndarray) -> np.ndarray:
-        deconFilterSize = self.parameters['decon_filter_size']
-        filteredImage = self._highpass_filter(inputImage.astype(np.float32))
+        filteredImage = self._fft_highpass_filter(inputImage)
+        filteredImage = self._highpass_filter(filteredImage)
         filteredImage = self._subtract_global_threshold(filteredImage)
         filteredImage = self._lowpass_filter(filteredImage)
-        deconvolvedImage = deconvolve.deconvolve_lucyrichardson(
-            filteredImage, deconFilterSize, self._deconSigma,
-            self._deconIterations)
-        return deconvolvedImage
-    
+        return self._deconvolve(filteredImage)
+
     def _preprocess_image_reversed(self, inputImage: np.ndarray) -> np.ndarray:
-        deconFilterSize = self.parameters['decon_filter_size']
-        deconvolvedImage = deconvolve.deconvolve_lucyrichardson(
-            inputImage.astype(np.float32), deconFilterSize, self._deconSigma,
-            self._deconIterations)
-        filteredImage = self._highpass_filter(deconvolvedImage)
+        deconvolvedImage = self._deconvolve(inputImage.astype(np.float32))
+        filteredImage = self._fft_highpass_filter(deconvolvedImage)
+        filteredImage = self._highpass_filter(filteredImage)
         filteredImage = self._subtract_global_threshold(filteredImage)
         filteredImage = self._lowpass_filter(filteredImage)
         return filteredImage

@@ -903,6 +903,17 @@ class CellPoseSegmentTwoChannel3D(CellPoseSegmentSingleChannel3D):
         if 'channel_2_name' not in self.parameters:
             self.parameters['channel_2_name'] = 'DAPI'
 
+        # cellpose channel selector, [cytoplasm, nucleus], 1-indexed into the
+        # stacked [channel_1, channel_2] image with 0 meaning grayscale.
+        # This used to be hardcoded to [0, 1], which is a no-op for the second
+        # channel: any channels[0]==0 makes cellpose average the stack down to
+        # one grayscale plane and zero the nuclear plane, so channel_2 never
+        # reached the model. Measured on this dataset (FOV 107, z3, membrane +
+        # DAPI, CP_20260301_mem_dapi_v3, diameter 95): [0,1] -> 26 cells,
+        # identical to [0,0] -> 26, versus [1,2] -> 194.
+        if 'cellpose_channels' not in self.parameters:
+            self.parameters['cellpose_channels'] = [1, 2]
+
     def _run_analysis(self, fragmentIndex):
 
         globalTask = self.dataSet.load_analysis_task(
@@ -956,7 +967,7 @@ class CellPoseSegmentTwoChannel3D(CellPoseSegmentSingleChannel3D):
                 cellpose_output = model.eval(seg_images, 
                                             diameter=self.parameters['diameter'],
                                             do_3D = False,
-                                            channels = [0,1], 
+                                            channels = self.parameters['cellpose_channels'],
                                             stitch_threshold=self.parameters['stitch_threshold']
                                             )
                 cellpose_output=cellpose_output[0]
@@ -964,7 +975,7 @@ class CellPoseSegmentTwoChannel3D(CellPoseSegmentSingleChannel3D):
                 cellpose_output = model.eval(seg_images, 
                                             diameter=self.parameters['diameter'],
                                             do_3D = False,
-                                            channels = [0,1], 
+                                            channels = self.parameters['cellpose_channels'],
                                             stitch_threshold=self.parameters['stitch_threshold']
                                             )
         else:
@@ -972,7 +983,7 @@ class CellPoseSegmentTwoChannel3D(CellPoseSegmentSingleChannel3D):
             cellpose_output = model.eval(seg_images, 
                                             diameter = self.parameters['diameter'], 
                                             do_3D = True,
-                                            channels = [0,1], channel_axis=3, 
+                                            channels = self.parameters['cellpose_channels'], channel_axis=3,
                                             anisotropy = self.parameters['anisotropy']
                                             )
                                             
