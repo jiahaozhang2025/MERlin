@@ -109,9 +109,9 @@ class PixelBasedDecoder(object):
             chunk_indices = np.argmax(similarities, axis=1).astype(np.int32)
             chunk_scores = similarities[
                 np.arange(similarities.shape[0]), chunk_indices]
-            chunk_scores = np.minimum(chunk_scores, 1.0)
 
             best_indices[start:stop] = chunk_indices
+            # Roundoff may put a normalized dot product just above one.
             best_dists[start:stop] = np.sqrt(
                 np.maximum(2.0 * (1.0 - chunk_scores), 0.0)
             ).astype(np.float32, copy=False)
@@ -155,7 +155,7 @@ class PixelBasedDecoder(object):
                     pixels_to_decode[start:stop].astype(np.float32, copy=False))
                 similarities = torch.matmul(chunk_tensor, codebook_tensor.T)
                 chunk_scores, chunk_indices = torch.max(similarities, dim=1)
-                chunk_scores = torch.clamp(chunk_scores, max=1.0)
+                # Clamp the radicand rather than capping scores separately.
                 chunk_dists = torch.sqrt(torch.clamp(
                     2.0 * (1.0 - chunk_scores), min=0.0))
 
@@ -178,7 +178,7 @@ class PixelBasedDecoder(object):
                       distanceThreshold: float=0.5176,
                       magnitudeThreshold: float=1.0,
                       lowPassSigma: float=1.0,
-                      distanceMetric = None,
+                      distanceMetric = 'dot_product',
                       softmaxTemperature: float=0.15,
                       decodeChunkSize: int=65536,
                       nnAlgorithm = 'brute',

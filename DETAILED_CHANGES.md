@@ -7,22 +7,21 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 
 ### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
 
-- `distance_metric`: Adds chunked matrix-multiplication decoding with
-  `dot_product`, `softmax`, and `softmax_dot_product` modes as faster
-  alternatives to nearest-neighbor search.
+- `distance_metric`: Defaults to chunked `dot_product` matrix-multiplication
+  decoding, with optional `softmax` and `softmax_dot_product` modes.
 - `decode_chunk_size`: Limits the number of pixel traces processed in each
   matrix multiplication to control memory use.
 - `softmax_temperature`: Controls optional softmax top-1 probabilities for
   machine-learning and confidence-based workflows.
-- `adaptive_crop`: Excludes each FOV's unaligned warp margins so invalid image
-  regions do not contaminate barcode extraction.
+- `adaptive_crop`: Defaults to excluding each FOV's unaligned warp margins so
+  invalid image regions do not contaminate barcode extraction.
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
 - `finalize()`: Computes shared scale factors, backgrounds, barcode counts, and
   chromatic corrections once instead of repeating them in downstream tasks.
-- `chromatic_from_fragments`: Collects chromatic displacement samples during
-  optimization fragments and pools them for one final fit.
+- `chromatic_from_fragments`: Defaults to collecting chromatic displacement
+  samples during enabled chromatic optimization and pooling one final fit.
 - `chromatic_on_preprocessed`: Reuses the preprocessed image stack for
   chromatic sampling instead of loading another warped stack.
 - `chromatic_threads`: Parallelizes FOV/z chromatic sampling only when
@@ -78,8 +77,8 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
-- `adaptive_crop`: Uses the same per-FOV valid warp region as Decode during
-  scale-factor and chromatic estimation.
+- `adaptive_crop`: Defaults to the same per-FOV valid warp region as Decode
+  during scale-factor and chromatic estimation.
 - `normalize_scale_factors`: Returns scale factors as mean-one ratios for
   consistency across preprocessing configurations.
 - `cleanup_fragment_results`: Removes fragment-level intermediate arrays after

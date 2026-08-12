@@ -123,7 +123,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # crop_width has to be sized for the worst FOV in the dataset and throws
         # that away from every other one; here each FOV pays only what it owes.
         if 'adaptive_crop' not in self.parameters:
-            self.parameters['adaptive_crop'] = False
+            self.parameters['adaptive_crop'] = True
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
@@ -164,7 +164,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             
         # distance metric
         if 'distance_metric' not in self.parameters:
-            self.parameters['distance_metric'] = None
+            self.parameters['distance_metric'] = 'dot_product'
         if 'softmax_temperature' not in self.parameters:
             self.parameters['softmax_temperature'] = 0.15
         if 'decode_chunk_size' not in self.parameters:
