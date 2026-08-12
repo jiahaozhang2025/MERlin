@@ -1,0 +1,69 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "merlin"
+version = "0.1.6"
+description = "MERFISH decoding and analysis software"
+readme = "README.md"
+requires-python = ">=3.9,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+  { name = "George Emanuel", email = "emanuega0@gmail.com" },
+]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Natural Language :: English",
+  "Operating System :: POSIX",
+  "Operating System :: Unix",
+  "Operating System :: MacOS :: MacOS X",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Bio-Informatics",
+]
+dependencies = [
+  "boto3",
+  "h5py",
+  "matplotlib",
+  "networkx>=3.0",
+  "numpy==1.26.4",
+  "opencv-python",
+  "pandas",
+  "pyclustering",
+  "python-dotenv",
+  "requests",
+  "rtree",
+  "scikit-image",
+  "scikit-learn",
+  "scipy",
+  "shapely>=2.0",
+  "snakemake>=7,<8",
+  "pulp==2.7.0",
+  "tables",
+  "tifffile",
+  "xmltodict",
+  "zarr",
+]
+
+[project.optional-dependencies]
+segmentation = ["cellpose==2.2"]
+care = ["tensorflow", "csbdeep"]
+model = ["torch"]
+gui = ["PyQt5"]
+gcs = ["google-cloud-storage"]
+plots = ["seaborn"]
+simulation = ["Pillow"]
+
+[project.scripts]
+merlin = "merlin.merlin:merlin"
+
+[tool.setuptools.packages.find]
+include = ["merlin*"]
+
+[tool.setuptools.package-data]
+merlin = ["ext/*.mplstyle"]

@@ -1,252 +1,162 @@
-# Detailed changes from the forked baseline
+# Changes from the `gpu_decoding` fork
 
-## Scope and comparison point
+Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
+`15ce55f919eed7e986c7a9c79eb59ef41f39e1c8`.
 
-This document describes the functional differences between:
+## Major changes
 
-- **Baseline:** `forked`, commit `15ce55f919eed7e986c7a9c79eb59ef41f39e1c8`
-  from `aaronhalpern/MERlin:gpu_decoding`.
-- **Documented code snapshot:** the current `main` branch of
-  `jiahaozhang2025/MERlin`.
+### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
 
-## Latest update (August 10, 2026)
+- `distance_metric`: Adds chunked matrix-multiplication decoding with
+  `dot_product`, `softmax`, and `softmax_dot_product` modes as faster
+  alternatives to nearest-neighbor search.
+- `decode_chunk_size`: Limits the number of pixel traces processed in each
+  matrix multiplication to control memory use.
+- `softmax_temperature`: Controls optional softmax top-1 probabilities for
+  machine-learning and confidence-based workflows.
+- `adaptive_crop`: Excludes each FOV's unaligned warp margins so invalid image
+  regions do not contaminate barcode extraction.
 
-This update focuses on making preprocessing, optimization, and decoding agree
-on the same image data while reducing repeated downstream recomputation.
+### Optimize (`merlin/analysis/optimize.py`)
 
-- Image filtering is now owned by preprocessing instead of being split between
-  preprocessing and decode/optimize. New preprocessing controls include
-  `fft_highpass_sigma`, `lowpass_sigma`, and `preprocess_threads`.
-- Decode and optimize both gained `tile_overlap` and `adaptive_crop` so
-  per-FOV invalid margins can be trimmed without paying the worst-case crop on
-  every field of view.
-- Decode now reuses the optimize stage's previous chromatic corrector, which
-  matches the corrector used when scale factors were estimated and avoids
-  triggering late chromatic re-estimation from decode jobs.
-- Optimize can aggregate its per-fragment outputs in `finalize()`, cache merged
-  barcode counts, optionally clean fragment intermediates, and estimate
-  chromatic shifts from per-fragment samples using `chromatic_threads`,
-  `chromatic_max_barcodes_per_group`, `chromatic_max_groups`,
-  `chromatic_from_fragments`, `chromatic_on_preprocessed`, and
-  `cleanup_fragment_results`.
-- Adaptive barcode filtering can now write post-filter decoded images with
-  `write_filtered_images`, `write_filtered_FOVs`, and `write_filtered_z`.
-- Two-channel Cellpose segmentation now exposes `cellpose_channels` and defaults
-  to `[1, 2]`, fixing a path where the second channel was previously not passed
-  to the model as intended.
+- `finalize()`: Computes shared scale factors, backgrounds, barcode counts, and
+  chromatic corrections once instead of repeating them in downstream tasks.
+- `chromatic_from_fragments`: Collects chromatic displacement samples during
+  optimization fragments and pools them for one final fit.
+- `chromatic_on_preprocessed`: Reuses the preprocessed image stack for
+  chromatic sampling instead of loading another warped stack.
+- `chromatic_threads`: Parallelizes FOV/z chromatic sampling only when
+  `chromatic_from_fragments` is disabled.
+- `chromatic_max_barcodes_per_group`: Limits barcode samples in each FOV/z
+  worker only when `chromatic_from_fragments` is disabled.
+- `chromatic_max_groups`: Limits the FOV/z workers used for chromatic fitting
+  only when `chromatic_from_fragments` is disabled.
 
-## 1. Decoding pipeline
+### Preprocess (`merlin/analysis/preprocess.py`)
 
-### `merlin/analysis/decode.py`
+- `fft_highpass_sigma`: Applies FFT-space high-pass filtering to remove broad
+  background artifacts before decoding.
 
-The `Decode` task was expanded to support larger images, partial runs, and
-additional output products.
+### Barcode filtering (`merlin/analysis/filterbarcodes.py`)
 
-Notable behavior and parameters include:
+- `threshold_solver_method`: Adds cumulative-bin threshold selection for better
+  control of the requested misidentification rate.
+- `intensity_transform`: Selects linear or log10 intensity space for adaptive
+  thresholding.
+- `overshoot_toward_target`: Controls whether a discrete adaptive threshold may
+  move toward the requested misidentification rate.
+- `overshoot_tolerance`: Limits the permitted overshoot when selecting an
+  adaptive threshold.
+- `LogisticFilterBarcodes`: Adds logistic filtering based on barcode intensity,
+  decoding distance, and area.
+- `l2_regularization`: Controls regularization strength for the logistic filter.
+- `max_iterations`: Limits logistic-model optimization iterations.
 
-- `decode_chunk_size` bounds the number of pixel traces processed in one
-  similarity calculation.
-- `tiling_factor` divides an image into overlapping tiles to reduce peak
-  memory use.
-- `num_threads` controls tile-processing concurrency.
-- `decode_z_index` limits a run to one z plane; the default processes all
-  planes.
-- `crop_in_image_space` applies the configured crop directly to decoded image
-  dimensions.
-- `adaptive_crop` shrinks each decoded field of view to its own valid warped
-  region, rather than using only a fixed global crop.
-- `tile_overlap` keeps edge-spanning objects intact during tiled decode.
-- `magnitude_threshold`, `distance_metric`, `softmax_temperature`, and
-  `nn_algorithm` expose additional decoder controls.
-- `extract_intensity_traces` optionally stores per-barcode intensity traces.
-- `write_unique_id_images` adds a unique-barcode-label output channel.
-- `write_decoded_z` limits persisted decoded-image output to selected planes.
-- `lowpass_sigma` is no longer a decode parameter; filtering now belongs to
-  the preprocess task so optimize and decode see the same pixels.
-- Decoded images can be written incrementally to chunked Zarr arrays, allowing
-  previously completed z planes to be reused.
-- Tiled decoding performs barcode extraction per tile, removes overlap-region
-  duplicates, remaps local labels to globally unique IDs, and returns
-  coordinates in the full image frame.
-- Image-space decoding now computes crop bounds per field of view and restores
-  global coordinates with independent x/y crop offsets, fixing skew when the
-  valid warp margin is asymmetric.
-- Decode uses the optimize task's previous chromatic corrector, keeping decode
-  aligned with the scale/background estimates from that optimize iteration.
+## Minor changes
 
-### `merlin/analysis/optimize.py`
+### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
 
-`OptimizeIteration` was extended to make optimization outputs cheaper to
-produce and more consistent with the eventual decode step.
+- `tiling_factor`: Divides large images into overlapping tiles to reduce peak
+  decoding memory.
+- `tile_overlap`: Preserves barcodes crossing tile boundaries and supports
+  overlap-duplicate removal.
+- `num_threads`: Controls tile or nearest-neighbor processing concurrency.
+- `magnitude_threshold`: Filters low-magnitude pixels before barcode matching.
+- `nn_algorithm`: Selects the scikit-learn nearest-neighbor algorithm.
+- `resumable_z_decoding`: Retains completed z planes when a decode task is
+  resumed.
+- `decode_z_index`: Restricts decoding to one selected z plane.
+- `extract_intensity_traces`: Saves per-barcode intensity traces.
+- `write_unique_id_images`: Writes decoded images with globally unique barcode
+  labels.
+- `write_decoded_FOVs`: Selects FOVs for decoded-image output.
+- `write_decoded_z`: Selects z planes for decoded-image output.
+- `crop_in_image_space`: Applies edge cropping before decoding and restores the
+  crop offset in output coordinates.
+- `crop_offset`: Supports independent x/y offsets after asymmetric adaptive
+  cropping.
 
-- `lowpass_sigma` is no longer accepted here; decode and optimize both rely on
-  preprocess-owned filtering.
-- `tile_overlap`, `adaptive_crop`, and `num_threads` align optimize-time pixel
-  decoding with the decode task's tiled behavior.
-- `finalize()` materializes chromatic corrections, scale factors, backgrounds,
-  and merged barcode counts once per completed iteration instead of letting
-  multiple downstream jobs recompute them on cache miss.
-- `cleanup_fragment_results` can remove fragment-level `.npy` intermediates
-  after merged outputs are safely written.
-- Chromatic estimation can be measured inside fragments and pooled later via
-  `chromatic_from_fragments`, with optional workload caps through
-  `chromatic_max_barcodes_per_group` and `chromatic_max_groups`.
-- `chromatic_threads` parallelizes per-group chromatic sampling, and
-  `chromatic_on_preprocessed` allows those samples to be measured on the
-  already filtered image stack instead of reloading raw-warped images.
+### Optimize (`merlin/analysis/optimize.py`)
 
-### `merlin/util/decoding.py`
+- `adaptive_crop`: Uses the same per-FOV valid warp region as Decode during
+  scale-factor and chromatic estimation.
+- `normalize_scale_factors`: Returns scale factors as mean-one ratios for
+  consistency across preprocessing configurations.
+- `cleanup_fragment_results`: Removes fragment-level intermediate arrays after
+  their merged results are safely written.
+- `get_previous_chromatic_corrector()`: Keeps Decode in the same chromatic image
+  space used to estimate its scale factors and backgrounds.
 
-`PixelBasedDecoder` now contains explicit chunked similarity implementations:
+### Preprocess (`merlin/analysis/preprocess.py`)
 
-- `_decode_pixels_by_similarity_numpy` performs chunked matrix similarity on
-  the CPU.
-- `_decode_pixels_by_similarity_torch` performs the same calculation through
-  PyTorch and falls back to NumPy if PyTorch is unavailable.
-- Optional softmax top-1 probabilities are computed from codebook
-  similarities.
-- Image tiling, overlap buffers, decode masks, callback-based per-tile
-  extraction, and optional omission of the full normalized-pixel-trace array
-  reduce memory pressure.
-- Timing information is retained in `last_decode_timings`.
-- Barcode extraction and refactor calculations were extended to support the
-  new outputs and tiled execution path.
-- Barcode extraction now accepts a two-axis `crop_offset` tuple so global
-  coordinates remain correct after asymmetric image-space cropping.
+- `preprocess_threads`: Parallelizes independent bit and z-plane preprocessing.
+- `lowpass_sigma`: Moves low-pass filtering into preprocessing so Optimize and
+  Decode use the same filtered images.
+- `threshold_subtract_n`: Sets the amount of global background subtraction.
+- `threshold_subtract_mode`: Selects mean-, standard-deviation-, or combined
+  background subtraction.
+- `deconvolve_after_highpass`: Selects whether deconvolution runs before or
+  after high-pass filtering.
+- `preprocess_z_index`: Restricts preprocessing to one selected z plane.
+- Zero-iteration bypass: Skips Lucy-Richardson allocation when deconvolution is
+  disabled.
 
-## 2. Barcode filtering
+### Barcode filtering (`merlin/analysis/filterbarcodes.py`)
 
-### `merlin/analysis/filterbarcodes.py`
+- `report_bracketing_thresholds`: Reports the available adaptive thresholds
+  around the requested misidentification rate for diagnostics.
+- `remove_z_duplicated_barcodes`: Removes likely duplicate detections across
+  nearby z planes.
+- `z_duplicate_zPlane_threshold`: Sets the maximum z-plane separation for
+  duplicate removal.
+- `z_duplicate_xy_pixel_threshold`: Sets the maximum xy separation for
+  duplicate removal.
+- `write_filtered_images`: Writes decoded images containing only retained
+  barcodes.
+- `write_filtered_FOVs`: Selects FOVs for filtered-image output.
+- `write_filtered_z`: Selects z planes for filtered-image output.
 
-Adaptive threshold selection was made more explicit and robust:
+### Segmentation (`merlin/analysis/segment.py`)
 
-- Finite blank-fraction threshold candidates are extracted safely.
-- Cumulative blank/coding curves identify achievable thresholds around a
-  target misidentification rate.
-- `threshold_solver_method` supports the cumulative-bin solver as well as the
-  earlier numerical approach.
-- `intensity_transform` supports `log10` and `linear` intensity spaces.
-- `overshoot_toward_target`, `overshoot_tolerance`, and
-  `report_bracketing_thresholds` control and report how discrete histogram
-  thresholds approach the target.
-- The same threshold logic is used by global and local adaptive filtering.
+- `cellpose_channels`: Selects the two Cellpose input channels and defaults to
+  `[1, 2]`, fixing the previous two-channel configuration.
 
-`LogisticFilterBarcodes` is a new analysis task:
+### Restoration (`merlin/analysis/preprocess.py`, `merlin/analysis/modelrestore.py`)
 
-- Fits a regularized logistic model using barcode intensity, decoding
-  distance, and area.
-- Standardizes model features and supports configurable
-  `l2_regularization` and `max_iterations`.
-- Chooses a probability cutoff using the requested
-  `misidentification_rate`.
-- Saves a per-fragment `logistic_filter_summary` with training and output
-  counts, blank/coding counts, coefficients, and selected threshold.
+- `CARERestorePreprocess`: Adds per-channel CARE restoration before the normal
+  preprocessing filters.
+- `care_camera_offset`: Sets the camera offset used for CARE normalization.
+- `care_input_scale`: Sets the fixed input scale used for CARE normalization.
+- `care_use_csbdeep_normalizer`: Enables optional csbdeep percentile
+  normalization.
+- `care_n_tiles`: Tiles CARE inference to limit peak memory.
+- `ModelRestorePreprocess`: Adds joint restoration of all MERFISH bit channels
+  with a trained soft-decoding model.
 
-Both adaptive and logistic filtering can optionally remove likely
-z-duplicated detections using:
+### Warp (`merlin/analysis/warp.py`)
 
-- `remove_z_duplicated_barcodes`
-- `z_duplicate_zPlane_threshold`
-- `z_duplicate_xy_pixel_threshold`
+- `boundary_smooth`: Fills invalid warped edges from an edge-padded blurred
+  image.
+- `median_filter`: Enables or disables fiducial hot-pixel filtering.
+- `sparse_bead_fix`: Enables edge removal and bright-pixel selection for sparse
+  fiducials.
+- `percentile_pixel_to_keep`: Selects the fiducial intensity percentile retained
+  by the sparse-bead filter.
+- `edge_width_to_remove`: Sets the excluded fiducial-image edge width.
+- `write_aligned_FOVs`: Selects FOVs for aligned-image output.
+- `write_aligned_z`: Selects z planes for aligned-image output.
+- Registration metrics: Saves per-channel x/y shifts, registration error, and
+  phase difference.
 
-Adaptive filtering can also optionally write decoded images containing only
-the barcodes that survived filtering:
+### Pipeline and compatibility
 
-- `write_filtered_images` enables the export.
-- `write_filtered_FOVs` selects which fields of view should be written.
-- `write_filtered_z` optionally limits output to selected z planes.
-
-## 3. Preprocessing and restoration
-
-### `merlin/analysis/preprocess.py`
-
-Preprocessing tasks gained:
-
-- Configurable global-background subtraction through
-  `threshold_subtract_n` and `threshold_subtract_mode`.
-- Subtraction modes based on the image mean, standard deviation, or their sum.
-- A frequency-domain high-pass stage controlled by `fft_highpass_sigma`.
-- Preprocess-owned `lowpass_sigma`, now defaulting to the value that decode
-  previously assumed internally.
-- Additional high-pass and low-pass helper paths.
-- A reversed preprocessing path for workflows that require a different
-  operation order.
-- Threaded bit/z preprocessing through `preprocess_threads`.
-- A no-op bypass for zero-iteration deconvolution calls, avoiding unnecessary
-  Lucy-Richardson buffer allocation on large images.
-- Updates to deconvolution preprocessing and z-plane selection.
-
-## 4. Segmentation and restoration
-
-### `merlin/analysis/segment.py`
-
-`CellPoseSegmentTwoChannel3D` now exposes the Cellpose channel selector through
-`cellpose_channels`, defaulting to `[1, 2]` for the stacked
-`[channel_1, channel_2]` input. This replaces an earlier hardcoded `[0, 1]`
-path that effectively collapsed the stack to grayscale and prevented the
-second channel from being used as the intended nuclear input.
-
-### `merlin/analysis/modelrestore.py`
-
-`ModelRestorePreprocess` is a new environment-specific task for restoring all
-MERFISH bit channels jointly with a trained soft-decoding model.
-
-The task:
-
-- Reads warped bit images for a field of view and z plane.
-- Applies chromatic correction, high-pass filtering, scale-factor correction,
-  and per-FOV normalization matching the model-training pipeline.
-- Runs a PyTorch checkpoint on the multi-channel stack.
-- Converts predictions back to the high-pass, pre-scale-factor space expected
-  by downstream MERlin optimization and decoding.
-- Caches the most recently restored `(fov, z)` stack.
-
-Important limitation: this module currently adds
-`/n/home08/jiahaozhang/merfish_decode_transfer_pkg` to `sys.path` and imports
-helpers from that external package. It also requires a checkpoint and
-calibration assets. The task is therefore not self-contained or portable
-without additional configuration.
-
-### `merlin/util/deconvolve.py` and `merlin/util/imagefilters.py`
-
-- Deconvolution utilities include a Gaussian-kernel helper and updated
-  Lucy–Richardson/Guo processing.
-- High-pass filtering is exposed as a shared image utility.
-
-## 5. Repository-level changes
-
-Relative to the baseline:
-
-- Legacy `merlin/util/legacy.py` and `merlin/util/matlab.py` modules were
-  removed.
-- The inherited CircleCI, Codecov, and pep8speaks configuration was removed.
-- Generated `merlin.egg-info` metadata was added.
-- Several generated `__pycache__` files are currently tracked.
-- Some files changed executable bits because the working copy moved between
-  POSIX and Windows-backed filesystems; those mode changes do not describe
-  functional behavior.
-
-## Known caveats
-
-- The model-restoration task depends on an external, user-specific package
-  path and model assets.
-- PyTorch is used by optional GPU/model paths but is not pinned in
-  `requirements.txt`; install the build appropriate for the target CUDA
-  environment.
-- Packaging metadata still reports MERlin version `0.1.6`; `setup.py` also
-  labels the license as restricted even though `license.md` contains the MIT
-  License. The inherited package metadata does not fully describe this
-  research fork.
-- The inherited documentation predates several changes listed here.
-- Automated CI configuration is not currently present.
-- This change record is based on source and history inspection; it is not a
-  claim that every task and environment-specific path has been validated.
-
-## Reproducing the comparison
-
-```bash
-git log --oneline main
-git log --oneline forked
-git diff --stat forked main
-git diff forked main -- merlin
-```
+- Snakemake latency wait: Increases shared-filesystem latency handling from 10
+  to 60 seconds.
+- Fiducial file parsing: Supports separate fiducial capture groups in data
+  organization files.
+- Dependency compatibility: Updates NumPy and pandas dtype and concatenation
+  behavior.
+- Deconvolution utilities: Replaces the legacy MATLAB Gaussian-kernel helper
+  with a local implementation.
+- Repository cleanup: Removes obsolete utility modules and inherited CI service
+  configuration.
