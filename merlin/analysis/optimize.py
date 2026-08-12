@@ -31,7 +31,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         super().__init__(dataSet, parameters, analysisName)
 
         if 'distance_metric' not in self.parameters:
-            self.parameters['distance_metric'] = 'euclidean'
+            self.parameters['distance_metric'] = 'dot_product'
         if 'fov_per_iteration' not in self.parameters:
             self.parameters['fov_per_iteration'] = 50
         if 'area_threshold' not in self.parameters:
@@ -80,7 +80,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         # would not: a fragment with few barcodes gives a badly conditioned
         # rotation/scale estimate that contaminates the mean.
         if 'chromatic_from_fragments' not in self.parameters:
-            self.parameters['chromatic_from_fragments'] = False
+            self.parameters['chromatic_from_fragments'] = True
         # Which images the fragment measures on. The preprocessed set is already
         # in memory (free); the raw-warped set costs an extra load but is what
         # the single-job path uses. They are NOT interchangeable -- both
@@ -94,7 +94,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         # instead of a fixed worst-case border, so the scale factors and the
         # chromatic samples are fit on valid pixels only.
         if 'adaptive_crop' not in self.parameters:
-            self.parameters['adaptive_crop'] = False
+            self.parameters['adaptive_crop'] = True
         if 'random_seed' in self.parameters:
             # set the random seed
             # make sure to set a different one for each optimize
@@ -405,7 +405,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             barcodesSeen, 'barcode_counts', self.analysisName,
             resultIndex=fragmentIndex)
 
-        if self.parameters['chromatic_from_fragments']:
+        if (self.parameters['optimize_chromatic_correction']
+                and self.parameters['chromatic_from_fragments']):
             # This fragment already holds its (fov, z) images and barcodes, so
             # measuring here avoids the single-job path re-loading and
             # re-warping all 24 images per group afterwards.
@@ -943,11 +944,18 @@ class OptimizeIterationFOV(OptimizeIteration):
         # TODO this saves the barcodes under fragment instead of fov
         # the barcodedb should be made more general
         cropWidth = self.parameters['crop_width']
+        extracted = decoder.extract_barcodes_with_index(
+            di, pm, npt, d, fovIndex,
+            0 if self.parameters['adaptive_crop'] else cropWidth,
+            zIndex, minimumArea=areaThreshold)
+        if self.parameters['adaptive_crop']:
+            r0, r1, c0, c1 = decode.compute_crop_bounds(
+                self.dataSet, self.parameters['warp_task'], fovIndex,
+                cropWidth, True)
+            extracted = extracted[extracted['x'].between(c0, c1)
+                                  & extracted['y'].between(r0, r1)]
         self.get_barcode_database().write_barcodes(
-            decoder.extract_barcodes_with_index(
-                di, pm, npt, d, fovIndex, cropWidth,
-                zIndex, minimumArea=areaThreshold),
-            fov=fragmentIndex)
+            extracted, fov=fragmentIndex)
         self.dataSet.save_numpy_analysis_result(
             refactors, 'scale_refactors', self.analysisName,
             resultIndex=fragmentIndex)
@@ -957,6 +965,24 @@ class OptimizeIterationFOV(OptimizeIteration):
         self.dataSet.save_numpy_analysis_result(
             barcodesSeen, 'barcode_counts', self.analysisName,
             resultIndex=fragmentIndex)
+
+        if (self.parameters['optimize_chromatic_correction']
+                and self.parameters['chromatic_from_fragments']):
+            if self.parameters['chromatic_on_preprocessed']:
+                chromaticImages = warpedImages
+            else:
+                warpTask = self.dataSet.load_analysis_task(
+                    self.parameters['warp_task'])
+                chromaticImages = np.array([warpTask.get_aligned_image(
+                    fovIndex,
+                    self.dataSet.get_data_organization()
+                        .get_data_channel_for_bit(b),
+                    int(zIndex), chromaticCorrector)
+                    for b in codebook.get_bit_names()])
+            self.dataSet.save_pickle_analysis_result(
+                self._measure_chromatic_samples(chromaticImages, extracted),
+                'chromatic_samples', self.analysisName,
+                resultIndex=fragmentIndex)
 
     def _get_previous_scale_factors(self, fragmentIndex) -> np.ndarray:
         if 'previous_iteration' not in self.parameters:
