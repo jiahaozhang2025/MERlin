@@ -25,29 +25,31 @@ Snakemake and a cluster scheduler. The pipeline covers image registration,
 preprocessing, barcode decoding and filtering, cell segmentation, and export
 of spatial features and barcode data.
 
-![Image of MERlin](docs/_static/merlin_headline.png "MERlin - the MERFISH decoding software")
-
-See [DETAILED_CHANGES.md](DETAILED_CHANGES.md) for the module-by-module
-tree comparison, parameters, caveats, and exact history boundary.
-
-The August 10, 2026 update adds centralized preprocessing filters,
-per-FOV adaptive decode cropping, faster optimize-stage aggregation and
-chromatic sampling, optional filtered decoded-image outputs, and a fix for
-two-channel Cellpose segmentation. See the "Latest update (August 10, 2026)"
-section in `DETAILED_CHANGES.md` for the operational details and new
-parameters.
+See [DETAILED_CHANGES.md](DETAILED_CHANGES.md) for a concise list of major and
+minor changes from the `gpu_decoding` baseline.
 
 ## Installation
 
-This is research software with environment-specific components. Create an
-isolated environment, install system-level dependencies such as `rtree` and
-PyTables as appropriate for the platform, then install this repository:
+MERlin supports Python 3.9 through 3.12. Create an isolated environment,
+install system-level dependencies such as `rtree` and PyTables as appropriate
+for the platform, then install the core package:
 
 ```bash
 git clone https://github.com/jiahaozhang2025/MERlin.git
 cd MERlin
-pip install -e .
+python -m pip install -e .
 ```
+
+Optional components can be installed as needed:
+
+```bash
+python -m pip install -e ".[segmentation]"  # Cellpose
+python -m pip install -e ".[care]"          # CARE restoration
+python -m pip install -e ".[model]"         # PyTorch decoding/restoration
+python -m pip install -e ".[gui]"           # MERlin viewer
+```
+
+`python -m pip install -r requirements.txt` installs all optional components.
 
 ## Configuration and use
 
@@ -79,11 +81,6 @@ merlin \
   dataset_name
 ```
 
-The inherited documentation in [`docs/`](docs/) describes the MERlin task
-model and file layout. Some pages still reflect the original MERlin release,
-so verify task parameters against the current source and the detailed change
-record.
-
 ## Original authors and citation
 
 The original MERlin repository identifies:
@@ -103,4 +100,4 @@ current branch descends.
 
 ## License
 
-MERlin is distributed under the terms in [license.md](license.md).
+MERlin is distributed under the [MIT License](LICENSE).
