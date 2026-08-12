@@ -2,7 +2,7 @@
 soft-decode restoration model (per-FOV, all bits jointly), so downstream
 Optimize/Decode run on the model-restored images.
 
-Unlike CAREPreprocess (a per-channel 2D denoiser), this model is multi-channel:
+Unlike CARERestorePreprocess (a per-channel 2D denoiser), this model is multi-channel:
 it consumes all codebook-bit channels of a FOV together. We therefore restore the
 whole bit-stack once per (fov, z) and return the requested channel(s).
 

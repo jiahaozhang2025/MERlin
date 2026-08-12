@@ -42,139 +42,6 @@ class Preprocess(analysistask.ParallelAnalysisTask):
         self.dataSet.save_numpy_analysis_result(
             histogram, 'pixel_histogram', self.analysisName, fov, 'histograms')
 
-class CAREPreprocess(Preprocess):
-    def __init__(self, dataSet, parameters=None, analysisName=None):
-            super().__init__(dataSet, parameters, analysisName)
-
-            # do lazy import since this is slow to load...
-            try:
-                from csbdeep.models import CARE
-            except ImportError:
-                raise ImportError('***CARE package (csbdeep.models.CARE) not found***')
-
-
-            if 'CARE_model_directory' not in self.parameters:
-                raise ValueError('CARE model path not in parameters')
-
-            if 'codebook_index' not in self.parameters:
-                self.parameters['codebook_index'] = 0
-            if 'write_preprocessed_images' not in self.parameters:
-                self.parameters['write_preprocessed_images'] = False
-            if 'highpass_sigma' not in self.parameters:
-                self.parameters['highpass_sigma'] = 3
-            # turn of save pixel histogram - it can be time consuming for CARE
-            # will assume initial scale factors are = 1 in Optimization
-            if 'save_pixel_histogram' not in self.parameters:
-                self.parameters['save_pixel_histogram'] = False
-            if 'write_preprocessed_FOVs' not in self.parameters:
-                self.parameters['write_preprocessed_FOVs'] = [-1]
-            if 'write_preprocessed_z' not in self.parameters:
-                # None = save all z; otherwise list of zIndexes to write
-                self.parameters['write_preprocessed_z'] = None
-            
-            self._highPassSigma = self.parameters['highpass_sigma']
-
-            self.warpTask = self.dataSet.load_analysis_task(
-                self.parameters['warp_task'])
-        
-            # is this a good way to bring in the model?
-            model_basedir, model_name = os.path.split(self.parameters['CARE_model_directory'])
-            
-            self.model = CARE(config = None,
-                             name = model_name,
-                             basedir= model_basedir)
-
-    def fragment_count(self):
-        return len(self.dataSet.get_fovs())
-
-    def get_estimated_memory(self):
-        return 4096
-
-    def get_estimated_time(self):
-        return 5
-
-    def get_dependencies(self):
-        return [self.parameters['warp_task']]
-
-    def get_codebook(self) -> codebook.Codebook:
-        return self.dataSet.get_codebook(self.parameters['codebook_index'])
-
-    def get_processed_image_set(
-            self, fov, zIndex: int = None,
-            chromaticCorrector: aberration.ChromaticCorrector = None
-    ) -> np.ndarray:
-        if zIndex is None:
-            return np.array([[self.get_processed_image(
-                fov, self.dataSet.get_data_organization()
-                    .get_data_channel_for_bit(b), zIndex, chromaticCorrector)
-                for zIndex in range(len(self.dataSet.get_z_positions()))]
-                for b in self.get_codebook().get_bit_names()])
-        else:
-            return np.array([self.get_processed_image(
-                fov, self.dataSet.get_data_organization()
-                    .get_data_channel_for_bit(b), zIndex, chromaticCorrector)
-                    for b in self.get_codebook().get_bit_names()])
-
-    def get_processed_image(
-            self, fov: int, dataChannel: int, zIndex: int,
-            chromaticCorrector: aberration.ChromaticCorrector = None
-    ) -> np.ndarray:
-        inputImage = self.warpTask.get_aligned_image(fov, dataChannel, zIndex,
-                                                    chromaticCorrector)
-        return self._preprocess_image(inputImage)
-    
-    def _preprocess_image(self, inputImage: np.ndarray) -> np.ndarray:
-        outputImage = self.model.predict(inputImage, 'YX')
-        outputImage = self._highpass_filter(outputImage)
-        return outputImage.astype(np.float32) # switching back to float32 will it eat up memory?
-        
-    def _highpass_filter(self, inputImage: np.ndarray) -> np.ndarray:
-        hpImage = inputImage
-        if self._highPassSigma is not None:
-            highPassFilterSize = int(2 * np.ceil(2 * self._highPassSigma) + 1)
-            hpImage = imagefilters.highpass_filter(inputImage,
-                                                    highPassFilterSize,
-                                                    self._highPassSigma)
-        return hpImage #.astype(np.float32) # does this need to be cast?
-    
-    def _run_analysis(self, fragmentIndex):
-    
-        if self.parameters['write_preprocessed_images']:
-            if self.parameters['write_preprocessed_FOVs'] == [-1]:
-                self.parameters['write_preprocessed_FOVs'] = self.dataSet.get_fovs()
-            
-        if self.parameters['save_pixel_histogram'] or (fragmentIndex in self.parameters['write_preprocessed_FOVs']):
-        
-            warpTask = self.dataSet.load_analysis_task(
-                    self.parameters['warp_task'])
-
-            histogramBins = np.arange(0, np.iinfo(np.uint16).max, 1)
-            pixelHistogram = np.zeros(
-                    (self.get_codebook().get_bit_count(), len(histogramBins)-1))
-
-            # this currently only is to calculate the pixel histograms in order
-            # to estimate the initial scale factors. This is likely unnecessary
-
-            with self.dataSet.writer_for_analysis_images(
-                     self.analysisName, 'preprocessed_images', fragmentIndex) as outputTif:
-
-                for bi, b in enumerate(self.get_codebook().get_bit_names()):
-                    dataChannel = self.dataSet.get_data_organization()\
-                            .get_data_channel_for_bit(b)
-                    for i in range(len(self.dataSet.get_z_positions())):
-                        inputImage = warpTask.get_aligned_image(
-                                fragmentIndex, dataChannel, i)
-                        outputImage = self._preprocess_image(inputImage)
-
-                        pixelHistogram[bi, :] += np.histogram(
-                                outputImage, bins=histogramBins)[0]
-
-                        _zsel = self.parameters.get('write_preprocessed_z')
-                        if _zsel is None or i in _zsel:
-                            outputTif.save(outputImage,photometric='MINISBLACK')
-
-            self._save_pixel_histogram(pixelHistogram, fragmentIndex)
-
 class DeconvolutionPreprocess(Preprocess):
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
@@ -456,6 +323,87 @@ class DeconvolutionPreprocess(Preprocess):
             threshold = nFactor * (imageMean + imageStd)
 
         return np.maximum(imageFloat - threshold, 0.0).astype(np.float32)
+
+
+class CARERestorePreprocess(DeconvolutionPreprocess):
+    """DeconvolutionPreprocess with a CARE restoration applied to each warped image
+    before the normal filter chain.
+
+    It subclasses DeconvolutionPreprocess so the restored images go through exactly the
+    same filter chain as a plain decode (e.g. M2 uses fft_highpass_sigma 3 ->
+    highpass_sigma 3 -> lowpass_sigma 0.5); the only difference between a restored and a
+    plain decode is then the restoration itself. An earlier CAREPreprocess class applied
+    only a single spatial high pass, which would have filtered restored images
+    differently from the decodes they are compared against; it has been removed in favour
+    of this one.
+
+    Normalization is explicit and must match how the model was trained:
+
+        model_input = (warped_image - care_camera_offset) / care_input_scale
+        restored    = model.predict(...) * care_input_scale + care_camera_offset
+
+    care_use_csbdeep_normalizer defaults to FALSE, i.e. predict(normalizer=None). This
+    matters: csbdeep's default is PercentileNormalizer(2, 99.8, do_after=True), which
+    re-normalizes every image to its own percentile range before the network and maps
+    the result back. For a model trained on a fixed global affine that is a train/apply
+    mismatch which measurably halves the restored brightness. Set it True only for models
+    that were themselves trained under csbdeep's percentile normalization.
+
+    Parameters
+      care_model_directory        path to the CARE model dir (parent dir + model name)
+      care_camera_offset          default 0.0
+      care_input_scale            default 65535.0 (uint16 full scale)
+      care_use_csbdeep_normalizer default False -- see above
+      care_n_tiles                optional [ny, nx] to bound peak memory
+    """
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+
+        if 'care_model_directory' not in self.parameters:
+            raise ValueError(
+                'CARERestorePreprocess requires care_model_directory')
+        self.parameters.setdefault('care_camera_offset', 0.0)
+        self.parameters.setdefault('care_input_scale', 65535.0)
+        self.parameters.setdefault('care_use_csbdeep_normalizer', False)
+        self.parameters.setdefault('care_n_tiles', None)
+        # The histogram is only used to seed initial scale factors, and is expensive
+        # here because every image must go through the network first. Off by default.
+        self.parameters.setdefault('save_pixel_histogram', False)
+
+        self._careModel = None      # loaded lazily; TF import is slow
+
+    def _get_care_model(self):
+        if self._careModel is None:
+            try:
+                from csbdeep.models import CARE
+            except ImportError:
+                raise ImportError(
+                    '***CARE package (csbdeep.models.CARE) not found***')
+            basedir, name = os.path.split(self.parameters['care_model_directory'])
+            self._careModel = CARE(config=None, name=name, basedir=basedir)
+        return self._careModel
+
+    def _restore_image(self, inputImage: np.ndarray) -> np.ndarray:
+        offset = float(self.parameters['care_camera_offset'])
+        scale = float(self.parameters['care_input_scale'])
+        kwargs = {}
+        if not self.parameters['care_use_csbdeep_normalizer']:
+            kwargs['normalizer'] = None
+        if self.parameters['care_n_tiles'] is not None:
+            kwargs['n_tiles'] = tuple(self.parameters['care_n_tiles'])
+        x = (inputImage.astype(np.float32) - offset) / scale
+        restored = self._get_care_model().predict(x, 'YX', **kwargs)
+        return (restored * scale + offset).astype(np.float32)
+
+    # both get_processed_image and _run_analysis funnel through these two, so
+    # overriding them restores every path without touching the filter chain
+    def _preprocess_image(self, inputImage: np.ndarray) -> np.ndarray:
+        return super()._preprocess_image(self._restore_image(inputImage))
+
+    def _preprocess_image_reversed(self, inputImage: np.ndarray) -> np.ndarray:
+        return super()._preprocess_image_reversed(self._restore_image(inputImage))
+
 
 class DeconvolutionPreprocessDW(Preprocess):
     

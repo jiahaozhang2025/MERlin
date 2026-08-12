@@ -148,8 +148,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             self.parameters['write_unique_id_images'] = False
             
         # magnitude threshold
+        # Default 0 (was 1.0). Magnitude is ||pixel_trace / scale_factors||, so what a
+        # fixed cut removes depends entirely on the scale-factor convention: with
+        # absolute factors (save_pixel_histogram=True -> ~50-180 here) magnitudes run
+        # ~10-100 and a cut at 1.0 is nearly inert, while with normalized mean-1 factors
+        # they are ~50x larger and it is fully inert. Same threshold, different meaning
+        # per dataset -- MB3 set it to 0 explicitly, M1 and M2 inherited 1.0. 0 makes the
+        # behaviour convention-independent; the adaptive filter does the real selection.
         if 'magnitude_threshold' not in self.parameters:
-            self.parameters['magnitude_threshold'] = 1.0
+            self.parameters['magnitude_threshold'] = 0.0
         
         # tiling factor for large images to avoid OOM
         if 'tiling_factor' not in self.parameters:

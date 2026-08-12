@@ -151,6 +151,30 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         if 'tiling_factor' not in self.parameters:
             self.parameters['tiling_factor'] = None
 
+        # Return scale factors as ratios with mean 1 rather than absolute intensities.
+        # Without this the convention depends on the preprocess task: with
+        # save_pixel_histogram=True the initial factors are the pixel histogram's 90th
+        # percentile (absolute, e.g. 177 / 50 on the two M2 arms), with it False they
+        # start at np.ones and stay near 1 -- so the same pipeline produced M1 at ~1 and
+        # M2 at ~177, which is a trap when comparing arms or feeding factors between
+        # datasets. Normalizing is decode-safe: decoding.py:394 computes
+        # (image - background)/scaleFactors and unit-normalizes the pixel trace at :397,
+        # so dividing the factors by a constant is a pure global scale that cancels.
+        # NOTE backgrounds are deliberately NOT rescaled -- they are subtracted before
+        # the division, so scaling them too would change the result rather than scale it.
+        if 'normalize_scale_factors' not in self.parameters:
+            self.parameters['normalize_scale_factors'] = True
+
+    def _normalize_scale_factors(self, scaleFactors: np.ndarray) -> np.ndarray:
+        """Rescale to mean 1 if requested. Idempotent, so it is safe to apply on every
+        read including to values cached from an earlier (un-normalized) run."""
+        if not self.parameters.get('normalize_scale_factors', True):
+            return scaleFactors
+        sf = np.asarray(scaleFactors, dtype=float)
+        m = np.nanmean(sf)
+        if not np.isfinite(m) or m == 0:
+            return scaleFactors
+        return sf / m
 
     def get_estimated_memory(self):
         return 4000
@@ -731,8 +755,9 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                             + 'factors.')
 
         try:
-            return self.dataSet.load_numpy_analysis_result(
-                'scale_factors', self.analysisName)
+            return self._normalize_scale_factors(
+                self.dataSet.load_numpy_analysis_result(
+                    'scale_factors', self.analysisName))
         # OSError and ValueError are raised if the previous file is not
         # completely written
         except (FileNotFoundError, OSError, ValueError):
@@ -750,10 +775,11 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             scaleFactors = np.nanmedian(
                     np.multiply(refactors, previousFactors), axis=0)
 
+            # cache the raw values; normalization is applied on read and is idempotent
             self.dataSet.save_numpy_analysis_result(
                 scaleFactors, 'scale_factors', self.analysisName)
 
-            return scaleFactors
+            return self._normalize_scale_factors(scaleFactors)
 
     def get_backgrounds(self) -> np.ndarray:
         if not self.is_complete():
@@ -962,9 +988,11 @@ class OptimizeIterationFOV(OptimizeIteration):
             raise Exception('Analysis is still running. Unable to get scale '
                             + 'factors.')
         try:
-            return self.dataSet.load_numpy_analysis_result(
-                'scale_factors', self.analysisName, resultIndex=fragmentIndex)
-        
+            return self._normalize_scale_factors(
+                self.dataSet.load_numpy_analysis_result(
+                    'scale_factors', self.analysisName,
+                    resultIndex=fragmentIndex))
+
         # OSError and ValueError are raised if the previous file is not
         # completely written
         except (FileNotFoundError, OSError, ValueError):
@@ -982,11 +1010,12 @@ class OptimizeIterationFOV(OptimizeIteration):
             # in case there are nans?
             scaleFactors[scaleFactors == np.nan] = previousFactors[scaleFactors == np.nan]
 
+            # cache the raw values; normalization is applied on read and is idempotent
             self.dataSet.save_numpy_analysis_result(
                 scaleFactors, 'scale_factors', self.analysisName,
                 resultIndex=fragmentIndex)
 
-            return scaleFactors
+            return self._normalize_scale_factors(scaleFactors)
 
     def get_backgrounds(self, fragmentIndex) -> np.ndarray:
         if not self.is_complete():
