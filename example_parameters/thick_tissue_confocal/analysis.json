@@ -1,23 +1,28 @@
 {
   "_comment": [
-    "Registration for a thick-tissue acquisition whose protein channel sits on a",
-    "late imaging round and whose polyT/DAPI live in a separate file.",
-    "PolyWarp registers EVERY channel the dataorganization describes, so giving",
-    "the protein round a row of its own removes the need for a standalone offset",
-    "script beside the pipeline. That matters: one such script re-implemented a",
-    "subset of this task's filter and peak search and inherited neither the median",
-    "filter (single hot pixels, fixed to the detector, correlate with themselves at",
-    "zero lag) nor the bounded peak search (a dense self-similar bead field locks",
-    "onto a secondary maximum of its own autocorrelation).",
-    "rigid_plane_search is ON because a 2D bead frame can give a confident-looking,",
-    "in-band answer that deeper planes show is wrong by tens of pixels.",
-    "See README.md for the measured numbers behind each setting."
+    "Full pipeline for a thick-tissue confocal MERFISH acquisition: an 80 um slab,",
+    "~160 z planes, 21 bit rounds on an MHD4 constant-weight-4 codebook, plus a",
+    "protein channel on a late imaging round and polyT/DAPI in a separate file.",
+    "Task order: GlobalAlign -> PolyWarp -> Preprocess -> Optimize x3 -> Decode ->",
+    "AdaptiveThreshold -> FilterBarcodes, with Segment -> CleanBoundaries ->",
+    "CombineBoundaries -> RefineCells feeding Partition.",
+    "Dependencies are by analysis_name, so rename a task and its dependents too.",
+    "Only the PolyWarp settings here were measured on the dataset this came from;",
+    "the rest are working defaults to adapt. See README.md."
   ],
   "analysis_tasks": [
+    {
+      "task": "SimpleGlobalAlignment",
+      "module": "merlin.analysis.globalalign",
+      "analysis_name": "GlobalAlign",
+      "_comment": "Stage positions -> a global coordinate frame. No dependencies; everything that reports global_x/global_y hangs off this.",
+      "parameters": {}
+    },
     {
       "task": "FiducialPolynomialWarp3D",
       "module": "merlin.analysis.warp",
       "analysis_name": "PolyWarp",
+      "_comment": "Registration. Registers EVERY channel the dataorganization describes, so a protein channel on a late round needs only a row of its own -- no standalone offset script. See README for what each rigid_* setting is for.",
       "parameters": {
         "highpass_sigma": 3,
         "median_filter": true,
@@ -34,15 +39,289 @@
         "rigid_plane_step": 4,
         "rigid_snr_ratio": 1.5,
         "rigid_search_bound": 200,
-        "per_z_slice_num_threads": 16,
-        "stack_num_threads": 4,
-        "write_qc_table": true,
         "rigid_walk_bound": 15,
         "rigid_only_channels": [
           "polyT",
           "DAPI"
+        ],
+        "max_z_fit_residual": 0.5,
+        "max_xy_fit_residual": 0.5,
+        "min_xy_planes_kept": 0.5,
+        "per_z_slice_num_threads": 16,
+        "stack_num_threads": 4,
+        "write_qc_table": true
+      }
+    },
+    {
+      "task": "DeconvolutionPreprocess",
+      "module": "merlin.analysis.preprocess",
+      "analysis_name": "Preprocess",
+      "_comment": "High-pass to kill out-of-focus background, then Lucy-Richardson deconvolution. highpass_sigma 3 is a plain Gaussian high-pass; an FFT high-pass only looked better here while chromatic misregistration was still present, and lost that advantage once registration was correct.",
+      "parameters": {
+        "warp_task": "PolyWarp",
+        "codebook_index": 0,
+        "highpass_sigma": 3,
+        "lowpass_sigma": 1,
+        "decon_sigma": 2,
+        "decon_iterations": 20,
+        "decon_method": "lucyrichardson",
+        "deconvolve_after_highpass": true,
+        "lowpass_after_deconvolution": false,
+        "save_pixel_histogram": true,
+        "write_preprocessed_images": false,
+        "preprocess_threads": 1
+      }
+    },
+    {
+      "task": "OptimizeIteration",
+      "module": "merlin.analysis.optimize",
+      "analysis_name": "Optimize1",
+      "_comment": "Per-bit scale factors. Each iteration re-estimates them from the previous one; three is a usual number, add more if the factors have not settled.",
+      "parameters": {
+        "warp_task": "PolyWarp",
+        "preprocess_task": "Preprocess",
+        "fov_per_iteration": 50,
+        "area_threshold": 4,
+        "distance_threshold": 0.5176,
+        "crop_width": 100,
+        "adaptive_crop": true,
+        "optimize_background": false,
+        "optimize_chromatic_correction": false,
+        "normalize_scale_factors": true,
+        "write_decoded_images": false,
+        "tiling_num_threads": 1
+      }
+    },
+    {
+      "task": "OptimizeIteration",
+      "module": "merlin.analysis.optimize",
+      "analysis_name": "Optimize2",
+      "_comment": "Chained off Optimize1 via previous_iteration.",
+      "parameters": {
+        "warp_task": "PolyWarp",
+        "preprocess_task": "Preprocess",
+        "fov_per_iteration": 50,
+        "area_threshold": 4,
+        "distance_threshold": 0.5176,
+        "crop_width": 100,
+        "adaptive_crop": true,
+        "optimize_background": false,
+        "optimize_chromatic_correction": false,
+        "normalize_scale_factors": true,
+        "write_decoded_images": false,
+        "tiling_num_threads": 1,
+        "previous_iteration": "Optimize1"
+      }
+    },
+    {
+      "task": "OptimizeIteration",
+      "module": "merlin.analysis.optimize",
+      "analysis_name": "Optimize3",
+      "_comment": "Chained off Optimize2 via previous_iteration.",
+      "parameters": {
+        "warp_task": "PolyWarp",
+        "preprocess_task": "Preprocess",
+        "fov_per_iteration": 50,
+        "area_threshold": 4,
+        "distance_threshold": 0.5176,
+        "crop_width": 100,
+        "adaptive_crop": true,
+        "optimize_background": false,
+        "optimize_chromatic_correction": false,
+        "normalize_scale_factors": true,
+        "write_decoded_images": false,
+        "tiling_num_threads": 1,
+        "previous_iteration": "Optimize2"
+      }
+    },
+    {
+      "task": "Decode",
+      "module": "merlin.analysis.decode",
+      "analysis_name": "Decode",
+      "_comment": "Pixel decoding. per_z_slice_num_threads is the one that scales -- planes are independent. Leave torch_num_threads null so the task pins torch to one intra-op thread whenever the per-z pool is active; otherwise every z thread asks for every core and they contend (measured 1.43x).",
+      "parameters": {
+        "preprocess_task": "Preprocess",
+        "optimize_task": "Optimize3",
+        "global_align_task": "GlobalAlign",
+        "crop_width": 100,
+        "crop_in_image_space": true,
+        "adaptive_crop": true,
+        "distance_threshold": 0.5167,
+        "magnitude_threshold": 0.0,
+        "minimum_area": 0,
+        "distance_metric": "dot_product",
+        "decode_chunk_size": 8192,
+        "per_z_slice_num_threads": 16,
+        "torch_num_threads": null,
+        "tiling_num_threads": 1,
+        "decode_z_index": null,
+        "remove_z_duplicated_barcodes": true,
+        "z_duplicate_zPlane_threshold": 1,
+        "write_decoded_images": true,
+        "write_decoded_FOVs": [
+          0
+        ],
+        "write_decoded_z": [
+          0
         ]
       }
+    },
+    {
+      "task": "GenerateAdaptiveThreshold",
+      "module": "merlin.analysis.filterbarcodes",
+      "analysis_name": "AdaptiveThreshold",
+      "_comment": "Builds the intensity/distance/area histogram the adaptive filter solves against. Runs over all fovs before any filtering happens.",
+      "parameters": {
+        "decode_task": "Decode",
+        "run_after_task": "Decode",
+        "tolerance": 0.001,
+        "intensity_bins": 199,
+        "distance_bins": 66,
+        "area_bins": 33,
+        "threshold_solver_method": "cumulative_bins",
+        "intensity_transform": "log10",
+        "overshoot_toward_target": true,
+        "overshoot_tolerance": 0.2
+      }
+    },
+    {
+      "task": "AdaptiveFilterBarcodes",
+      "module": "merlin.analysis.filterbarcodes",
+      "analysis_name": "FilterBarcodes",
+      "_comment": "Picks the threshold that hits the target blank-based misidentification rate. NOTE: blank rate falls with codeword concentration alone, so also report the top-10 gene share before reading a low rate as good decoding.",
+      "parameters": {
+        "decode_task": "Decode",
+        "adaptive_task": "AdaptiveThreshold",
+        "misidentification_rate": 0.05,
+        "write_filtered_images": true,
+        "write_filtered_FOVs": [
+          0
+        ],
+        "write_filtered_z": [
+          0
+        ]
+      }
+    },
+    {
+      "task": "CellPoseSegmentSingleChannel3D",
+      "module": "merlin.analysis.segment",
+      "analysis_name": "Segment",
+      "_comment": "EXAMPLE segmentation: single-channel DAPI with cpsam_v2. On cellpose 4.x you MUST route through path_to_user_model -- it accepts a bare model name and builds CellposeModel(gpu=..., pretrained_model=...). The model_type branch calls cellpose.models.Cellpose, which does not exist in 4.x.",
+      "parameters": {
+        "warp_task": "PolyWarp",
+        "global_align_task": "GlobalAlign",
+        "channel_name": "DAPI",
+        "path_to_user_model": "cpsam_v2",
+        "use_gpu": true,
+        "cellpose_3D_stitching": true,
+        "stitch_threshold": 0.25,
+        "anisotropy": 1,
+        "diameter": 50,
+        "downsample_factor": null,
+        "dump_segmented_masks": true,
+        "dump_segmented_images": false,
+        "dump_segmented_FOVs": [
+          0
+        ]
+      }
+    },
+    {
+      "task": "CleanCellBoundaries",
+      "module": "merlin.analysis.segment",
+      "analysis_name": "CleanBoundaries",
+      "_comment": "Resolves cells that straddle an fov boundary, using the global frame.",
+      "parameters": {
+        "segment_task": "Segment",
+        "global_align_task": "GlobalAlign"
+      }
+    },
+    {
+      "task": "CombineCleanedBoundaries",
+      "module": "merlin.analysis.segment",
+      "analysis_name": "CombineBoundaries",
+      "_comment": "Collects the per-fov cleaning results into one assignment.",
+      "parameters": {
+        "cleaning_task": "CleanBoundaries"
+      }
+    },
+    {
+      "task": "RefineCellDatabases",
+      "module": "merlin.analysis.segment",
+      "analysis_name": "RefineCells",
+      "_comment": "Writes the de-duplicated cell database that partitioning assigns into.",
+      "parameters": {
+        "segment_task": "Segment",
+        "combine_cleaning_task": "CombineBoundaries"
+      }
+    },
+    {
+      "task": "ExportCellMetadata",
+      "module": "merlin.analysis.segment",
+      "analysis_name": "CellMetadata",
+      "_comment": "Per-cell geometry (centre, volume) as a flat table.",
+      "parameters": {
+        "segment_task": "Segment"
+      }
+    },
+    {
+      "task": "PartitionBarcodes",
+      "module": "merlin.analysis.partition",
+      "analysis_name": "Partition",
+      "_comment": "Filtered barcodes -> cells. assignment_task is the REFINED database, not the raw segmentation, so boundary-straddling cells are counted once.",
+      "parameters": {
+        "filter_task": "FilterBarcodes",
+        "assignment_task": "RefineCells",
+        "alignment_task": "GlobalAlign"
+      }
+    },
+    {
+      "task": "ExportPartitionedBarcodes",
+      "module": "merlin.analysis.partition",
+      "analysis_name": "ExportPartitioned",
+      "_comment": "The cell-by-gene matrix.",
+      "parameters": {
+        "partition_task": "Partition"
+      }
+    },
+    {
+      "task": "SumSignal",
+      "module": "merlin.analysis.sequential",
+      "analysis_name": "SumSignal",
+      "_comment": "Per-cell sums for non-decoded channels (polyT, protein). z_index selects the plane; set it per experiment.",
+      "parameters": {
+        "warp_task": "PolyWarp",
+        "segment_task": "Segment",
+        "global_align_task": "GlobalAlign",
+        "apply_highpass": false,
+        "highpass_sigma": 5,
+        "z_index": 0
+      }
+    },
+    {
+      "task": "ExportSumSignals",
+      "module": "merlin.analysis.sequential",
+      "analysis_name": "ExportSumSignals",
+      "_comment": "Those sums as one table.",
+      "parameters": {
+        "sequential_task": "SumSignal"
+      }
+    },
+    {
+      "task": "ExportBarcodes",
+      "module": "merlin.analysis.exportbarcodes",
+      "analysis_name": "ExportBarcodes",
+      "_comment": "Flat barcode list for downstream analysis.",
+      "parameters": {
+        "filter_task": "FilterBarcodes",
+        "exclude_blanks": true
+      }
+    },
+    {
+      "task": "PlotPerformance",
+      "module": "merlin.analysis.plotperformance",
+      "analysis_name": "Plots",
+      "_comment": "QC figures. Terminal task -- keeps the others in the snakemake graph.",
+      "parameters": {}
     }
   ]
 }

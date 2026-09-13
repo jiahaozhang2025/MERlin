@@ -1,17 +1,70 @@
 # thick_tissue_confocal
 
-`analysis.json` for a thick-tissue confocal MERFISH acquisition that has an
-extra protein imaging round and a separately-acquired nuclear stack:
+A complete MERlin `analysis.json` for a thick-tissue confocal MERFISH
+acquisition that has an extra protein imaging round and a separately-acquired
+nuclear stack:
 
     ~160 z planes over an 80 um slab at 0.5 um
     21 bit rounds, MHD4 constant-weight-4 codebook
     polyT / DAPI in their OWN file, acquired separately from the bit rounds
-    a protein (biotin) channel on a late imaging round
+    a protein channel on a late imaging round
 
-Pass it to MERlin with `-a`. Only the analysis definition is included --
-supply your own dataorganization (`-o`), codebook (`-c`), microscope
-parameters (`-m`) and positions (`-p`). The notes below are the parts of that
-dataorganization that this task's settings depend on.
+Pass it with `-a`. Supply your own dataorganization (`-o`), codebook (`-c`),
+microscope parameters (`-m`) and positions (`-p`) -- those are dataset
+specific. The notes below are the parts of *your* dataorganization that these
+settings depend on.
+
+## Pipeline
+
+    GlobalAlign ─┬─────────────────────────────────────────────┐
+                 │                                             │
+    PolyWarp ────┼─> Preprocess ─> Optimize1 ─> Optimize2 ─> Optimize3
+                 │                                             │
+                 │                                             v
+                 │                     Decode ─> AdaptiveThreshold ─> FilterBarcodes
+                 │                                             │
+                 └─> Segment ─> CleanBoundaries ─> CombineBoundaries ─> RefineCells
+                        │                                      │
+                        │                                      v
+                        │                    Partition ─> ExportPartitioned
+                        └─> SumSignal ─> ExportSumSignals
+                        └─> CellMetadata          FilterBarcodes ─> ExportBarcodes
+
+Twenty tasks. Dependencies are declared by `analysis_name`, so if you rename a
+task, rename it in its dependents too. Terminal tasks are `CellMetadata`,
+`ExportPartitioned`, `ExportSumSignals`, `ExportBarcodes` and `Plots`.
+
+**Only the PolyWarp settings were measured on the dataset this came from.**
+Everything else is a working default to adapt -- in particular
+`Preprocess.decon_sigma`, the number of `Optimize` iterations, the
+`FilterBarcodes` misidentification rate, and all of `Segment`.
+
+The file has been checked end to end: `merlin --generate-only` builds all 20
+task definitions and resolves the dependency graph above.
+
+## Segmentation is an EXAMPLE, and cpsam needs the right slot
+
+The dataset this came from was segmented by a custom three-model script, not by
+MERlin. What is included here is a plain single-channel DAPI segmentation with
+`cpsam_v2`, as a starting point.
+
+**On cellpose 4.x you must pass the model through `path_to_user_model`, not
+`model_type`.** `CellPoseSegmentSingleChannel3D` picks its model two ways:
+
+    path_to_user_model set  ->  CellposeModel(gpu=..., pretrained_model=...)   works
+    otherwise               ->  cellpose.models.Cellpose(model_type=...)       AttributeError
+
+`cellpose.models.Cellpose` does not exist in 4.x -- that build has only
+`CellposeModel`, and `MODEL_NAMES` is `['cpsam_v2', 'cpdino', 'cpdino-vitb',
+'cpsam']`. So the default `model_type: "cyto2"` cannot run there at all.
+`pretrained_model` accepts a bare model name as well as a path, which is why
+`"path_to_user_model": "cpsam_v2"` is the working spelling. Set `use_gpu` --
+this class does forward it to the model, though note the 2D
+`CellPoseSegmentSingleChannel` class does not.
+
+`cellpose_3D_stitching: true` segments each plane in 2D and links them across z
+by IoU, which on this kind of slab gives smoother cells than the `do_3D`
+anisotropy path. `diameter` is largely vestigial for cpsam.
 
 ## Registering a channel MERlin does not otherwise know about
 
@@ -19,8 +72,8 @@ dataorganization that this task's settings depend on.
 be registered at all**, which is how a project ends up with a standalone offset
 script beside the pipeline. Give the protein channel a row of its own -- model
 it on an existing protein row, with `imagingRound`, `fiducialImagingRound` and
-`fiducial3DImagingRound` all set to that round -- and
-`FiducialPolynomialWarp3D` registers it like any other channel.
+`fiducial3DImagingRound` all set to that round -- and PolyWarp registers it like
+any other channel.
 
 Worth doing even if a standalone script already "works": one such script had
 re-implemented a subset of this task's filter and peak search and inherited
@@ -97,8 +150,24 @@ print that case and write it to
 `transformations/fit_quality_flags_<fov>.csv`, which is written even when empty
 so its absence is never read as "the guard did not run".
 
-## Threads
+## Decode threading
 
-`per_z_slice_num_threads: 16` with `stack_num_threads: 4` is sized for a
-~22-core job; the task arbitrates them internally rather than letting them
-nest and oversubscribe.
+`per_z_slice_num_threads` is the one that scales, because z planes are
+independent and each is a large unit of work. Leave `torch_num_threads` null:
+the task then pins torch to a single intra-op thread whenever that per-z pool
+is active. Without the pin every z thread sizes its pool to the whole machine
+and they contend -- 16 planes on 16 cores took 364 ms with torch at its default
+against 255 ms pinned, a 1.43x difference, and numpy in the same pattern does
+not scale at all (1738 ms) because a threaded OpenBLAS gemm serialises across
+calling threads.
+
+`decode_chunk_size` is a cache-behaviour knob only; results are bit-identical at
+every value. The optimum moves with thread count, and 8192 sits inside both the
+single-thread and the multi-thread plateau.
+
+## A caution on the filter
+
+`AdaptiveFilterBarcodes` targets a blank-based misidentification rate, but blank
+rate falls with codeword concentration alone -- a run that collapses onto a few
+abundant genes will report a *better* rate while decoding worse. Report the
+top-10 gene share alongside it before reading a low rate as good decoding.
