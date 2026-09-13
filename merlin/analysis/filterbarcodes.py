@@ -1,4 +1,5 @@
 import os
+import time
 import numpy as np
 import pandas
 import zarr
@@ -366,9 +367,65 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
             self.parameters['overshoot_tolerance'] = 0.20
         if 'report_bracketing_thresholds' not in self.parameters:
             self.parameters['report_bracketing_thresholds'] = False
+        # Which fragments this histogram is built from and waited on. None
+        # means every fov in the dataset, which is right for a full run and
+        # wrong for a subset: the wait below can only ever be satisfied by
+        # fovs the decode task actually produced, so a subset run with the
+        # default spins forever.
+        if 'fovs' not in self.parameters:
+            self.parameters['fovs'] = None
+        # How many completed fovs to sample when choosing the intensity bin
+        # edges, and equivalently the minimum number needed before binning can
+        # start. The bins only need the intensity range, so a sample is enough
+        # -- but the sample size also gates the whole task, so on a subset run
+        # it has to come down to the number of fovs being decoded.
+        if 'bin_sample_fovs' not in self.parameters:
+            self.parameters['bin_sample_fovs'] = None
+        # Seconds to wait between polls while decode fragments are still
+        # arriving. The original loop had no sleep at all and burned a core.
+        if 'poll_interval' not in self.parameters:
+            self.parameters['poll_interval'] = 30
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
+
+    def _selected_fragments(self):
+        """Fragment indices this task builds its histogram from.
+
+        An explicit `fovs` on this task wins. Otherwise the decode task is
+        asked what it covers, so a subset run does not have to declare the
+        same thing twice. Failing both, every fov in the dataset.
+        """
+        fovs = self.parameters['fovs']
+        if fovs is None:
+            fovs = self._decode_fov_subset()
+        if fovs is None:
+            return list(range(self.fragment_count()))
+        return sorted({int(f) for f in fovs})
+
+    def _decode_fov_subset(self):
+        """The fov subset the decode task declares, or None for all of them.
+
+        A z-plane subset (decode_z_index) needs no special handling: the
+        barcodes simply only exist for those planes, and the histogram is
+        built from whatever barcodes are there.
+        """
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        declared = decodeTask.get_parameters().get('fovs')
+        if declared is None:
+            return None
+        return [int(f) for f in declared]
+
+    def _describe_selection(self) -> str:
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        zIndex = decodeTask.get_parameters().get('decode_z_index')
+        zDescription = 'all z' if zIndex is None else (
+            '%d z planes' % len(zIndex)
+            if isinstance(zIndex, (list, tuple)) else 'z index %s' % zIndex)
+        return '%d of %d fovs, %s' % (len(self._selected_fragments()),
+                                      self.fragment_count(), zDescription)
 
     def get_estimated_memory(self):
         return 5000
@@ -581,6 +638,14 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         completeFragments = \
             self.dataSet.load_numpy_analysis_result_if_available(
                 'complete_fragments', self, [False]*self.fragment_count())
+        selectedFragments = self._selected_fragments()
+        requestedSample = self.parameters['bin_sample_fovs']
+        if requestedSample is None:
+            requestedSample = 20
+        sampleTarget = max(1, min(requestedSample, len(selectedFragments)))
+        print('%s: building thresholds from %s (sampling %d for the intensity '
+              'range)' % (self.get_analysis_name(), self._describe_selection(),
+                          sampleTarget), flush=True)
         pendingFragments = [
             decodeTask.is_complete(i) and not completeFragments[i]
             for i in range(self.fragment_count())]
@@ -607,20 +672,27 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                 distanceBins, 'distance_bins', self)
 
         updated = False
-        while not all(completeFragments):
+        while not all(completeFragments[i] for i in selectedFragments):
             if (intensityBins is None or distanceBins is None or
                     blankCounts is None or codingCounts is None):
-                for i in range(self.fragment_count()):
+                for i in selectedFragments:
                     if not pendingFragments[i] and decodeTask.is_complete(i):
                         pendingFragments[i] = decodeTask.is_complete(i)
 
-                if np.sum(pendingFragments) >= min(20, self.fragment_count()):
+                readyFragments = [i for i in selectedFragments
+                                  if pendingFragments[i]]
+                if len(readyFragments) < sampleTarget:
+                    # Nothing to do until more decode fragments land. Without
+                    # a sleep this is a busy-wait on a full core.
+                    time.sleep(self.parameters['poll_interval'])
+                    continue
+
+                if True:
                     def extreme_values(inputData: pandas.Series):
                         return inputData.min(), inputData.max()
-                    sampleSize = min(20, np.sum(pendingFragments))
+                    sampleSize = min(sampleTarget, len(readyFragments))
                     sampledFragments = np.random.choice(
-                            [i for i, p in enumerate(pendingFragments) if p],
-                            size=sampleSize, replace=False)
+                            readyFragments, size=sampleSize, replace=False)
                     intensityExtremes = [
                         extreme_values(barcodeDB.get_barcodes(
                             i, columnList=['mean_intensity'])['mean_intensity'])
@@ -641,8 +713,10 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                                             len(areaBins)-1))
 
             else:
-                for i in range(self.fragment_count()):
+                progressed = False
+                for i in selectedFragments:
                     if not completeFragments[i] and decodeTask.is_complete(i):
+                        progressed = True
                         barcodes = barcodeDB.get_barcodes(
                             i, columnList=['barcode_id', 'mean_intensity',
                                            'min_distance', 'area'])
@@ -664,6 +738,8 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                         blankCounts, 'blank_counts', self)
                     self.dataSet.save_numpy_analysis_result(
                         codingCounts, 'coding_counts', self)
+                if not progressed:
+                    time.sleep(self.parameters['poll_interval'])
 
 
 class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
@@ -694,12 +770,14 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         # survive, median component area 1 px. Judging decode quality from that
         # image judges the unfiltered decode. This writes the same field with
         # only the surviving barcodes, which is what should be inspected.
+        # On by default for one fov and one plane, to match Decode: the point
+        # is that every run leaves behind at least one image to eyeball.
         if 'write_filtered_images' not in self.parameters:
-            self.parameters['write_filtered_images'] = False
+            self.parameters['write_filtered_images'] = True
         if 'write_filtered_FOVs' not in self.parameters:
-            self.parameters['write_filtered_FOVs'] = []
+            self.parameters['write_filtered_FOVs'] = [0]
         if 'write_filtered_z' not in self.parameters:
-            self.parameters['write_filtered_z'] = None
+            self.parameters['write_filtered_z'] = [0]
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -724,9 +802,18 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
             return
         source = zarr.open(zarrPath, mode='r')
 
+        # Only planes that were decoded carry anything; the rest of the zarr
+        # is zeros. Fall back to a decoded plane if the requested ones were
+        # not decoded, for the same reason Decode does.
+        decodedZ = sorted(barcodes['z'].astype(int).unique().tolist())
         zSel = self.parameters['write_filtered_z']
-        zIndexes = (list(range(source.shape[0])) if zSel is None
-                    else [z for z in zSel if z < source.shape[0]])
+        if zSel is None:
+            zIndexes = decodedZ
+        else:
+            zIndexes = [z for z in zSel if z in decodedZ]
+            if not zIndexes and decodedZ:
+                zIndexes = [decodedZ[0]]
+        zIndexes = [z for z in zIndexes if z < source.shape[0]]
         with self.dataSet.writer_for_analysis_images(
                 self, 'filtered', fragmentIndex) as outputTif:
             for z in zIndexes:

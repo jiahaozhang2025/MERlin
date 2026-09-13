@@ -1,0 +1,48 @@
+{
+  "_comment": [
+    "Registration for a thick-tissue acquisition whose protein channel sits on a",
+    "late imaging round and whose polyT/DAPI live in a separate file.",
+    "PolyWarp registers EVERY channel the dataorganization describes, so giving",
+    "the protein round a row of its own removes the need for a standalone offset",
+    "script beside the pipeline. That matters: one such script re-implemented a",
+    "subset of this task's filter and peak search and inherited neither the median",
+    "filter (single hot pixels, fixed to the detector, correlate with themselves at",
+    "zero lag) nor the bounded peak search (a dense self-similar bead field locks",
+    "onto a secondary maximum of its own autocorrelation).",
+    "rigid_plane_search is ON because a 2D bead frame can give a confident-looking,",
+    "in-band answer that deeper planes show is wrong by tens of pixels.",
+    "See README.md for the measured numbers behind each setting."
+  ],
+  "analysis_tasks": [
+    {
+      "task": "FiducialPolynomialWarp3D",
+      "module": "merlin.analysis.warp",
+      "analysis_name": "PolyWarp",
+      "parameters": {
+        "highpass_sigma": 3,
+        "median_filter": true,
+        "edge_width_to_remove": 20,
+        "zero_below_percentile": 5,
+        "interpolation": "weighted",
+        "xy_polynomial_order": 3,
+        "z_polynomial_order": 3,
+        "xy_sample_step": 6,
+        "z_sample_step": 16,
+        "xy_search_bound": 10,
+        "z_search_range": 6,
+        "rigid_plane_search": 40,
+        "rigid_plane_step": 4,
+        "rigid_snr_ratio": 1.5,
+        "rigid_search_bound": 200,
+        "per_z_slice_num_threads": 16,
+        "stack_num_threads": 4,
+        "write_qc_table": true,
+        "rigid_walk_bound": 15,
+        "rigid_only_channels": [
+          "polyT",
+          "DAPI"
+        ]
+      }
+    }
+  ]
+}

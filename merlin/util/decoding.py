@@ -187,8 +187,9 @@ class PixelBasedDecoder(object):
                       tilingFactor = None,
                       accumulatePixelTraces = True,
                       onTileDone = None,
-                      numThreads = 1,
-                      overlap = None):
+                      tilingNumThreads = 1,
+                      neighborNumJobs = -1,
+                      tilingOverlap = None):
         """Assign barcodes to the pixels in the provided image stock.
 
         Each pixel is assigned to the nearest barcode from the codebook if
@@ -213,7 +214,7 @@ class PixelBasedDecoder(object):
                 in the decoded image.
             lowPassSigma: standard deviation for the low pass filter that is
                 applied to the images prior to decoding.
-            overlap: (Optional) Buffer size for tile overlaps. if None,
+            tilingOverlap: (Optional) Buffer size for tile overlaps. if None,
                 defaults to 2x filter size.
             
         Returns:
@@ -247,9 +248,9 @@ class PixelBasedDecoder(object):
             full_height = image_shape[0]
             full_width = image_shape[1]
             
-            if overlap is None:
-                 # Default overlap to cover filter size + safety margin
-                 overlap = int(2 * np.ceil(2 * lowPassSigma) + 1) + 10
+            if tilingOverlap is None:
+                 # Default tilingOverlap to cover filter size + safety margin
+                 tilingOverlap = int(2 * np.ceil(2 * lowPassSigma) + 1) + 10
             
             # check if divisible
             if full_height % tilingFactor != 0 or full_width % tilingFactor != 0:
@@ -258,7 +259,7 @@ class PixelBasedDecoder(object):
             tile_height = int(full_height // tilingFactor)
             tile_width = int(full_width // tilingFactor)
             
-            # Pad size for overlap to handle boundary objects
+            # Pad size for tilingOverlap to handle boundary objects
             # Sufficient to cover filter checks and spot sizes
             
             # Define the tile processing function for parallel execution
@@ -272,8 +273,8 @@ class PixelBasedDecoder(object):
                     h_end = full_height
 
                 # Calculate padded bounds
-                h_start_pad = max(0, h_start - overlap)
-                h_end_pad = min(full_height, h_end + overlap)
+                h_start_pad = max(0, h_start - tilingOverlap)
+                h_end_pad = min(full_height, h_end + tilingOverlap)
                 
                 w_start = index_w * tile_width
                 w_end = (index_w + 1) * tile_width
@@ -281,8 +282,8 @@ class PixelBasedDecoder(object):
                 if index_w == tilingFactor - 1:
                     w_end = full_width
                 
-                w_start_pad = max(0, w_start - overlap)
-                w_end_pad = min(full_width, w_end + overlap)
+                w_start_pad = max(0, w_start - tilingOverlap)
+                w_end_pad = min(full_width, w_end + tilingOverlap)
 
                 # Extract tile with padding
                 # Note: This slice creates a copy/view depending on memory layout
@@ -293,10 +294,11 @@ class PixelBasedDecoder(object):
                 if decodeMask is not None:
                     tile_decode_mask = decodeMask[h_start_pad:h_end_pad, w_start_pad:w_end_pad]
                     
-                # Recurse for the tile
-                # If we are parallelizing tiles, we shouldn't parallelize neighbors too aggressively
-                # to avoid oversubscription. If numThreads > 1 (parallel tiles), inner numThreads should be 1.
-                inner_numThreads = 1 if numThreads > 1 else -1
+                # Recurse for the tile. Tiles are already running
+                # concurrently, so the neighbour search inside one must not
+                # also fan out or the two oversubscribe each other.
+                inner_neighborNumJobs = 1 if tilingNumThreads > 1 \
+                    else neighborNumJobs
                 
                 t_di, t_pm, t_npt, t_dist = self.decode_pixels(
                     tile_image_data,
@@ -312,7 +314,8 @@ class PixelBasedDecoder(object):
                     decodeMask=tile_decode_mask,
                     useGpu=useGpu, 
                     tilingFactor=None,
-                    numThreads=inner_numThreads 
+                    tilingNumThreads=1,
+                    neighborNumJobs=inner_neighborNumJobs
                 )
                 
                 # Offsets relative to the padded tile
@@ -344,8 +347,8 @@ class PixelBasedDecoder(object):
             tile_indices = [(h, w) for h in range(tilingFactor) for w in range(tilingFactor)]
             
             # Execute
-            if numThreads > 1:
-                with ThreadPoolExecutor(max_workers=numThreads) as executor:
+            if tilingNumThreads > 1:
+                with ThreadPoolExecutor(max_workers=tilingNumThreads) as executor:
                     futures = executor.map(process_single_tile, tile_indices)
                     
                     for res in futures:
@@ -446,7 +449,7 @@ class PixelBasedDecoder(object):
             # 3. Nearest Neighbors Path
             else:
                 metric_arg = 'euclidean' if distanceMetric is None else distanceMetric
-                jobs_arg = numThreads if numThreads is not None else -1
+                jobs_arg = neighborNumJobs if neighborNumJobs is not None else -1
                 
                 nbrs = NearestNeighbors(n_neighbors=1, algorithm=nnAlgorithm, 
                                       metric=metric_arg, n_jobs=jobs_arg)
@@ -780,41 +783,34 @@ class PixelBasedDecoder(object):
 
         return refactors, backgroundRefactors, barcodesSeen
 
-    def _calculate_normalized_barcodes(
-            self, ignoreBlanks=False, includeErrors=False):
+    def _calculate_normalized_barcodes(self, ignoreBlanks=False):
         """Normalize the barcodes present in the provided codebook so that
         their L2 norm is 1.
+
+        The dot product of a normalized pixel trace with a row of this matrix
+        is therefore the cosine similarity, which is what makes the distance
+        sqrt(2(1-cos)) meaningful. For a constant-weight codebook -- every
+        MHD4 codeword here has weight 4, so norm exactly 2 -- this is a single
+        global factor and cannot change which codeword wins; it sets the
+        distance SCALE that distanceThreshold is compared against. It is
+        computed once at construction, so it costs nothing at decode time.
+        The structure it hides is exploited instead by the sparse backend,
+        which sums the 4 on-bits directly (see _build_sparse_codebook).
+
+        An includeErrors branch used to live here, adding every single-bit
+        flip of every codeword. It was dead -- the one call site passes no
+        arguments -- and also broken: it returned a 3D array, (barcodes, 1+bits,
+        bits), which no caller could have matmul'd against a pixel trace.
 
         Args:
             ignoreBlanks: Flag to set if the barcodes corresponding to blanks
                 should be ignored. If True, barcodes corresponding to a name
                 that contains 'Blank' are ignored.
-            includeErrors: Flag to set if barcodes corresponding to single bit 
-                errors should be added.
         Returns:
             A 2d numpy array where each row is a normalized barcode and each
                 column is the corresponding normalized bit value.
         """
-        
         barcodeSet = self._codebook.get_barcodes(ignoreBlanks=ignoreBlanks)
-        
-        if not includeErrors:
-            weightedBarcodes = np.array(
-                [normalize(x) for x in barcodeSet])
-                
-            return weightedBarcodes
-
-        else:
-            barcodesWithSingleErrors = []
-            for b in barcodeSet:
-                barcodeSet = np.array([b]
-                                      + [binary.flip_bit(b, i)
-                                         for i in range(len(b))])
-                bcMagnitudes = np.sqrt(np.sum(barcodeSet*barcodeSet, axis=1))
-                weightedBC = np.array(
-                    [x/m for x, m in zip(barcodeSet, bcMagnitudes)])
-                barcodesWithSingleErrors.append(weightedBC)
-                
-            return np.array(barcodesWithSingleErrors)
+        return np.array([normalize(x) for x in barcodeSet])
     
         

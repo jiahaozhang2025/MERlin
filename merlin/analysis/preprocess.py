@@ -55,6 +55,12 @@ class DeconvolutionPreprocess(Preprocess):
         # won the M1 preprocessing comparison. Off by default; 0 disables it.
         if 'fft_highpass_sigma' not in self.parameters:
             self.parameters['fft_highpass_sigma'] = 0
+        if 'fft_highpass_clip' not in self.parameters:
+            # True reproduces the standalone fft_highpass this class was written
+            # to match. False is measurably better for decoding -- see
+            # _fft_highpass_filter -- but changing the default would silently
+            # move every existing analysis, so it stays opt-in.
+            self.parameters['fft_highpass_clip'] = True
         # All image filtering lives here now, so this carries the default that
         # Decode used to hold. 0 disables it.
         if 'lowpass_sigma' not in self.parameters:
@@ -66,6 +72,14 @@ class DeconvolutionPreprocess(Preprocess):
                 int(2 * np.ceil(2 * self.parameters['decon_sigma']) + 1)
         if 'decon_iterations' not in self.parameters:
             self.parameters['decon_iterations'] = 20
+        # 'lucyrichardson' is the Matlab deconvlucy port this task has always
+        # used; 'guo' is the Wiener-Butterworth accelerated variant from Guo et
+        # al 2019, which was already in merlin/util/deconvolve.py but only
+        # reachable from another class. It converges in far fewer iterations,
+        # so a sigma/iteration pair tuned for one is not comparable to the
+        # other.
+        if 'decon_method' not in self.parameters:
+            self.parameters['decon_method'] = 'lucyrichardson'
         if 'codebook_index' not in self.parameters:
             self.parameters['codebook_index'] = 0
         
@@ -78,6 +92,12 @@ class DeconvolutionPreprocess(Preprocess):
             self.parameters['save_pixel_histogram'] = True
         if 'deconvolve_after_highpass' not in self.parameters:
             self.parameters['deconvolve_after_highpass'] = True
+        # Where the lowpass sits relative to the deconvolution. Stock MERlin
+        # applies it in Decode, i.e. AFTER preprocessing has already
+        # deconvolved, so a run that moves lowpass_sigma here has to say so to
+        # reproduce that ordering. Default False keeps the existing behaviour.
+        if 'lowpass_after_deconvolution' not in self.parameters:
+            self.parameters['lowpass_after_deconvolution'] = False
         if 'preprocess_z_index' not in self.parameters:
             self.parameters['preprocess_z_index'] = None
         if 'threshold_subtract_n' not in self.parameters:
@@ -92,6 +112,7 @@ class DeconvolutionPreprocess(Preprocess):
 
         self._highPassSigma = self.parameters['highpass_sigma']
         self._fftHighPassSigma = self.parameters['fft_highpass_sigma']
+        self._fftHighPassClip = self.parameters['fft_highpass_clip']
         self._fftTransfer = None            # cached per image shape
         self._lowPassSigma = self.parameters['lowpass_sigma']
         self._deconSigma = self.parameters['decon_sigma']
@@ -195,11 +216,34 @@ class DeconvolutionPreprocess(Preprocess):
         return self._fftTransfer
 
     def _fft_highpass_filter(self, inputImage: np.ndarray) -> np.ndarray:
-        """Frequency-domain high pass, negatives clipped to 0.
+        """Frequency-domain high pass; negatives clipped only if asked.
 
-        Matches run_low_data_filter_decode_compare.fft_highpass so that a MERlin
-        run with fft_highpass_sigma=3, highpass_sigma=3, lowpass_sigma=0.5
-        reproduces the standalone fft_hp3_hp3_lp05 pipeline.
+        fft_highpass_clip=True matches run_low_data_filter_decode_compare
+        .fft_highpass, so a MERlin run with fft_highpass_sigma=3,
+        highpass_sigma=3, lowpass_sigma=0.5 reproduces the standalone
+        fft_hp3_hp3_lp05 pipeline. It is the default for that reason only.
+
+        CLIPPING HERE COSTS DECODE QUALITY. Measured on 15 tiles (5 fovs x 3
+        planes, pixel-level, pre-filter, matched coding yield, 20 blanks as
+        control): turning the clip off lowers the normalised blank rate by
+        0.084 (medians -0.074 to -0.090 across yields from 20k to 200k coding
+        barcodes), better on 11 of 12 signal-carrying tiles, Wilcoxon
+        p = 0.0015-0.0069. That is over twice the gain from fft_highpass_sigma
+        3 vs 0, and unlike the max-over-z experiment it is not conditional on
+        tile quality (r = -0.45 against baseline blank rate, p = 0.09, and it
+        helps the poor tiles slightly MORE).
+
+        The mechanism is not the obvious one. Clipping here leaves no negatives
+        in the final image either way, because the spatial highpass downstream
+        rectifies anyway -- unclipped output measures 0.0% negative pixels. What
+        the clip destroys is the INPUT to that spatial stage: it forces 9% of
+        pixels to exactly 0, and the Gaussian local-background estimate the
+        spatial highpass then subtracts is computed from those rectified values.
+        Removing this clip drops the exact-zero fraction from 9.0% to 0.1% and
+        lets the second stage see the true local structure. Consistent with
+        that, removing the SPATIAL clip instead is slightly harmful (+0.019) and
+        removing both cancels out -- so the final rectification is fine, and it
+        is specifically rectifying BEFORE the spatial highpass that hurts.
 
         scipy.fft is used rather than numpy.fft because numpy always promotes to
         complex128, which costs 2.7x the time and twice the memory for a
@@ -212,14 +256,29 @@ class DeconvolutionPreprocess(Preprocess):
         spectrum = sp_fft.fftshift(sp_fft.fft2(image))
         spectrum *= self._fft_transfer(image.shape)
         output = np.real(sp_fft.ifft2(sp_fft.ifftshift(spectrum))).astype(np.float32)
-        np.maximum(output, 0.0, out=output)
+        if self._fftHighPassClip:
+            np.maximum(output, 0.0, out=output)
         return output
 
     def _deconvolve(self, inputImage: np.ndarray) -> np.ndarray:
         # deconvolve_lucyrichardson allocates ~10 full-size buffers before its
         # loop, so a 0-iteration call is an expensive no-op on 3200^2 frames.
-        if not self._deconIterations or not self._deconSigma:
+        #
+        # Any non-positive setting means off, not just 0. merlin-MX defaults
+        # decon_sigma to -1 and derives decon_filter_size = 2*ceil(2*s)+1 = -3
+        # from it, and a run that inherits those is asking for no
+        # deconvolution. Passing them through reaches cv2.GaussianBlur with a
+        # negative kernel size, which raises rather than returning anything.
+        if (self._deconIterations <= 0 or self._deconSigma <= 0
+                or self.parameters['decon_filter_size'] <= 0):
             return inputImage.astype(np.float32, copy=False)
+        method = self.parameters['decon_method']
+        if method == 'guo':
+            return deconvolve.deconvolve_lucyrichardson_guo(
+                inputImage, self.parameters['decon_filter_size'],
+                self._deconSigma, self._deconIterations)
+        if method != 'lucyrichardson':
+            raise ValueError('Unknown decon_method: %s' % method)
         return deconvolve.deconvolve_lucyrichardson(
             inputImage, self.parameters['decon_filter_size'],
             self._deconSigma, self._deconIterations)
@@ -282,17 +341,23 @@ class DeconvolutionPreprocess(Preprocess):
         zIndex = self.parameters.get('preprocess_z_index')
         if zIndex is None:
             return list(range(zPositionCount))
-        zIndex = int(zIndex)
-        if zIndex < 0 or zIndex >= zPositionCount:
-            raise ValueError(
-                f'preprocess_z_index {zIndex} out of range for '
-                f'{zPositionCount} z-positions')
-        return [zIndex]
+        if isinstance(zIndex, (list, tuple)):
+            requested = [int(z) for z in zIndex]
+        else:
+            requested = [int(zIndex)]
+        for z in requested:
+            if z < 0 or z >= zPositionCount:
+                raise ValueError(
+                    f'preprocess_z_index {z} out of range for '
+                    f'{zPositionCount} z-positions')
+        return sorted(set(requested))
     
     def _preprocess_image(self, inputImage: np.ndarray) -> np.ndarray:
         filteredImage = self._fft_highpass_filter(inputImage)
         filteredImage = self._highpass_filter(filteredImage)
         filteredImage = self._subtract_global_threshold(filteredImage)
+        if self.parameters['lowpass_after_deconvolution']:
+            return self._lowpass_filter(self._deconvolve(filteredImage))
         filteredImage = self._lowpass_filter(filteredImage)
         return self._deconvolve(filteredImage)
 

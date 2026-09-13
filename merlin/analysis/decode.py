@@ -4,6 +4,8 @@ import os
 import tempfile
 import zarr
 import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from merlin.core import dataset
 from merlin.core import analysistask
@@ -16,12 +18,17 @@ from merlin.util import barcodefilters
 def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
     """(rowStart, rowEnd, colStart, colEnd) of the valid region of one FOV.
 
-    crop_width is applied first, then the adaptive margin on top.
+    Each edge is trimmed by max(crop_width, that edge's invalid margin), NOT by
+    their sum. crop_width exists because the frame edges are unreliable even
+    with zero shift (vignetting, the filter's border, chromatic roll-off); the
+    adaptive margin exists because a warp leaves an actually-invalid strip. A
+    shift smaller than crop_width is already inside the region crop_width
+    discards, so adding them double-counts and throws away good pixels: with
+    crop_width 100 and a 60 px shift the old code cropped 160.
+
     transform.warp maps output->input, so output (r, c) samples input
     (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many on
-    the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM. A fixed crop_width has
-    to be sized for the worst FOV in the dataset and discards that from every
-    other one; this charges each FOV only what it owes.
+    the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM.
     """
     h, w = dataSet.get_image_dimensions()
     top = bottom = left = right = 0
@@ -34,8 +41,9 @@ def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
         right = int(np.ceil(max(0.0, float(tx.max()))))
         top = int(np.ceil(max(0.0, float((-ty).max()))))
         bottom = int(np.ceil(max(0.0, float(ty.max()))))
-    return (top + cropWidth, h - bottom - cropWidth,
-            left + cropWidth, w - right - cropWidth)
+    top, bottom = max(top, cropWidth), max(bottom, cropWidth)
+    left, right = max(left, cropWidth), max(right, cropWidth)
+    return (top, h - bottom, left, w - right)
 
 
 class BarcodeSavingParallelAnalysisTask(analysistask.ParallelAnalysisTask):
@@ -76,6 +84,10 @@ class Decode(BarcodeSavingParallelAnalysisTask):
     def __init__(self, dataSet: dataset.MERFISHDataSet,
                  parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
+        # Which names the caller actually passed, as opposed to the
+        # defaults filled in below. The rename migration needs this so an
+        # explicit new-style setting always beats a stale old-style one.
+        explicitParameters = set(parameters or {})
 
         # Image filtering now lives entirely in the preprocess task, so that
         # Optimize and Decode cannot disagree about how the pixels were
@@ -104,18 +116,22 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             self.parameters['crop_in_image_space'] = True
         if 'write_decoded_images' not in self.parameters:
             self.parameters['write_decoded_images'] = True
+        # Default to one fov and one z plane rather than everything: a decoded
+        # image per fov per plane is enormous, which is why runs used to switch
+        # this off entirely and end up with nothing to look at. One plane of
+        # one fov is cheap and always worth having.
         if 'write_decoded_FOVs' not in self.parameters:
-            self.parameters['write_decoded_FOVs'] = list(range(self.fragment_count()))
+            self.parameters['write_decoded_FOVs'] = [0]
         if 'write_decoded_z' not in self.parameters:
-            # None = save all z; otherwise list of zIndexes to write images for
-            self.parameters['write_decoded_z'] = None
+            # None = save every decoded plane; otherwise a list of zIndexes
+            self.parameters['write_decoded_z'] = [0]
         if 'minimum_area' not in self.parameters:
             self.parameters['minimum_area'] = 0
         if 'distance_threshold' not in self.parameters:
             self.parameters['distance_threshold'] = 0.5167
         # Buffer added around each tile so objects spanning a tile edge survive.
-        if 'tile_overlap' not in self.parameters:
-            self.parameters['tile_overlap'] = 20
+        if 'tiling_overlap' not in self.parameters:
+            self.parameters['tiling_overlap'] = 20
         # Crop each FOV to its own valid region, on top of crop_width.
         # transform.warp maps output->input, so output (r, c) samples input
         # (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many
@@ -168,19 +184,72 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         if 'softmax_temperature' not in self.parameters:
             self.parameters['softmax_temperature'] = 0.15
         if 'decode_chunk_size' not in self.parameters:
-            self.parameters['decode_chunk_size'] = 65536
+            # 8192, not 65536. Measured on a 246x21 codebook, 4M pixels,
+            # Xeon 8480CL: at one intra-op thread 65536 costs 1965 ms and the
+            # 1024-8192 plateau costs 1765-1792; at eight it costs 279 against
+            # 235-243 for 8192-32768. The optimum MOVES with thread count --
+            # small when serial, large when parallel -- and 8192 is the value
+            # inside both plateaus. Results are bit-identical at every chunk
+            # size (verified 100.000000% agreement); this is purely cache
+            # behaviour. It also cuts the per-thread similarity buffer 8x,
+            # which matters when per_z_slice_num_threads planes run at once.
+            self.parameters['decode_chunk_size'] = 8192
              
-        # threads for tile decoding
-        if 'num_threads' not in self.parameters:
-            self.parameters['num_threads'] = 1
-        # optional single z-index decode
+        # Threads for tile decoding, i.e. how many tiles of ONE z plane are
+        # decoded at once. Only meaningful with tiling_factor set.
+        if 'tiling_num_threads' not in self.parameters:
+            self.parameters['tiling_num_threads'] = 1
+        # optional z-index restriction: an int or a list of ints
         if 'decode_z_index' not in self.parameters:
             self.parameters['decode_z_index'] = None
+        # Decode is fragmented by fov, so one fov is one process and its z
+        # planes run in sequence. They are genuinely independent, so they can
+        # be fanned out over a thread pool: the heavy steps (OpenCV filtering,
+        # FFTs, the decode matmul, the neighbour search) all release the GIL.
+        # Only the barcode append and the zarr write are serialised, under
+        # _sliceWriteLock. Memory scales with this: each in-flight plane holds
+        # a bitCount x H x W float32 image set, ~350 MB for 21 bits at 2048^2.
+        if 'per_z_slice_num_threads' not in self.parameters:
+            self.parameters['per_z_slice_num_threads'] = 1
+        # None = arbitrate automatically against per_z_slice_num_threads;
+        # an integer overrides. See _pin_torch_threads.
+        if 'torch_num_threads' not in self.parameters:
+            self.parameters['torch_num_threads'] = None
+
+        # These were renamed. task.json records whatever names were current
+        # when it was written, so refusing outright would make every existing
+        # analysis directory unloadable. Migrate instead, and say so.
+        for oldName, newName in (('tile_overlap', 'tiling_overlap'),
+                 ('num_threads', 'tiling_num_threads'),
+                 ('decode_threads', 'per_z_slice_num_threads')):
+            if oldName in self.parameters:
+                value = self.parameters.pop(oldName)
+                if newName not in explicitParameters:
+                    self.parameters[newName] = value
+                print('%s was renamed to %s; using %s=%s'
+                      % (oldName, newName, newName, self.parameters[newName]))
+        # Declares which fovs this decode covers. Purely a declaration -- it
+        # does not stop any fragment from running -- but downstream tasks need
+        # to know that a partial run is complete on purpose rather than still
+        # in progress. GenerateAdaptiveThreshold reads it.
+        if 'fovs' not in self.parameters:
+            self.parameters['fovs'] = None
         if 'extract_intensity_traces' not in self.parameters:
             self.parameters['extract_intensity_traces'] = False
             
         self.cropWidth = self.parameters['crop_width']
         self.imageSize = dataSet.get_image_dimensions()
+        self._sliceWriteLock = threading.Lock()
+        # When decoding planes concurrently, barcodes are buffered here and
+        # written once at the end instead of per plane. PyTables' flavor.toarray
+        # wraps its work in `warnings.catch_warnings(); simplefilter('error')`,
+        # and catch_warnings mutates PROCESS-GLOBAL filter state -- so an HDF5
+        # write in one thread makes every other thread's DeprecationWarning
+        # fatal (pandas .iloc -> np.find_common_type raises, and the fragment
+        # dies). A lock cannot fix that: the hazard is a write racing with any
+        # other work, not with another write. Keeping PyTables out of the
+        # threaded region closes the window entirely.
+        self._pendingBarcodes = None
 
         # method for resumable decoding
         # load the previous barcodes
@@ -269,26 +338,63 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         self.decoded_z_planes = self._get_decoded_z_planes(fragmentIndex)
         
         decodeZIndexes = self._get_z_indexes_to_decode(zPositionCount)
-        for zIndex in decodeZIndexes:
 
+        # Only planes that are actually decoded can be written. If the
+        # requested ones are not among them -- the default [0] against a run
+        # restricted to deeper planes, say -- fall back to the first decoded
+        # plane so the run still leaves an image behind.
+        requestedZ = self.parameters['write_decoded_z']
+        if requestedZ is None:
+            writeZIndexes = list(decodeZIndexes)
+        else:
+            writeZIndexes = [z for z in requestedZ if z in decodeZIndexes]
+            if not writeZIndexes and decodeZIndexes:
+                writeZIndexes = [decodeZIndexes[0]]
+                print('write_decoded_z %s is not among the decoded planes; '
+                      'writing zIndex %d instead'
+                      % (requestedZ, writeZIndexes[0]), flush=True)
+
+        def decode_one_plane(zIndex):
             if zIndex in self.decoded_z_planes:
                 print(f'barcodes in zIndex {zIndex} detected. Skipping plane!')
-                pass 
-        
-            else:
-                outputImages = self._process_independent_z_slice(
-                    fragmentIndex, zIndex, chromaticCorrector, scaleFactors,
-                    backgrounds, preprocessTask, decoder)
-                    
-                _zsel = self.parameters['write_decoded_z']
-                if self.parameters['write_decoded_images'] \
-                        and (fragmentIndex in self.parameters['write_decoded_FOVs']) \
-                        and (_zsel is None or zIndex in _zsel):
+                return
+
+            outputImages = self._process_independent_z_slice(
+                fragmentIndex, zIndex, chromaticCorrector, scaleFactors,
+                backgrounds, preprocessTask, decoder)
+
+            if self.parameters['write_decoded_images'] \
+                    and (fragmentIndex in self.parameters['write_decoded_FOVs']) \
+                    and zIndex in writeZIndexes:
+                with self._sliceWriteLock:
                     zarr_out[zIndex,0,:,:] = outputImages[0]
                     zarr_out[zIndex,1,:,:] = outputImages[1]
                     zarr_out[zIndex,2,:,:] = outputImages[2]
                     if self.parameters['write_unique_id_images']:
                         zarr_out[zIndex,3,:,:] = outputImages[3]
+
+        perZThreads, tilingThreads, _ = self._thread_allocation()
+        self._pin_torch_threads(perZThreads)
+        if perZThreads > 1 and len(decodeZIndexes) > 1:
+            print('decoding %d z planes over %d threads (%d tile threads each)'
+                  % (len(decodeZIndexes), perZThreads, tilingThreads),
+                  flush=True)
+            self._pendingBarcodes = []
+            try:
+                with ThreadPoolExecutor(
+                        max_workers=min(perZThreads,
+                                        len(decodeZIndexes))) as pool:
+                    list(pool.map(decode_one_plane, decodeZIndexes))
+                pending = [d for d in self._pendingBarcodes if len(d)]
+            finally:
+                self._pendingBarcodes = None
+            if pending:
+                self.get_barcode_database().write_barcodes(
+                    pandas.concat(pending, ignore_index=True),
+                    fov=fragmentIndex)
+        else:
+            for zIndex in decodeZIndexes:
+                decode_one_plane(zIndex)
 
         if self.parameters['remove_z_duplicated_barcodes']:
             bcDB = self.get_barcode_database()
@@ -297,16 +403,88 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             bcDB.empty_database(fragmentIndex)
             bcDB.write_barcodes(bc, fov=fragmentIndex)
 
+    def _emit_barcodes(self, df, fov: int) -> None:
+        """Hand a plane's barcodes on: buffered while a thread pool is live,
+        written straight through otherwise."""
+        if self._pendingBarcodes is not None:
+            with self._sliceWriteLock:
+                self._pendingBarcodes.append(df)
+            return
+        self.get_barcode_database().write_barcodes(df, fov=fov)
+
+    def _thread_allocation(self):
+        """How the two nested pools and the neighbour search share the cores.
+
+        There are three things that can fan out: z planes within a fov, tiles
+        within a z plane, and scikit-learn's neighbour search within a tile.
+        Nesting them multiplies, so they have to be arbitrated rather than each
+        taking what it wants.
+
+        Per-z has first claim, because it is the one that scales -- planes are
+        wholly independent and each is a large unit of work, whereas tiling
+        exists to bound memory and the neighbour search saturates early. So
+        when per_z_slice_num_threads > 1 the inner two are pinned to one
+        thread; only when it is 1 does tiling get to fan out, and only when
+        both are 1 does the neighbour search get every core (n_jobs=-1, which
+        is what it did unconditionally before).
+
+        Returns (perZThreads, tilingThreads, neighborNumJobs).
+        """
+        perZThreads = max(1, int(self.parameters['per_z_slice_num_threads']))
+        tilingThreads = max(1, int(self.parameters['tiling_num_threads']))
+        if perZThreads > 1:
+            tilingThreads = 1
+        neighborNumJobs = 1 if (perZThreads > 1 or tilingThreads > 1) else -1
+        return perZThreads, tilingThreads, neighborNumJobs
+
+    def _pin_torch_threads(self, perZThreads: int) -> None:
+        """Arbitrate torch's intra-op pool against the per-z thread pool.
+
+        The existing arbitration covers tiling and the neighbour search but not
+        torch, which is the one that actually does the decode. Left alone torch
+        sizes its pool to the whole machine, so per_z_slice_num_threads planes
+        each ask for every core and contend.
+
+        Measured, 16 planes of 500k pixels, 16 cores, chunk 4096:
+
+            torch left at default (16 intra-op)   364.2 ms   1.37x scaling
+            torch pinned to 1                     254.6 ms  14.12x scaling
+
+        so pinning is worth 1.43x on the decode core and costs nothing. The
+        single-plane numbers show why it is conditional rather than always:
+        one plane alone takes 31.1 ms on 16 intra-op threads and 224.7 ms on
+        one, so when there is no per-z pool torch should keep the machine.
+
+        (numpy is not an alternative here -- under the same pattern it does not
+        scale at all, 1.05x over 16 planes, because a multi-threaded OpenBLAS
+        gemm called from many python threads serialises. 1738 ms against 255.)
+        """
+        requested = self.parameters.get('torch_num_threads')
+        if not decoding.TORCH_AVAILABLE:
+            return
+        if requested is None:
+            requested = 1 if perZThreads > 1 else None
+        if requested is None:
+            return
+        try:
+            decoding.torch.set_num_threads(max(1, int(requested)))
+        except Exception as e:
+            print('could not set torch threads: %s' % e, flush=True)
+
     def _get_z_indexes_to_decode(self, zPositionCount: int) -> list[int]:
         decodeZIndex = self.parameters.get('decode_z_index')
         if decodeZIndex is None:
             return list(range(zPositionCount))
-        decodeZIndex = int(decodeZIndex)
-        if decodeZIndex < 0 or decodeZIndex >= zPositionCount:
-            raise ValueError(
-                f'decode_z_index {decodeZIndex} out of range for '
-                f'{zPositionCount} z-positions')
-        return [decodeZIndex]
+        if isinstance(decodeZIndex, (list, tuple)):
+            requested = [int(z) for z in decodeZIndex]
+        else:
+            requested = [int(decodeZIndex)]
+        for z in requested:
+            if z < 0 or z >= zPositionCount:
+                raise ValueError(
+                    f'decode_z_index {z} out of range for '
+                    f'{zPositionCount} z-positions')
+        return sorted(set(requested))
 
     # finding what z planes are already in the barcode file
     def _get_decoded_z_planes(self, fragmentIndex):
@@ -381,7 +559,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         di, pm, npt, d = decoder.decode_pixels(
             imageSet, scaleFactors, backgrounds,
             lowPassSigma=0,
-            overlap=self.parameters['tile_overlap'],
+            tilingOverlap=self.parameters['tiling_overlap'],
             magnitudeThreshold=self.parameters['magnitude_threshold'],
             distanceThreshold=self.parameters['distance_threshold'],
             distanceMetric=self.parameters['distance_metric'],
@@ -389,7 +567,8 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             decodeChunkSize=self.parameters['decode_chunk_size'],
             nnAlgorithm=self.parameters.get('nn_algorithm', 'brute'),
             decodeMask = decodeMask,
-            numThreads = self.parameters['num_threads'],
+            tilingNumThreads = self._thread_allocation()[1],
+            neighborNumJobs = self._thread_allocation()[2],
             useGpu = self.parameters['use_gpu'],
             tilingFactor = self.parameters['tiling_factor'],
             accumulatePixelTraces = accumulatePixelTraces,
@@ -487,8 +666,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             else:
                 df = pandas.DataFrame()
 
-            # Save barcodes
-            self.get_barcode_database().write_barcodes(df, fov=fov)
+            self._emit_barcodes(df, fov)
             
             barcodeOutputs = df
 
@@ -578,7 +756,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         else:
             df = barcodeOutput
             
-        self.get_barcode_database().write_barcodes(df, fov = fov)
+        self._emit_barcodes(df, fov)
         
         return barcodeOutput
         
