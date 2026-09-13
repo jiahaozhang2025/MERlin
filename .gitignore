@@ -7,3 +7,6 @@ htmlcov/
 build/
 dist/
 *.log
+
+# local pre-edit backups (warp.py.bak_before_*, etc.)
+*.bak_*

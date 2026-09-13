@@ -29,6 +29,10 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
+        # Which names the caller actually passed, as opposed to the
+        # defaults filled in below. The rename migration needs this so an
+        # explicit new-style setting always beats a stale old-style one.
+        explicitParameters = set(parameters or {})
 
         if 'distance_metric' not in self.parameters:
             self.parameters['distance_metric'] = 'dot_product'
@@ -51,12 +55,23 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             raise ValueError(
                 'lowpass_sigma is no longer an OptimizeIteration parameter -- '
                 'set it on the preprocess task instead.')
-        if 'tile_overlap' not in self.parameters:
-            self.parameters['tile_overlap'] = 20
+        if 'tiling_overlap' not in self.parameters:
+            self.parameters['tiling_overlap'] = 20
         # threads for the nearest-neighbour decode (sklearn n_jobs); must be
         # matched by the cpus requested for this task
-        if 'num_threads' not in self.parameters:
-            self.parameters['num_threads'] = 1
+        if 'tiling_num_threads' not in self.parameters:
+            self.parameters['tiling_num_threads'] = 1
+        # These were renamed. task.json records whatever names were current
+        # when it was written, so refusing outright would make every existing
+        # analysis directory unloadable. Migrate instead, and say so.
+        for oldName, newName in (('tile_overlap', 'tiling_overlap'),
+                 ('num_threads', 'tiling_num_threads')):
+            if oldName in self.parameters:
+                value = self.parameters.pop(oldName)
+                if newName not in explicitParameters:
+                    self.parameters[newName] = value
+                print('%s was renamed to %s; using %s=%s'
+                      % (oldName, newName, newName, self.parameters[newName]))
         # threads for estimating this iteration's chromatic corrections, which
         # fan out over independent (fov, z) groups. Set the cpus on the
         # ChromaticCorrection task that drives it, not on this one.
@@ -359,8 +374,9 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                                             backgrounds,
                                             decodeMask = decodeMask,
                                             lowPassSigma = 0,
-                                            overlap = self.parameters['tile_overlap'],
-                                            numThreads = self.parameters['num_threads'],
+                                            tilingOverlap = self.parameters['tiling_overlap'],
+                                            tilingNumThreads = self.parameters['tiling_num_threads'],
+                                            neighborNumJobs = 1 if self.parameters['tiling_num_threads'] > 1 else -1,
                                             distanceThreshold = distance_threshold,
                                             distanceMetric = self.parameters['distance_metric'],
                                             useGpu = self.parameters['use_gpu'],
@@ -932,7 +948,7 @@ class OptimizeIterationFOV(OptimizeIteration):
             scaleFactors,
             backgrounds,
             lowPassSigma=0,
-            overlap=self.parameters['tile_overlap'],
+            tilingOverlap=self.parameters['tiling_overlap'],
             distanceThreshold=self.parameters['distance_threshold'],
             distanceMetric=self.parameters['distance_metric'])
 

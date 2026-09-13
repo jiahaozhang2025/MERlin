@@ -48,8 +48,17 @@ def build_parser():
         help='the name of the analysis task to execute. If no '
              + 'analysis task is provided, all tasks are executed.')
     parser.add_argument(
-        '-i', '--fragment-index', type=int,
-        help='the index of the fragment of the analysis task to execute')
+        '-i', '--fragment-index', type=str,
+        help='fragment(s) of the analysis task to execute. A bare integer '
+             'runs one fragment, exactly as before, and is the default '
+             'behaviour. A range "A-B" (inclusive) or a list "A,B,C" runs '
+             'several fragments in THIS process, which matters because '
+             '`import merlin.analysis.optimize` alone costs ~30 s -- a task '
+             'fragmented 30 ways over 10 iterations pays that 300 times. '
+             'Each fragment still goes through the normal '
+             'already-complete / already-running checks, so batching changes '
+             'only how many interpreter startups are paid, never what is '
+             'computed.')
     parser.add_argument('-e', '--data-home',
                         help='the data home directory')
     parser.add_argument('-s', '--analysis-home',
@@ -63,6 +72,29 @@ def build_parser():
                         'should not be shared to improve MERlin')
 
     return parser
+
+
+def _parse_fragment_index(value):
+    """-i argument -> list of fragment indices to run in this process.
+
+    None -> [None], which means "all fragments" to AnalysisTask.run and is the
+    pre-existing behaviour for an omitted -i. A bare integer -> a single
+    fragment, also unchanged: batching is opt-in and off by default.
+    """
+    if value is None:
+        return [None]
+    text = str(value).strip()
+    if text == '':
+        return [None]
+    if ',' in text:
+        return [int(part) for part in text.split(',') if part.strip() != '']
+    for separator in ('-', ':'):
+        # a leading '-' would be a negative number, not a range
+        if separator in text[1:]:
+            start, _, stop = text[1:].partition(separator)
+            start = text[0] + start
+            return list(range(int(start), int(stop) + 1))
+    return [int(text)]
 
 
 def _clean_string_arg(stringIn):
@@ -159,7 +191,9 @@ def merlin():
 
             else:
                 print('Running %s' % args.analysis_task)
-                e.run(task, index=args.fragment_index)
+                for fragmentIndex in _parse_fragment_index(
+                        args.fragment_index):
+                    e.run(task, index=fragmentIndex)
         elif snakefilePath:
             snakemakeParameters = {}
             if args.snakemake_parameters:
