@@ -450,7 +450,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             with self.dataSet.writer_for_analysis_images(
                     self, 'decoded', fragmentIndex) as outputTif:
                 for im in [di, pm, d]:
-                    outputTif.save(im.astype(np.float32),
+                    outputTif.write(im.astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True,
                                    metadata=imageDescription)
