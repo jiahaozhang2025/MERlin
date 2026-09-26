@@ -1,0 +1,46 @@
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>0718 Â· 3D tissue cells</title>
+<style>body{margin:0;background:#f6f8fc;color:#17263c;font-family:Arial,sans-serif}header{padding:18px 24px 10px}h1{font-size:23px;margin:0 0 7px}p{font-size:13px;color:#536274;margin:5px 0}.controls{display:flex;gap:18px;align-items:center;flex-wrap:wrap;padding:12px 24px;background:white;border-block:1px solid #dce3ed}label{font-size:13px}button,select,input[type=number]{padding:6px;border:1px solid #b9c7d6;border-radius:5px;background:white}input[type=number]{width:66px}input[type=range]{width:95px;vertical-align:middle}#plot{height:calc(100vh - 232px);min-height:500px}#status{font-size:13px;color:#17477a;font-weight:bold}footer{font-size:12px;line-height:1.5;color:#536274;padding:8px 24px}</style>
+<script>__PLOTLY__</script></head><body>
+<header><h1>0718 Â· Cells in the 3D tissue</h1><p>78,159 cells Â· one dot per cell center Â· 18 Leiden clusters with the same colors as the UMAP</p><p>Corrected stitched X/Y/Z positions in Âµm. Cluster numbers are exploratory groups, not assigned biological cell types.</p></header>
+<div class="controls"><label>Z range (Âµm) <input id="zmin" type="number" step="1"> to <input id="zmax" type="number" step="1"></label>
+<label>Z display scale <select id="zscale"><option value="1">1Ã— Â· physical proportions</option><option value="3">3Ã—</option><option value="10">10Ã—</option></select></label>
+<label>Dot size <input id="size" type="range" min="1" max="5" value="2" step=".5"></label><label>Opacity <input id="opacity" type="range" min=".1" max="1" value=".75" step=".05"></label>
+<label><input type="checkbox" id="hideflags"> Hide cells flagged for coordinate review</label><button id="reset">Reset all</button><span id="status">Loadingâ€¦</span></div>
+<div id="plot"></div><footer>Drag to rotate Â· scroll to zoom Â· hover for cell ID, cluster, counts and tissue coordinates Â· click a legend entry to hide a cluster, double-click to isolate it.<br>
+Z display scaling changes only the view; coordinates and depth filtering remain in physical Âµm. Of these cells, 4,382 have inherited coordinate ambiguity &gt;5 Âµm and are flagged for review. All are shown by default. Points represent cell centers, not cell boundaries. Offline HTML.</footer>
+<script>
+const payload=__PAYLOAD__;
+const el=id=>document.getElementById(id);const plot=el('plot');
+el('zmin').value=payload.zmin;el('zmax').value=payload.zmax;
+for(const id of ['zmin','zmax']){el(id).min=payload.zmin;el(id).max=payload.zmax;}
+const camera={eye:{x:1.4,y:1.4,z:1.1}};
+function render(reset=false){
+ const low=Number(el('zmin').value),high=Number(el('zmax').value);
+ if(!Number.isFinite(low)||!Number.isFinite(high)||low>high){el('status').textContent='Enter a valid Z range (minimum â‰¤ maximum).';return;}
+ const hide=el('hideflags').checked,size=Number(el('size').value),opacity=Number(el('opacity').value),factor=Number(el('zscale').value);
+ let total=0,flags=0;
+ const data=payload.traces.map(t=>{
+  const ix=[];for(let i=0;i<t.z.length;i++)if(t.z[i]>=low&&t.z[i]<=high&&(!hide||!t.review[i]))ix.push(i);
+  total+=ix.length;flags+=ix.reduce((n,i)=>n+t.review[i],0);
+  return {type:'scatter3d',mode:'markers',uid:'cluster-'+t.label,name:'Cluster '+t.label+' ('+ix.length.toLocaleString()+')',
+   x:ix.map(i=>t.x[i]),y:ix.map(i=>t.y[i]),z:ix.map(i=>t.z[i]),
+   customdata:ix.map(i=>[t.cell_ids[i],t.label,t.counts[i],t.review[i]?'Yes':'No']),
+   marker:{size,opacity,color:t.color},hovertemplate:'Cell %{customdata[0]}<br>Cluster %{customdata[1]}<br>X %{x:.2f} Âµm Â· Y %{y:.2f} Âµm Â· Z %{z:.2f} Âµm<br>Coding counts %{customdata[2]}<br>Coordinate review: %{customdata[3]}<extra></extra>'};
+ });
+ const longest=Math.max(...payload.spans);
+ const layout={paper_bgcolor:'#f6f8fc',margin:{l:0,r:8,t:10,b:0},uirevision:'tissue-0718',
+  legend:{itemsizing:'constant',font:{size:11},uirevision:'clusters-0718'},
+  scene:{xaxis:{title:{text:'Stitched X (Âµm)'}},yaxis:{title:{text:'Stitched Y (Âµm)'},autorange:'reversed'},zaxis:{title:{text:'Stitched Z (Âµm)'}},
+   aspectmode:'manual',aspectratio:{x:payload.spans[0]/longest,y:payload.spans[1]/longest,z:payload.spans[2]/longest*factor},camera}};
+ // With stable uirevision, Plotly preserves the user's camera on filter changes.
+ if(reset)layout.uirevision='reset-'+Date.now();
+ Plotly.react(plot,data,layout,{responsive:true,displaylogo:false,toImageButtonOptions:{format:'png',filename:'0718_tissue3d',scale:2}}).then(()=>{
+  el('status').textContent=total.toLocaleString()+' cells Â· '+flags.toLocaleString()+' flagged'+(factor===1?'':' Â· Z shown '+factor+'Ã—');
+  window.tissueReady=true;window.tissueAudit={total,flags,clusters:data.length,zscale:factor,zrange:[low,high]};
+ });
+}
+for(const id of ['zmin','zmax','zscale','hideflags'])el(id).addEventListener('change',()=>render());
+for(const id of ['size','opacity'])el(id).addEventListener('input',()=>render());
+el('reset').addEventListener('click',()=>{el('zmin').value=payload.zmin;el('zmax').value=payload.zmax;el('zscale').value='1';el('hideflags').checked=false;el('size').value='2';el('opacity').value='.75';render(true);});
+render();
+</script></body></html>

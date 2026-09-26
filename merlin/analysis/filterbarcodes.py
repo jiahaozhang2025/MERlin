@@ -822,7 +822,7 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
                 keep = barcodes.loc[barcodes['z'] == z,
                                     'unique_id'].to_numpy(np.int64)
                 out = np.where(np.isin(labels, keep), decoded, -1)
-                outputTif.save(out.astype(np.float32),
+                outputTif.write(out.astype(np.float32),
                                photometric='MINISBLACK', contiguous=True)
 
     def get_estimated_memory(self):

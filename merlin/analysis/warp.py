@@ -150,7 +150,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         inputImage = self.dataSet.get_raw_image(x, fov, z)
                         transformedImage = transform.warp(
                             inputImage, t, preserve_range=True).astype(inputImage.dtype)
-                        outputTif.save(
+                        outputTif.write(
                             transformedImage,
                             photometric='MINISBLACK',
                             contiguous=True,
@@ -193,7 +193,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         filterSize = int(2 * np.ceil(2 * lowPassSigma) + 1)
                         avgImage = cv2.GaussianBlur(avgImage, (filterSize, filterSize), lowPassSigma, borderType=cv2.BORDER_REPLICATE)
                             
-                    outputTif.save(
+                    outputTif.write(
                         avgImage.astype(inputImage.dtype),
                         photometric='MINISBLACK',
                         contiguous=True,
@@ -216,7 +216,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         inputImage = self.dataSet.get_fiducial_image(x, fov)
                         transformedImage = transform.warp(
                             inputImage, t, preserve_range=True).astype(inputImage.dtype)
-                        outputTif.save(
+                        outputTif.write(
                             transformedImage, 
                             photometric='MINISBLACK',
                             contiguous=True,
@@ -1400,7 +1400,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     for zIndex in range(len(zPositions)):
                         if alignedZ is not None and zIndex not in alignedZ:
                             continue
-                        outputTif.save(
+                        outputTif.write(
                             self.get_aligned_image(fov, dataChannel, zIndex),
                             photometric='MINISBLACK', contiguous=True,
                             metadata=imageDescription)
@@ -1419,7 +1419,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                               dataChannels):
                         inputImage = self.dataSet.get_fiducial_image(
                             dataChannel, fov)
-                        outputTif.save(
+                        outputTif.write(
                             transform.warp(inputImage, t, preserve_range=True)
                             .astype(inputImage.dtype),
                             photometric='MINISBLACK', contiguous=True,

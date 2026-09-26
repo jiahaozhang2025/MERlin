@@ -329,7 +329,7 @@ class DeconvolutionPreprocess(Preprocess):
                         if outputTif is None:
                             outputTif = self.dataSet.writer_for_analysis_images(
                                 self.analysisName, 'preprocessed_images', fragmentIndex).__enter__() 
-                        outputTif.save(deconvolvedImage, photometric='MINISBLACK')
+                        outputTif.write(deconvolvedImage, photometric='MINISBLACK')
                             
             if outputTif is not None:
                 outputTif.__exit__(None, None, None)
@@ -647,7 +647,7 @@ class DeconvolutionPreprocessDW(Preprocess):
                 
                 for zPosition in self.dataSet.get_z_positions():
                         frame = self.dataSet.get_raw_image(dataChannel, fragmentIndex, zPosition)
-                        outputTif.save(frame, photometric='MINISBLACK')
+                        outputTif.write(frame, photometric='MINISBLACK')
 
             # this is the path of the image that was just saved
             inputImagePath = self.get_raw_image_path(dataChannel, fragmentIndex)
