@@ -14,6 +14,9 @@ class GlobalAlignment(analysistask.AnalysisTask):
     different field of views relative to each other in order to construct
     a global alignment.
     """
+
+    outputGroup = 'Prepare'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 

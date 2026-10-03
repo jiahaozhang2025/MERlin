@@ -26,6 +26,12 @@ class AnalysisTask(ABC):
     should implement the analysis to perform in the run_analysis() function.
     """
 
+    # Folder that groups this task's output with the rest of its pipeline
+    # stage in the dataset's analysis directory: Prepare, Optimize, Decode,
+    # Segment or Export. Subclasses inherit it; tasks that set none go to
+    # Other. Only datasets created with the grouped layout use it.
+    outputGroup = 'Other'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         """Creates an AnalysisTask object that performs analysis on the
         specified DataSet.

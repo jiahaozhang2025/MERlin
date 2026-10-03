@@ -11,6 +11,8 @@ class PartitionBarcodes(analysistask.ParallelAnalysisTask):
     based on the boundaries determined during the segment task.
     """
 
+    outputGroup = 'Export'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
         if 'boundary_correction_buffer_size' not in self.parameters:
@@ -47,8 +49,11 @@ class PartitionBarcodes(analysistask.ParallelAnalysisTask):
                  for fov in self.dataSet.get_fovs()]
             )
 
-        return self.dataSet.load_dataframe_from_csv(
+        counts = self.dataSet.load_dataframe_from_csv(
             'counts_per_cell', self.get_analysis_name(), fov, index_col=0)
+        # cell ids (128-bit integers) as str under every pandas version
+        counts.index = counts.index.astype(str)
+        return counts
 
     def _run_analysis(self, fragmentIndex):
         if self.parameters['boundary_correction_buffer_size'] == 0:
@@ -254,6 +259,8 @@ class ExportPartitionedBarcodes(analysistask.AnalysisTask):
     An analysis task that combines counts per cells data from each
     field of view into a single output file.
     """
+
+    outputGroup = 'Export'
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)

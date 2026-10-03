@@ -8,6 +8,8 @@ class ExportBarcodes(analysistask.AnalysisTask):
     intensity.
     """
 
+    outputGroup = 'Export'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 

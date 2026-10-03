@@ -315,7 +315,9 @@ class SpatialFeature(object):
         bounding_box = self.get_bounding_box()
         
         boundaries = self.get_boundaries()
-        positionList[:, 2] = np.round(positionList[:, 2])
+        # rounded z without writing into the caller's array (with pandas >= 3,
+        # DataFrame.values is a read-only view)
+        zRounded = np.round(positionList[:, 2])
 
         containmentList = np.zeros(positionList.shape[0], dtype='bool')
         
@@ -323,7 +325,7 @@ class SpatialFeature(object):
             return containmentList
 
         for zIndex in range(len(boundaries)):
-            currentIndexes = np.where(np.all([positionList[:, 2] == zIndex,
+            currentIndexes = np.where(np.all([zRounded == zIndex,
                                               bounding_box[0] <= positionList[:, 0],
                                               bounding_box[1] <= positionList[:, 1],
                                               bounding_box[2] >= positionList[:, 0],
@@ -444,7 +446,7 @@ class HDF5SpatialFeatureDB(SpatialFeatureDB):
     def _save_geometry_to_hdf5_group(h5Group: h5py.Group,
                                      polygon: geometry.Polygon) -> None:
         geometryDict = geometry.mapping(polygon)
-        h5Group.attrs['type'] = np.string_(geometryDict['type'])
+        h5Group.attrs['type'] = np.bytes_(geometryDict['type'])
         h5Group['coordinates'] = np.array(geometryDict['coordinates'])
 
     @staticmethod
@@ -453,7 +455,7 @@ class HDF5SpatialFeatureDB(SpatialFeatureDB):
                                     fov: int) -> None:
         featureKey = str(feature.get_feature_id())
         featureGroup = h5Group.create_group(featureKey)
-        featureGroup.attrs['id'] = np.string_(feature.get_feature_id())
+        featureGroup.attrs['id'] = np.bytes_(feature.get_feature_id())
         featureGroup.attrs['fov'] = fov
         featureGroup.attrs['bounding_box'] = \
             np.array(feature.get_bounding_box())
@@ -571,6 +573,8 @@ class HDF5SpatialFeatureDB(SpatialFeatureDB):
                         attrValues = list(f['featuredata'][key].attrs.values())
                         allAttrKeys.append(attrNames)
                         allAttrValues.append(attrValues)
+                    if not allAttrValues:  # a fov with no features
+                        return pandas.DataFrame()
 
                     columns = list(np.unique(allAttrKeys))
                     df = pandas.DataFrame(data=allAttrValues, columns=columns)

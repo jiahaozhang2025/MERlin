@@ -87,6 +87,9 @@ def get_analysis_datasets(maxDepth=2) -> List[dataset.DataSet]:
     for d in range(1, maxDepth+1):
         metadataFiles += glob.glob(os.path.join(
             ANALYSIS_HOME, *['*']*d, 'dataset.json'))
+        # datasets in the grouped layout keep dataset.json under Files
+        metadataFiles += glob.glob(os.path.join(
+            ANALYSIS_HOME, *['*']*d, 'Files', 'dataset.json'))
 
     def load_dataset(jsonPath) -> dataset.DataSet:
         with open(jsonPath, 'r') as f:
@@ -95,4 +98,4 @@ def get_analysis_datasets(maxDepth=2) -> List[dataset.DataSet]:
             analysisTask = getattr(analysisModule, metadata['class'])
             return analysisTask(metadata['dataset_name'])
 
-    return [load_dataset(m) for m in metadataFiles]
+    return [load_dataset(m) for m in sorted(set(metadataFiles))]

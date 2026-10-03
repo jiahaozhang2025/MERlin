@@ -72,6 +72,20 @@ class DataSet(object):
         self.analysisPath = os.sep.join([analysisHome, dataDirectoryName])
         os.makedirs(self.analysisPath, exist_ok=True)
 
+        # Grouped layout: each task's folder sits under the folder of its
+        # outputGroup (analysisPath/Decode/Filter05) and the dataset files
+        # (codebooks, data organization, positions ...) under Files. A dataset
+        # whose dataset.json is at the top level was created before this and
+        # keeps the flat layout, with everything directly in analysisPath.
+        self.groupedOutput = not os.path.exists(
+            os.sep.join([self.analysisPath, 'dataset.json']))
+        if self.groupedOutput:
+            self.filesPath = os.sep.join([self.analysisPath, 'Files'])
+        else:
+            self.filesPath = self.analysisPath
+        os.makedirs(self.filesPath, exist_ok=True)
+        self._taskGroups = {}
+
         self.logPath = os.sep.join([self.analysisPath, 'logs'])
         os.makedirs(self.logPath, exist_ok=True)
 
@@ -262,7 +276,7 @@ class DataSet(object):
             saveName += fileExtension
 
         if analysisTask is None:
-            return os.sep.join([self.analysisPath, saveName])
+            return os.sep.join([self.filesPath, saveName])
         else:
             return os.sep.join([self.get_analysis_subdirectory(
                 analysisTask, subdirectory), saveName])
@@ -391,9 +405,21 @@ class DataSet(object):
 
     def open_pandas_hdfstore(self, mode: str, resultName: str,
                              analysisName: str, resultIndex: int = None,
-                             subdirectory: str = None) -> pandas.HDFStore:
+                             subdirectory: str = None,
+                             complib: str = None,
+                             complevel: int = 0) -> pandas.HDFStore:
+        """Open a pandas HDFStore, optionally compressed.
+
+        Barcode tables are written uncompressed by default, which is what every
+        existing table in every analysis tree already is. complib/complevel are
+        forwarded to PyTables and apply only to newly created tables, so a task
+        directory may legitimately hold a mix -- reads do not care.
+        """
         savePath = self._analysis_result_save_path(
             resultName, analysisName, resultIndex, subdirectory, '.h5')
+        if complib and complevel:
+            return pandas.HDFStore(savePath, mode=mode,
+                                   complib=complib, complevel=complevel)
         return pandas.HDFStore(savePath, mode=mode)
 
     def delete_pandas_hdfstore(
@@ -585,22 +611,59 @@ class DataSet(object):
         create - Flag indicating if the analysis subdirectory should be
             created if it does not already exist.
         """
-        if isinstance(analysisTask, analysistask.AnalysisTask):
-            analysisName = analysisTask.get_analysis_name()
-        else:
-            analysisName = analysisTask
-
         if subdirectory is None:
-            subdirectoryPath = os.sep.join(
-                    [self.analysisPath, analysisName])
+            subdirectoryPath = self._task_path(analysisTask)
         else:
             subdirectoryPath = os.sep.join(
-                    [self.analysisPath, analysisName, subdirectory])
+                    [self._task_path(analysisTask), subdirectory])
 
         if create:
             os.makedirs(subdirectoryPath, exist_ok=True)
 
         return subdirectoryPath
+
+    def _task_path(self, analysisTask: TaskOrName) -> str:
+        """Get the folder holding the output of an analysis task.
+
+        In the grouped layout a task that already has a folder is used
+        wherever it is, so changing a class's outputGroup never orphans
+        finished output. A new task goes under the outputGroup of its class.
+        A name that matches no task on disk falls under the default group.
+        """
+        if isinstance(analysisTask, analysistask.AnalysisTask):
+            analysisName = analysisTask.get_analysis_name()
+        else:
+            analysisName = analysisTask
+
+        if not self.groupedOutput:
+            return os.sep.join([self.analysisPath, analysisName])
+
+        group = self._taskGroups.get(analysisName)
+        if group is None:
+            for name, g in self._find_grouped_tasks().items():
+                self._taskGroups.setdefault(name, g)
+            group = self._taskGroups.get(analysisName)
+        if group is None:
+            if isinstance(analysisTask, analysistask.AnalysisTask):
+                group = analysisTask.outputGroup
+                self._taskGroups[analysisName] = group
+            else:
+                group = analysistask.AnalysisTask.outputGroup
+
+        return os.sep.join([self.analysisPath, group, analysisName])
+
+    def _find_grouped_tasks(self) -> Dict[str, str]:
+        """Map the name of each task saved in the grouped layout to its
+        group folder."""
+        found = {}
+        for group in sorted(os.listdir(self.analysisPath)):
+            groupPath = os.sep.join([self.analysisPath, group])
+            if group == 'Files' or not os.path.isdir(groupPath):
+                continue
+            for name in os.listdir(groupPath):
+                if os.path.isdir(os.sep.join([groupPath, name, 'tasks'])):
+                    found.setdefault(name, group)
+        return found
 
     def get_task_subdirectory(self, analysisTask: TaskOrName):
         return self.get_analysis_subdirectory(
@@ -649,8 +712,8 @@ class DataSet(object):
 
     def load_analysis_task(self, analysisTaskName: str) \
             -> analysistask.AnalysisTask:
-        loadName = os.sep.join([self.get_task_subdirectory(
-            analysisTaskName), 'task.json'])
+        loadName = os.sep.join([self.get_analysis_subdirectory(
+            analysisTaskName, 'tasks', create=False), 'task.json'])
 
         with open(loadName, 'r') as inFile:
             parameters = json.load(inFile)
@@ -668,6 +731,7 @@ class DataSet(object):
         """
         analysisDirectory = self.get_analysis_subdirectory(analysisTask)
         shutil.rmtree(analysisDirectory)
+        self._taskGroups.pop(os.path.basename(analysisDirectory), None)
 
     def get_analysis_tasks(self) -> List[str]:
         """
@@ -675,6 +739,9 @@ class DataSet(object):
 
         Returns: A list of the analysis task names.
         """
+        if self.groupedOutput:
+            return sorted(self._find_grouped_tasks())
+
         analysisList = []
         for a in os.listdir(self.analysisPath):
             if os.path.isdir(os.path.join(self.analysisPath, a)):
@@ -959,13 +1026,13 @@ class ImageDataSet(DataSet):
         sourcePath = os.sep.join([merlin.MICROSCOPE_PARAMETERS_HOME,
                 microscopeParametersName])
         destPath = os.sep.join(
-                [self.analysisPath, 'microscope_parameters.json'])
+                [self.filesPath, 'microscope_parameters.json'])
 
         shutil.copyfile(sourcePath, destPath) 
 
     def _load_microscope_parameters(self): 
         path = os.sep.join(
-                [self.analysisPath, 'microscope_parameters.json'])
+                [self.filesPath, 'microscope_parameters.json'])
         
         if os.path.exists(path):
             with open(path) as inputFile:
@@ -1269,11 +1336,11 @@ class MERFISHDataSet(ImageDataSet):
                 metadata['settings']['acquisition']['stage_position']['#text'] \
                 .split(',')
             positionData.append([float(x) for x in currentPositions])
-        positionPath = os.sep.join([self.analysisPath, 'positions.csv'])
+        positionPath = os.sep.join([self.filesPath, 'positions.csv'])
         np.savetxt(positionPath, np.array(positionData), delimiter=',')
 
     def _load_positions(self):
-        positionPath = os.sep.join([self.analysisPath, 'positions.csv'])
+        positionPath = os.sep.join([self.filesPath, 'positions.csv'])
         if not os.path.exists(positionPath):
             self._import_positions_from_metadata()
         self.positions = pandas.read_csv(
@@ -1281,7 +1348,7 @@ class MERFISHDataSet(ImageDataSet):
 
     def _import_positions(self, positionFileName):
         sourcePath = os.sep.join([merlin.POSITION_HOME, positionFileName])
-        destPath = os.sep.join([self.analysisPath, 'positions.csv'])
+        destPath = os.sep.join([self.filesPath, 'positions.csv'])
             
         shutil.copyfile(sourcePath, destPath)    
 
