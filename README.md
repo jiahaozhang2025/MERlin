@@ -25,8 +25,10 @@ Snakemake and a cluster scheduler. The pipeline covers image registration,
 preprocessing, barcode decoding and filtering, cell segmentation, and export
 of spatial features and barcode data.
 
-See [DETAILED_CHANGES.md](DETAILED_CHANGES.md) for a concise list of major and
-minor changes from the `gpu_decoding` baseline.
+See [CHANGES.md](CHANGES.md) for a concise list of major and minor changes from
+the `gpu_decoding` baseline, and [DETAILED_WALKTHROUGH.md](DETAILED_WALKTHROUGH.md)
+for why each major change was made. Example analysis files are in
+[docs/analysis](docs/analysis).
 
 ## Installation
 
@@ -50,6 +52,8 @@ python -m pip install -e ".[gui]"           # MERlin viewer
 ```
 
 `python -m pip install -r requirements.txt` installs all optional components.
+On the Harvard cluster, `bash setup_merlin_env.sh` builds the `merlin` conda env
+(Python 3.12, cellpose 4) with the package versions MERlin was checked against.
 
 ## Configuration and use
 

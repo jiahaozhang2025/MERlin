@@ -3,7 +3,7 @@
     {
       "task": "StitchedInitialize",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Initialize",
+      "analysis_name": "StitchedInitialize",
       "parameters": {
         "configuration": {
           "profile": "0718_40x_150z",
@@ -11,7 +11,7 @@
           "metadata_dir": "/absolute/path/frozen_metadata",
           "raw_root": "/absolute/path/raw_sample",
           "review_decision": "/absolute/path/alignment_decision.json",
-          "mask_archive": "/absolute/path/ulip3D"
+          "mask_archive": "/absolute/path/mask_archive"
         },
         "memory_mb": 8192,
         "minutes": 30
@@ -20,12 +20,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Extract",
+      "analysis_name": "StitchedExtract",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "extract",
         "dependencies": [
-          "StitchedU1Initialize"
+          "StitchedInitialize"
         ],
         "memory_mb": 16384,
         "minutes": 60
@@ -34,12 +34,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Within",
+      "analysis_name": "StitchedWithin",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "within",
         "dependencies": [
-          "StitchedU1Extract"
+          "StitchedExtract"
         ],
         "memory_mb": 32768,
         "minutes": 480
@@ -48,12 +48,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Pool",
+      "analysis_name": "StitchedPool",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "pool",
         "dependencies": [
-          "StitchedU1Within"
+          "StitchedWithin"
         ],
         "memory_mb": 16384,
         "minutes": 240
@@ -62,12 +62,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Cross",
+      "analysis_name": "StitchedCross",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "cross",
         "dependencies": [
-          "StitchedU1Pool"
+          "StitchedPool"
         ],
         "memory_mb": 32768,
         "minutes": 240
@@ -76,12 +76,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1QAWindows",
+      "analysis_name": "StitchedQAWindows",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "qa_windows",
         "dependencies": [
-          "StitchedU1Cross"
+          "StitchedCross"
         ],
         "memory_mb": 8192,
         "minutes": 30
@@ -90,12 +90,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1QA",
+      "analysis_name": "StitchedQA",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "qa",
         "dependencies": [
-          "StitchedU1QAWindows"
+          "StitchedQAWindows"
         ],
         "memory_mb": 8192,
         "minutes": 60
@@ -104,12 +104,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Review",
+      "analysis_name": "StitchedReview",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "registration_review",
         "dependencies": [
-          "StitchedU1QA"
+          "StitchedQA"
         ],
         "memory_mb": 8192,
         "minutes": 60
@@ -118,12 +118,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1CalibrationPlan",
+      "analysis_name": "StitchedCalibrationPlan",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "calibration_plan",
         "dependencies": [
-          "StitchedU1Review"
+          "StitchedReview"
         ],
         "memory_mb": 16384,
         "minutes": 120
@@ -132,12 +132,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1CalibrationImages",
+      "analysis_name": "StitchedCalibrationImages",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "calibration_images",
         "dependencies": [
-          "StitchedU1CalibrationPlan"
+          "StitchedCalibrationPlan"
         ],
         "memory_mb": 16384,
         "minutes": 120
@@ -146,12 +146,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1CalibrationFinalize",
+      "analysis_name": "StitchedCalibrationFinalize",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "calibration_finalize",
         "dependencies": [
-          "StitchedU1CalibrationImages"
+          "StitchedCalibrationImages"
         ],
         "memory_mb": 8192,
         "minutes": 120
@@ -160,12 +160,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Optimize",
+      "analysis_name": "StitchedOptimize",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "optimize",
         "dependencies": [
-          "StitchedU1CalibrationFinalize"
+          "StitchedCalibrationFinalize"
         ],
         "memory_mb": 65536,
         "minutes": 1440
@@ -174,12 +174,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1DecodePlan",
+      "analysis_name": "StitchedDecodePlan",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "decode_plan",
         "dependencies": [
-          "StitchedU1Optimize"
+          "StitchedOptimize"
         ],
         "memory_mb": 16384,
         "minutes": 120
@@ -188,12 +188,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Decode",
+      "analysis_name": "StitchedDecode",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "decode",
         "dependencies": [
-          "StitchedU1DecodePlan"
+          "StitchedDecodePlan"
         ],
         "memory_mb": 24576,
         "minutes": 2880,
@@ -203,12 +203,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1RawFinalize",
+      "analysis_name": "StitchedRawFinalize",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "raw_finalize",
         "dependencies": [
-          "StitchedU1Decode"
+          "StitchedDecode"
         ],
         "memory_mb": 16384,
         "minutes": 360
@@ -217,12 +217,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1AdaptiveFilter",
+      "analysis_name": "StitchedAdaptiveFilter",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "adaptive_filter",
         "dependencies": [
-          "StitchedU1RawFinalize"
+          "StitchedRawFinalize"
         ],
         "memory_mb": 24576,
         "minutes": 1440
@@ -231,12 +231,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Deduplicate",
+      "analysis_name": "StitchedDeduplicate",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "deduplicate",
         "dependencies": [
-          "StitchedU1AdaptiveFilter"
+          "StitchedAdaptiveFilter"
         ],
         "memory_mb": 16384,
         "minutes": 360
@@ -245,12 +245,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Export",
+      "analysis_name": "StitchedExport",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "export",
         "dependencies": [
-          "StitchedU1Deduplicate"
+          "StitchedDeduplicate"
         ],
         "memory_mb": 16384,
         "minutes": 720
@@ -259,12 +259,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Quality",
+      "analysis_name": "StitchedQuality",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "quality",
         "dependencies": [
-          "StitchedU1Export"
+          "StitchedExport"
         ],
         "memory_mb": 8192,
         "minutes": 120
@@ -273,12 +273,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1PartitionSetup",
+      "analysis_name": "StitchedPartitionSetup",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "partition_setup",
         "dependencies": [
-          "StitchedU1Export"
+          "StitchedExport"
         ],
         "memory_mb": 16384,
         "minutes": 120
@@ -287,12 +287,12 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1PartitionGeometry",
+      "analysis_name": "StitchedPartitionGeometry",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "partition_geometry",
         "dependencies": [
-          "StitchedU1PartitionSetup"
+          "StitchedPartitionSetup"
         ],
         "memory_mb": 16384,
         "minutes": 240
@@ -301,12 +301,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1PartitionCoordinates",
+      "analysis_name": "StitchedPartitionCoordinates",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "partition_coordinates",
         "dependencies": [
-          "StitchedU1PartitionSetup"
+          "StitchedPartitionSetup"
         ],
         "memory_mb": 16384,
         "minutes": 240
@@ -315,13 +315,13 @@
     {
       "task": "StitchedFragments",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1PartitionJoin",
+      "analysis_name": "StitchedPartitionJoin",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "partition_join",
         "dependencies": [
-          "StitchedU1PartitionGeometry",
-          "StitchedU1PartitionCoordinates"
+          "StitchedPartitionGeometry",
+          "StitchedPartitionCoordinates"
         ],
         "memory_mb": 16384,
         "minutes": 240
@@ -330,12 +330,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1PartitionExport",
+      "analysis_name": "StitchedPartitionExport",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "partition_export",
         "dependencies": [
-          "StitchedU1PartitionJoin"
+          "StitchedPartitionJoin"
         ],
         "memory_mb": 32768,
         "minutes": 360
@@ -344,12 +344,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1PartitionVerify",
+      "analysis_name": "StitchedPartitionVerify",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "partition_verify",
         "dependencies": [
-          "StitchedU1PartitionExport"
+          "StitchedPartitionExport"
         ],
         "memory_mb": 32768,
         "minutes": 240
@@ -358,12 +358,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1CellCenters",
+      "analysis_name": "StitchedCellCenters",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "cell_centers",
         "dependencies": [
-          "StitchedU1PartitionVerify"
+          "StitchedPartitionVerify"
         ],
         "memory_mb": 8192,
         "minutes": 120
@@ -372,12 +372,12 @@
     {
       "task": "StitchedStage",
       "module": "merlin.analysis.stitched",
-      "analysis_name": "StitchedU1Analysis",
+      "analysis_name": "StitchedAnalysis",
       "parameters": {
-        "initialize_task": "StitchedU1Initialize",
+        "initialize_task": "StitchedInitialize",
         "stage": "analysis_report",
         "dependencies": [
-          "StitchedU1CellCenters"
+          "StitchedCellCenters"
         ],
         "memory_mb": 32768,
         "minutes": 240
