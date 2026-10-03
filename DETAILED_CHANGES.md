@@ -41,6 +41,44 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   runs the unfinished iterations in order and finalizes each one. It is
   complete once its last iteration is, including when the iterations were run
   by name. As an `optimize_task` it answers with its last iteration.
+- `ImageScaleFactors` (new task): Estimates per-bit scale factors from the
+  preprocessed images alone, with no decode in the loop. The barcode loop
+  equalises the mean on-bit intensity of the pixels it decoded, and for a
+  genuinely dim bit that converges to a wrong answer: on 20260609, RS0707 goes
+  to 0.173, and the max/min spread reaches 9.28x against ~3.1x from the
+  images. For each bit and sampled (fov, z), the background is the
+  `background_percentile` (default 50) percentile and the amplitude is
+  mean(selected pixels) - background. The median is taken over planes.
+  `selection` chooses the pixels:
+  - `sigma` (default): above background + `signal_sigma` (3.0) x MAD spread
+  - `quantile`: the top `signal_quantile` (0.999)
+  - `excess`: the histogram excess over the background mirrored about its
+    mode (`excess_bins` 512)
+  - `mean`: the whole-plane mean
+
+  `min_pixels_above` (200): below this many pixels a plane is uninformative for
+  that bit. Use `background_pixels: nonzero` after `clip_stage: lowpass`, where
+  most pixels are exactly 0 and the median would be 0. `fov_per_iteration` (30)
+  or `fov_index` sets the planes.
+
+  It drops in as Decode's `optimize_task`. It supplies its own backgrounds
+  (`supply_backgrounds`, default true; zeros would leave a background floor in
+  every trace) and takes chromatic correction from `reference_optimize_task`.
+  An `OptimizeIteration` can chain onto it as `previous_iteration`. Every run
+  also saves the estimate over a fixed grid of sigma/quantile settings;
+  `get_scale_factor_sensitivity()` reports how far each bit moves across it.
+- Per-bit bias freeze (`bias_freeze_reference`: a gene-abundance `.npz`
+  (names/total) or 2-column csv; off when unset): After each round, each bit's
+  bias is its coefficient in a least-squares fit of log10(observed / reference
+  gene share) against the codebook. A bit whose |bias| grew by more than
+  `bias_freeze_tolerance` (0.10) has its update rolled back; the other bits
+  update normally. Round k measures the factors of round k-1, so the rollback
+  restores round k-2's value, and a vetoed bit hovers between two values.
+  `bias_freeze_min_genes` (50): with fewer usable genes nothing is vetoed.
+  `bias_freeze_min_abs` (0, off) restricts vetoes to bits with |bias| above it.
+  Each round it judges writes `bias_freeze.csv`. Why: on 20260609 the total
+  squared bit bias is lowest at round 2 (1.518, 0.405, 0.491, 0.549, 0.719,
+  ...) and grows after it.
 
 ### Preprocess (`merlin/analysis/preprocess.py`)
 
@@ -111,6 +149,8 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 - Scripts that build task paths themselves (`$DS/$T/tasks/...`) have to look
   under the group folder. `dataSet.get_analysis_subdirectory(name)` works in
   both layouts.
+- `merlin.get_analysis_datasets()` also finds grouped datasets
+  (`Files/dataset.json`).
 
 ### Segmentation: Cellpose-SAM only (`merlin/analysis/segment.py`)
 
@@ -149,6 +189,27 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   get tables of the kept cells. Chain used for 20260909 DS-4: Segment -> CleanBoundaries
   -> CombineBoundaries -> RefineCells -> PartitionQC -> FilterCells -> Partition*.
 
+### Dense per-plane z registration (`merlin/analysis/Warp_perplane_MX.py`)
+
+- `DenseZWarp` (new task): Measures each round's z offset at every plane,
+  instead of fitting a curve through a sample of planes. It is meant for deep
+  stacks (written for 299 planes over 150 um) where gel expansion shifts deep
+  planes by 9+ planes. Steps:
+  1. 2D xy registration from the coverslip beads.
+  2. At every plane, three z searches: windowed 3D cross-correlation of the
+     fiducial beads, the same on the RNA signal channel
+     (`use_signal_channel`), and a MIP-based search.
+  3. The three are fused, weighted by correlation quality; a source whose
+     error is above `quality_threshold` (0.85) is suppressed.
+  4. z order is kept monotonic by isotonic regression (`monotonic`), and the
+     offsets are smoothed with a quality-weighted spline.
+  5. A per-plane xy residual is measured at the best z.
+  6. The search repeats with a narrower window (`n_iterations` 2,
+     `z_search_range` 12, `fine_search_range` 4).
+
+  Its transformation table is read by Decode/Optimize like any warp's. It
+  preloads all four stacks, ~20 GB for 299 planes at 2048 x 2048.
+
 ## Minor changes
 
 ### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
@@ -172,6 +233,14 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   crop offset in output coordinates.
 - `crop_offset`: Supports independent x/y offsets after asymmetric adaptive
   cropping.
+- `minimum_area`: Now defaults to **2** (was 0), so single-pixel barcodes are
+  dropped at decode. Tasks created before the change keep the value in their
+  `task.json`.
+- `resumable_z_decoding: false` fix: The barcode table was emptied only when
+  the key was absent, so an explicit `false` neither emptied nor deliberately
+  kept it. Re-running such a fragment appended a second copy of every barcode
+  (on 20260609, fov 0 of BFDecode and fov 20 of L2DecodeL held every row
+  twice). The table is now emptied unless the key is true.
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
@@ -183,6 +252,19 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   their merged results are safely written.
 - `get_previous_chromatic_corrector()`: Keeps Decode in the same chromatic image
   space used to estimate its scale factors and backgrounds.
+- `scale_factor_floor_ratio` (default 0, off): Raises every scale factor to at
+  least this fraction of the largest, on read. 0.25 reproduces the reference
+  floor on 20260609: the spread is pinned at 4.00x, and Opalin falls from 32.2%
+  to 3.1% of calls. The blank-based filter cannot see this over-call, because
+  the spurious calls look like real ones.
+- `initial_scale_factors` (`ones`, default, or `image_mean`), with
+  `initial_scale_factor_planes` (4): Seeds the first iteration from the per-bit
+  mean of a few sampled preprocessed planes instead of from ones.
+- `scale_factor_source` (`barcodes`, default, or `image_mean`): `image_mean`
+  uses the plane-mean factors as the final answer and bypasses the barcode
+  refactor. Backgrounds and chromatic correction still come from the loop. A
+  refactor round scales a dim bit down by a roughly constant factor wherever it
+  starts, so seeding alone does not stop the drift.
 
 ### Preprocess (`merlin/analysis/preprocess.py`)
 
@@ -197,6 +279,12 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 - `preprocess_z_index`: Restricts preprocessing to one selected z plane.
 - Zero-iteration bypass: Skips Lucy-Richardson allocation when deconvolution is
   disabled.
+- `highpass_clip` (default true): False keeps the negative half of
+  image - blur(image) (`imagefilters.highpass_filter(..., clip=False)`). With
+  the clip, a pure-background pixel's nearest codeword on 20260609 is Opalin,
+  rank 1 of 246. Do not combine false with `OptimizeIteration`: the rectified
+  pedestal props up the on-bit mean of low-SNR bits. It is meant for an
+  `ImageScaleFactors` path.
 
 ### Barcode filtering (`merlin/analysis/filterbarcodes.py`)
 
@@ -226,6 +314,19 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   `CombineCleanedBoundaries.return_exported_data`, `get_partitioned_barcodes` and
   `get_sum_signals`. Before it, `RefineCellDatabases` under pandas 3 matched no
   cells and silently wrote empty databases. It also uses a set lookup now.
+
+### Barcode database (`merlin/util/barcodedb.py`)
+
+- `barcode_complib` (default `blosc:lz4`), `barcode_complevel` (default 5),
+  set on the task that writes barcodes: Barcode tables are compressed. This
+  applies to newly created tables only; a task folder may hold both kinds, and
+  reads work the same.
+- Intensity columns follow the data: when Decode ran with
+  `extract_intensity_traces` false, the `intensity_*` columns used to be
+  written as NaN, 84 bytes per row (57.5% of the row; 259 GB across four
+  20260609 tasks). They are now left out.
+- `write_barcodes(fov=None)` no longer appends the whole table again after
+  writing it per fov. No call in this fork passes `fov=None`.
 
 ### Restoration (`merlin/analysis/preprocess.py`, `merlin/analysis/modelrestore.py`)
 
