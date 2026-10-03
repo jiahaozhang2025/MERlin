@@ -350,7 +350,7 @@ class CellPoseSegment(FeatureSavingAnalysisTask):
         '''Save a stack of images as a tiff file.'''
         with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
              for i in range(image_stack.shape[0]):
-                    outputTif.save(image_stack[i].astype(np.float32),
+                    outputTif.write(image_stack[i].astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True)
 
@@ -627,7 +627,7 @@ class CellPoseSegmentSingleChannel(FeatureSavingAnalysisTask):
         '''Save a stack of images as a tiff file.'''
         with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
              for i in range(image_stack.shape[0]):
-                    outputTif.save(image_stack[i].astype(np.float32),
+                    outputTif.write(image_stack[i].astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True)
 
@@ -786,9 +786,9 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
         with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
             if len(image_stack.shape)>2:
                 for frame in image_stack:
-                    outputTif.save(frame,photometric='MINISBLACK',contiguous=True)
+                    outputTif.write(frame,photometric='MINISBLACK',contiguous=True)
             else:
-                outputTif.save(image_stack,photometric='MINISBLACK',contiguous=True)
+                outputTif.write(image_stack,photometric='MINISBLACK',contiguous=True)
 
     ###
     # make a reader for segmented masks
@@ -1216,7 +1216,7 @@ class CellPoseSegmentMultiChannel(FeatureSavingAnalysisTask):
         '''Save a stack of images as a tiff file.'''
         with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
              for i in range(image_stack.shape[0]):
-                    outputTif.save(image_stack[i].astype(np.float32),
+                    outputTif.write(image_stack[i].astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True)
 
