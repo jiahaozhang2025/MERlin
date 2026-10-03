@@ -177,6 +177,42 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   get tables of the kept cells. Chain used for 20260909 DS-4: Segment -> CleanBoundaries
   -> CombineBoundaries -> RefineCells -> PartitionQC -> FilterCells -> Partition*.
 
+### Stitched decoding (`merlin/analysis/stitched.py`, `merlin/util/stitched/`) (from Lida Cheng)
+
+- New opt-in tasks `StitchedInitialize`, `StitchedStage` and `StitchedFragments`
+  decode a whole sample as one stitched volume instead of per fov. A molecule
+  at a fov boundary is decoded with the neighbouring fovs' image around it, and
+  each molecule belongs to exactly one output tile. Stages:
+  1. bead-based within-round and cross-round XYZ registration
+  2. a required review: `StitchedReview` waits for a decision file that names
+     the hash of the evidence it reviewed
+  3. fresh intensity optimization, decode, global adaptive filter, and
+     duplicate removal across tiles and z
+  4. optional: GeoPandas mask partition and an analysis report (H5AD, Leiden
+     clusters, HTML)
+
+  `python -m merlin.util.stitched.configure` writes the analysis json and a
+  cluster-resource json. Guide: `docs/stitched_decoding.md`.
+- Only the 0718 acquisition is accepted (profile `0718_40x_150z`: 52 fovs,
+  anchor fov 13, 0.1493 um/px, 150 z planes); other geometries are rejected.
+  Each run freezes copies of its inputs, its stage scripts and the current
+  `merlin` package, and runs each stage in a subprocess against those copies.
+- Extras: `pip install -e '.[stitched]'` (geopandas, rasterio), or
+  `'.[stitched-analysis]'` for the report.
+- Its optimizer calls `OptimizeIteration` helpers on a stand-in object. The
+  scale-factor floor and bias-freeze helpers are bound there with both off, so
+  it reproduces the validated run's scale factors on this version.
+
+### Cross-fov composite warp (`merlin/analysis/crossfov_composite_warp.py`) (from Lida Cheng)
+
+- `CrossFOVCompositeWarp` (new task, built on a finished `polywarp_task`):
+  Fills the margins that stage drift pushed outside a fov's camera frame with
+  the same tissue imaged by the neighbouring fov in that round. The two fovs
+  are linked through their round-0 beads (xy offset and focus offset, gated on
+  SNR and spread, with a self-test). Decode's adaptive crop then excludes only
+  the margins that could not be filled. Written for 20260824, where per-fov
+  cropping lost ~19% of the footprint. No test covers it yet.
+
 ## Minor changes
 
 ### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
@@ -371,8 +407,8 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 
 - Option names have no capital letters. Renamed: `write_decoded_FOVs`,
   `write_preprocessed_FOVs`, `write_filtered_FOVs`, `write_aligned_FOVs`,
-  `write_fiducial_FOVs`, `dump_segmented_FOVs` -> `*_fovs`;
-  `cellpose_3D_stitching` -> `cellpose_3d_stitching`;
+  `write_fiducial_FOVs`, `write_composite_FOVs`, `dump_segmented_FOVs` ->
+  `*_fovs`; `cellpose_3D_stitching` -> `cellpose_3d_stitching`;
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`; `zIndices` ->
   `z_indices`; `codebookNum` -> `codebook_num`. An analysis json or saved
   `task.json` that uses an old name is read as the new name

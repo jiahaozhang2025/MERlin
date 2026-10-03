@@ -181,14 +181,20 @@ def canonical_aggregate(OptimizeIteration, scales, backgrounds, scale_refactors,
         records['background_refactors', i] = np.asarray(br)
         records['previous_scale_factors', i] = scales
         records['previous_backgrounds', i] = backgrounds
-    proxy = SimpleNamespace(parameters={'fov_per_iteration': len(scale_refactors), 'normalize_scale_factors': False},
+    # The scale-factor floor and the per-bit bias freeze did not exist in the
+    # validated run; their off values keep get_scale_factors identical to it.
+    proxy = SimpleNamespace(parameters={'fov_per_iteration': len(scale_refactors), 'normalize_scale_factors': False,
+                                        'scale_factor_floor_ratio': 0, 'bias_freeze_reference': None},
                             analysisName='FreshVirtualFOV', dataSet=MemoryResults(records),
                             is_complete=lambda: True)
     # Current MERlin exposes optional scale normalization; the validated run
-    # used absolute scales, so explicitly disable it and bind the real helper.
-    if hasattr(OptimizeIteration, '_normalize_scale_factors'):
-        from types import MethodType
-        proxy._normalize_scale_factors = MethodType(OptimizeIteration._normalize_scale_factors, proxy)
+    # used absolute scales, so explicitly disable it and bind the real helpers
+    # that get_scale_factors calls.
+    from types import MethodType
+    for name in ('_normalize_scale_factors', '_floor_scale_factors',
+                 '_apply_bias_freeze', '_bias_reference'):
+        if hasattr(OptimizeIteration, name):
+            setattr(proxy, name, MethodType(getattr(OptimizeIteration, name), proxy))
     with warnings.catch_warnings(record=True) as seen:
         warnings.simplefilter('always')
         sf = OptimizeIteration.get_scale_factors(proxy)
