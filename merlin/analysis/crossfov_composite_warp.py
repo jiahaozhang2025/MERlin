@@ -69,7 +69,7 @@ class CrossFOVCompositeWarp(warp.FiducialPolynomialWarp3D):
         p.setdefault('fill_threshold', 100)
         # neighbour frames closer than this fraction of a frame are candidates
         p.setdefault('neighbor_search_frames', 1.6)
-        p.setdefault('write_composite_FOVs', [])
+        p.setdefault('write_composite_fovs', [])
         p.setdefault('write_composite_channels', [])
         p.setdefault('write_composite_z', [])
         self._pw = None
@@ -277,7 +277,7 @@ class CrossFOVCompositeWarp(warp.FiducialPolynomialWarp3D):
         with self._linkLock:
             self._linkCache[fov] = out
         # optional composite QC images
-        if fov in self.parameters['write_composite_FOVs']:
+        if fov in self.parameters['write_composite_fovs']:
             with self.dataSet.writer_for_analysis_images(self, 'composite', fov) as tif:
                 for ch in self.parameters['write_composite_channels']:
                     for z in self.parameters['write_composite_z']:

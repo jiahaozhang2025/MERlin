@@ -24,6 +24,7 @@ class InvalidParameterException(Exception):
 # both are given, the new one wins.
 RENAMED_PARAMETERS = {
     'write_fiducial_FOVs': 'write_fiducial_fovs',
+    'write_composite_FOVs': 'write_composite_fovs',
     'write_aligned_FOVs': 'write_aligned_fovs',
     'write_preprocessed_FOVs': 'write_preprocessed_fovs',
     'write_decoded_FOVs': 'write_decoded_fovs',
