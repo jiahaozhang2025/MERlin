@@ -142,11 +142,11 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # write the same fields. write_decoded_z None = every decoded plane.
         if 'write_images_seed' not in self.parameters:
             self.parameters['write_images_seed'] = imagesample.DEFAULT_SEED
-        if 'write_decoded_FOVs' not in self.parameters \
+        if 'write_decoded_fovs' not in self.parameters \
                 or 'write_decoded_z' not in self.parameters:
             fovs, zIndexes = imagesample.default_image_selection(
                 self.dataSet, self.parameters['write_images_seed'])
-            self.parameters.setdefault('write_decoded_FOVs', fovs)
+            self.parameters.setdefault('write_decoded_fovs', fovs)
             self.parameters.setdefault('write_decoded_z', zIndexes)
         # 'tif': one 2D file per output channel per written plane,
         #   images/decoded_<channel>_fov<fov>_z<z>.tif, channel one of
@@ -175,8 +175,8 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
-            if 'z_duplicate_zPlane_threshold' not in self.parameters:
-                self.parameters['z_duplicate_zPlane_threshold'] = 1
+            if 'z_duplicate_z_threshold' not in self.parameters:
+                self.parameters['z_duplicate_z_threshold'] = 1
             if 'z_duplicate_xy_pixel_threshold' not in self.parameters:
                 self.parameters['z_duplicate_xy_pixel_threshold'] = np.sqrt(2)
         
@@ -361,7 +361,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             
         writeZarr = self.parameters['decoded_image_format'] == 'zarr'
         if writeZarr and self.parameters['write_decoded_images'] \
-                and (fragmentIndex in self.parameters['write_decoded_FOVs']):
+                and (fragmentIndex in self.parameters['write_decoded_fovs']):
             zarr_path = self.dataSet._analysis_zarr_name(self, "decoded", fragmentIndex)
             zarr_out = zarr.open(zarr_path, mode = 'a',
                 shape = (zPositionCount, zarrChannels, *imageShape),
@@ -398,7 +398,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 backgrounds, preprocessTask, decoder)
 
             if self.parameters['write_decoded_images'] \
-                    and (fragmentIndex in self.parameters['write_decoded_FOVs']) \
+                    and (fragmentIndex in self.parameters['write_decoded_fovs']) \
                     and zIndex in writeZIndexes:
                 with self._sliceWriteLock:
                     if writeZarr:
@@ -848,7 +848,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         
     def _remove_z_duplicate_barcodes(self, bc):
         bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(
-            bc, self.parameters['z_duplicate_zPlane_threshold'],
+            bc, self.parameters['z_duplicate_z_threshold'],
             self.parameters['z_duplicate_xy_pixel_threshold'],
             self.dataSet.get_z_positions())
         return bc

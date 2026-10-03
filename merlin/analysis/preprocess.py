@@ -131,11 +131,11 @@ class DeconvolutionPreprocess(Preprocess):
             self.parameters['write_images_seed'] = imagesample.DEFAULT_SEED
         if 'write_preprocessed_images' not in self.parameters:
             self.parameters['write_preprocessed_images'] = True
-        if 'write_preprocessed_FOVs' not in self.parameters \
+        if 'write_preprocessed_fovs' not in self.parameters \
                 or 'write_preprocessed_z' not in self.parameters:
             fovs, zIndexes = imagesample.default_image_selection(
                 self.dataSet, self.parameters['write_images_seed'])
-            self.parameters.setdefault('write_preprocessed_FOVs', fovs)
+            self.parameters.setdefault('write_preprocessed_fovs', fovs)
             self.parameters.setdefault('write_preprocessed_z', zIndexes)
         if 'save_pixel_histogram' not in self.parameters:
             self.parameters['save_pixel_histogram'] = True
@@ -355,7 +355,7 @@ class DeconvolutionPreprocess(Preprocess):
         # example images, so a fov that needs neither is a no-op.
         saveHistogram = self.parameters['save_pixel_histogram']
         writeImages = (self.parameters['write_preprocessed_images'] and
-                       fragmentIndex in self.parameters['write_preprocessed_FOVs'])
+                       fragmentIndex in self.parameters['write_preprocessed_fovs'])
         if not (saveHistogram or writeImages):
             return
 

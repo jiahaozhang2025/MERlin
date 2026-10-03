@@ -158,7 +158,7 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
     The model is `path_to_user_model` if set (a path, or a cellpose-4 model
     name such as a fine-tuned cpsam), otherwise `model_type` ('cpsam_v2').
     By default every z plane is segmented in 2D and stitched into 3D
-    (`stitch_threshold`); `cellpose_3D_stitching: false` runs cellpose's 3D
+    (`stitch_threshold`); `cellpose_3d_stitching: false` runs cellpose's 3D
     mode instead. `z_index` segments that one plane only and repeats its
     outlines on every plane, so barcodes from all planes are partitioned
     into these 2D cells. `diameter` null runs at native resolution (cpsam
@@ -184,8 +184,8 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
             self.parameters['dump_segmented_masks'] = True
         if 'dump_segmented_images' not in self.parameters:
             self.parameters['dump_segmented_images'] = True
-        if 'dump_segmented_FOVs' not in self.parameters:
-            self.parameters['dump_segmented_FOVs'] = list(range(self.fragment_count()))
+        if 'dump_segmented_fovs' not in self.parameters:
+            self.parameters['dump_segmented_fovs'] = list(range(self.fragment_count()))
 
         if 'use_gpu' not in self.parameters:
             self.parameters['use_gpu'] = False
@@ -193,8 +193,8 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
         # true: segment each plane in 2D and stitch planes whose masks overlap
         # by stitch_threshold (IoU); false: cellpose's 3D mode, with z scaled
         # by anisotropy (z step / pixel size)
-        if 'cellpose_3D_stitching' not in self.parameters:
-            self.parameters['cellpose_3D_stitching'] = True
+        if 'cellpose_3d_stitching' not in self.parameters:
+            self.parameters['cellpose_3d_stitching'] = True
         if 'stitch_threshold' not in self.parameters:
             self.parameters['stitch_threshold'] = 0.4
         if 'anisotropy' not in self.parameters:
@@ -250,7 +250,7 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
         kwargs = dict(diameter=diameter, z_axis=0, channel_axis=channelAxis,
                       flow_threshold=self.parameters['flow_threshold'],
                       cellprob_threshold=self.parameters['cellprob_threshold'])
-        if self.parameters['cellpose_3D_stitching']:
+        if self.parameters['cellpose_3d_stitching']:
             kwargs.update(do_3D=False,
                           stitch_threshold=self.parameters['stitch_threshold'])
         else:
@@ -355,9 +355,9 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
         if self.parameters['z_index'] is not None:
             masks = self._extend_to_all_planes(masks)
 
-        if self.parameters['dump_segmented_masks'] and fragmentIndex in self.parameters['dump_segmented_FOVs']:
+        if self.parameters['dump_segmented_masks'] and fragmentIndex in self.parameters['dump_segmented_fovs']:
             self._save_tiff_images(fragmentIndex, 'segmented_mask', masks)
-        if self.parameters['dump_segmented_images'] and fragmentIndex in self.parameters['dump_segmented_FOVs']:
+        if self.parameters['dump_segmented_images'] and fragmentIndex in self.parameters['dump_segmented_fovs']:
             self._save_tiff_images(fragmentIndex, 'segmented_images', images)
 
         zPos = np.array(self.dataSet.get_data_organization().get_z_positions())

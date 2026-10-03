@@ -26,10 +26,6 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   chromatic sampling instead of loading another warped stack.
 - `chromatic_threads`: Parallelizes FOV/z chromatic sampling only when
   `chromatic_from_fragments` is disabled.
-- `chromatic_max_barcodes_per_group`: Limits barcode samples in each FOV/z
-  worker only when `chromatic_from_fragments` is disabled.
-- `chromatic_max_groups`: Limits the FOV/z workers used for chromatic fitting
-  only when `chromatic_from_fragments` is disabled.
 - `OptimizeLoop`: Writes a chain of optimize iterations once in the analysis
   json. It expands into ordinary `OptimizeIteration` tasks
   `<name>1 .. <name>N`, linked by `previous_iteration`, and these are identical
@@ -103,8 +99,9 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 ### Example images (Preprocess, Decode, adaptive filters; `merlin/util/imagesample.py`)
 
 - On by default in all three: `write_preprocessed_images` now defaults to
-  `True`; Decode and the adaptive filters already did.
-- `write_images_seed` (default 1): When `write_*_FOVs` or `write_*_z` is not
+  `True` (was `False`); Decode already wrote images by default, and the
+  adaptive filters' new `write_filtered_images` is on by default too.
+- `write_images_seed` (default 1): When `write_*_fovs` or `write_*_z` is not
   given, 3 fovs and one z plane are drawn at random from this seed. All three
   tasks draw the same way, so by default they write the same fovs and plane.
   The draw is stored in `task.json`. Explicit lists are kept as they are.
@@ -152,29 +149,20 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 - `merlin.get_analysis_datasets()` also finds grouped datasets
   (`Files/dataset.json`).
 
-### Segmentation: Cellpose-SAM only (`merlin/analysis/segment.py`)
+### Segmentation: Cellpose-SAM (`merlin/analysis/segment.py`)
 
-- Segmentation now uses only Cellpose-SAM, i.e. cellpose >= 4 with models such as `cpsam_v2`.
-  `CellPoseSegment`, `CellPoseSegmentSingleChannel`, `CellPoseSegmentMultiChannel` and every
-  cellpose 2/3 code path were removed. The old code is in the history before this change.
-  cellpose 4 cannot load cellpose 2/3 models, so datasets segmented with them are
-  re-segmented with cpsam (or a cpsam fine-tune).
-- `CellPoseSegmentSingleChannel3D` / `CellPoseSegmentTwoChannel3D` (the latter stacks
-  `[channel_1_name, channel_2_name]`) now share one `_run_analysis`.
-- The model is `path_to_user_model` (a path, or a cellpose-4 model name) or else
-  `model_type`, which now defaults to `cpsam_v2`. `diameter: null`, the new default, runs
-  at native resolution; a value scales the image by 30 / diameter. `flow_threshold` and
-  `cellprob_threshold` are passed to cellpose; before, `flow_threshold` was ignored.
-- The module still imports under older cellpose, so its non-cellpose tasks run anywhere.
-  A cellpose task raises a clear error there.
+- Cellpose-SAM replaces cellpose 2/3. `CellPoseSegmentSingleChannel3D` and
+  `CellPoseSegmentTwoChannel3D` now run cellpose >= 4; `CellPoseSegment` and
+  `CellPoseSegmentSingleChannel` were removed. cellpose 4 cannot load cellpose
+  2/3 models, so a json that names a removed class or a `cyto2`/`cyto3` model
+  fails, and such datasets are re-segmented with cpsam (or a cpsam fine-tune).
+- Defaults changed: `model_type` `cyto2` -> `cpsam_v2`; `diameter` 50 ->
+  `null` (native resolution; a value scales the image by 30 / diameter).
+  `flow_threshold` (0.4) and `cellprob_threshold` (0.0) are now passed to
+  cellpose; the 3D classes did not pass them before.
 - `z_index`: Segments one z plane and repeats its outlines on every plane, so
   `PartitionBarcodes` assigns barcodes from all planes to these 2D cells. This is the
   middle-plane convention of Vizgen/Allen, e.g. Yao 2023, 10.1038/s41586-023-06812-z.
-- Cell outlines are traced on each label's bounding box. The polygons are identical, and
-  this takes ~1 s per fov instead of ~0.4 s per cell.
-- New outputs: `feature_labels_<fov>.csv` maps each mask label to its feature id. The
-  `segmented_mask` / `segmented_images` dumps are zlib-compressed, ~0.5 MB instead of
-  67 MB per fov; a z-stack is written in one call, so it stays one series.
 - `FilterCells` (new task): Removes non-cell objects after a provisional partition,
   because its barcode criteria need assigned barcodes:
   - `min_area_um2`, `min_width_um`: footprint area and minor axis on the label's
@@ -189,27 +177,6 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   get tables of the kept cells. Chain used for 20260909 DS-4: Segment -> CleanBoundaries
   -> CombineBoundaries -> RefineCells -> PartitionQC -> FilterCells -> Partition*.
 
-### Dense per-plane z registration (`merlin/analysis/Warp_perplane_MX.py`)
-
-- `DenseZWarp` (new task): Measures each round's z offset at every plane,
-  instead of fitting a curve through a sample of planes. It is meant for deep
-  stacks (written for 299 planes over 150 um) where gel expansion shifts deep
-  planes by 9+ planes. Steps:
-  1. 2D xy registration from the coverslip beads.
-  2. At every plane, three z searches: windowed 3D cross-correlation of the
-     fiducial beads, the same on the RNA signal channel
-     (`use_signal_channel`), and a MIP-based search.
-  3. The three are fused, weighted by correlation quality; a source whose
-     error is above `quality_threshold` (0.85) is suppressed.
-  4. z order is kept monotonic by isotonic regression (`monotonic`), and the
-     offsets are smoothed with a quality-weighted spline.
-  5. A per-plane xy residual is measured at the best z.
-  6. The search repeats with a narrower window (`n_iterations` 2,
-     `z_search_range` 12, `fine_search_range` 4).
-
-  Its transformation table is read by Decode/Optimize like any warp's. It
-  preloads all four stacks, ~20 GB for 299 planes at 2048 x 2048.
-
 ## Minor changes
 
 ### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
@@ -221,13 +188,10 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 - `num_threads`: Controls tile or nearest-neighbor processing concurrency.
 - `magnitude_threshold`: Filters low-magnitude pixels before barcode matching.
 - `nn_algorithm`: Selects the scikit-learn nearest-neighbor algorithm.
-- `resumable_z_decoding`: Retains completed z planes when a decode task is
-  resumed.
 - `decode_z_index`: Restricts decoding to one selected z plane.
 - `extract_intensity_traces`: Saves per-barcode intensity traces.
 - `write_unique_id_images`: Writes decoded images with globally unique barcode
   labels.
-- `write_decoded_FOVs`: Selects FOVs for decoded-image output.
 - `write_decoded_z`: Selects z planes for decoded-image output.
 - `crop_in_image_space`: Applies edge cropping before decoding and restores the
   crop offset in output coordinates.
@@ -252,6 +216,10 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   their merged results are safely written.
 - `get_previous_chromatic_corrector()`: Keeps Decode in the same chromatic image
   space used to estimate its scale factors and backgrounds.
+- `chromatic_max_barcodes_per_group`: Limits barcode samples in each FOV/z
+  worker only when `chromatic_from_fragments` is disabled.
+- `chromatic_max_groups`: Limits the FOV/z workers used for chromatic fitting
+  only when `chromatic_from_fragments` is disabled.
 - `scale_factor_floor_ratio` (default 0, off): Raises every scale factor to at
   least this fraction of the largest, on read. 0.25 reproduces the reference
   floor on 20260609: the spread is pinned at 4.00x, and Opalin falls from 32.2%
@@ -269,8 +237,9 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 ### Preprocess (`merlin/analysis/preprocess.py`)
 
 - `preprocess_threads`: Parallelizes independent bit and z-plane preprocessing.
-- `lowpass_sigma`: Moves low-pass filtering into preprocessing so Optimize and
-  Decode use the same filtered images.
+- `lowpass_sigma`: Moved from Decode to Preprocess (default 1), so Optimize and
+  Decode use the same filtered images. Decode raises an error if it is still
+  set there.
 - `threshold_subtract_n`: Sets the amount of global background subtraction.
 - `threshold_subtract_mode`: Selects mean-, standard-deviation-, or combined
   background subtraction.
@@ -290,21 +259,25 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 
 - `report_bracketing_thresholds`: Reports the available adaptive thresholds
   around the requested misidentification rate for diagnostics.
-- `remove_z_duplicated_barcodes`: Removes likely duplicate detections across
-  nearby z planes.
-- `z_duplicate_zPlane_threshold`: Sets the maximum z-plane separation for
-  duplicate removal.
-- `z_duplicate_xy_pixel_threshold`: Sets the maximum xy separation for
-  duplicate removal.
 - `write_filtered_images`: Writes decoded images containing only retained
   barcodes.
-- `write_filtered_FOVs`: Selects FOVs for filtered-image output.
+- `write_filtered_fovs`: Selects FOVs for filtered-image output.
 - `write_filtered_z`: Selects z planes for filtered-image output.
 
 ### Segmentation (`merlin/analysis/segment.py`, `merlin/util/spatialfeature.py`)
 
-- `cellpose_channels` (a cellpose 2/3 channel selector) was removed with the old
-  cellpose code; cpsam reads the channels in the order they are stacked.
+- `CellPoseSegmentSingleChannel3D` / `CellPoseSegmentTwoChannel3D` share one
+  `_run_analysis`; the latter stacks `[channel_1_name, channel_2_name]`, and cpsam
+  reads channels in that order. `path_to_user_model` takes a path or a
+  cellpose-4 model name and overrides `model_type`.
+- The module still imports under older cellpose, so its non-cellpose tasks run
+  anywhere. A cellpose task raises a clear error there.
+- Cell outlines are traced on each label's bounding box. The polygons are
+  identical, and this takes ~1 s per fov instead of ~0.4 s per cell.
+- New output `feature_labels_<fov>.csv` maps each mask label to its feature id.
+  The `segmented_mask` / `segmented_images` dumps are zlib-compressed, ~0.5 MB
+  instead of 67 MB per fov; a z-stack is written in one call, so it stays one
+  series.
 - `read_feature_metadata`: A fov with no features returns an empty table instead
   of failing, so `ExportCellMetadata` works when a filter empties a fov.
 - `contains_positions`: Rounds z without writing into its input array. With
@@ -342,15 +315,10 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 
 ### Warp (`merlin/analysis/warp.py`)
 
-- `boundary_smooth`: Fills invalid warped edges from an edge-padded blurred
-  image.
-- `median_filter`: Enables or disables fiducial hot-pixel filtering.
-- `sparse_bead_fix`: Enables edge removal and bright-pixel selection for sparse
-  fiducials.
-- `percentile_pixel_to_keep`: Selects the fiducial intensity percentile retained
-  by the sparse-bead filter.
-- `edge_width_to_remove`: Sets the excluded fiducial-image edge width.
-- `write_aligned_FOVs`: Selects FOVs for aligned-image output.
+- `median_filter` (default true): The 3x3 fiducial hot-pixel median filter,
+  which was always applied, can be turned off.
+- `write_fiducial_fovs`: Selects FOVs for fiducial-image output.
+- `write_aligned_fovs`: Selects FOVs for aligned-image output.
 - `write_aligned_z`: Selects z planes for aligned-image output.
 - Registration metrics: Saves per-channel x/y shifts, registration error, and
   phase difference.
@@ -400,6 +368,17 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   `z_neighbor_substitution` false, `z_polynomial_order` 3.
 
 ### Pipeline and compatibility
+
+- Option names have no capital letters. Renamed: `write_decoded_FOVs`,
+  `write_preprocessed_FOVs`, `write_filtered_FOVs`, `write_aligned_FOVs`,
+  `write_fiducial_FOVs`, `dump_segmented_FOVs` -> `*_fovs`;
+  `cellpose_3D_stitching` -> `cellpose_3d_stitching`;
+  `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`; `zIndices` ->
+  `z_indices`; `codebookNum` -> `codebook_num`. An analysis json or saved
+  `task.json` that uses an old name is read as the new name
+  (`analysistask.RENAMED_PARAMETERS`), so existing datasets load and regenerate
+  unchanged. Scripts that read `task.parameters[...]` directly need the new
+  names.
 
 - Snakemake latency wait: Increases shared-filesystem latency handling from 10
   to 60 seconds.

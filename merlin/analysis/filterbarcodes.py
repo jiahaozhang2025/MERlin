@@ -764,8 +764,8 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
-            if 'z_duplicate_zPlane_threshold' not in self.parameters:
-                self.parameters['z_duplicate_zPlane_threshold'] = 1
+            if 'z_duplicate_z_threshold' not in self.parameters:
+                self.parameters['z_duplicate_z_threshold'] = 1
             if 'z_duplicate_xy_pixel_threshold' not in self.parameters:
                 self.parameters['z_duplicate_xy_pixel_threshold'] = np.sqrt(2)
 
@@ -784,11 +784,11 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
             self.parameters['write_images_seed'] = imagesample.DEFAULT_SEED
         if 'write_filtered_images' not in self.parameters:
             self.parameters['write_filtered_images'] = True
-        if 'write_filtered_FOVs' not in self.parameters \
+        if 'write_filtered_fovs' not in self.parameters \
                 or 'write_filtered_z' not in self.parameters:
             fovs, zIndexes = imagesample.default_image_selection(
                 self.dataSet, self.parameters['write_images_seed'])
-            self.parameters.setdefault('write_filtered_FOVs', fovs)
+            self.parameters.setdefault('write_filtered_fovs', fovs)
             self.parameters.setdefault('write_filtered_z', zIndexes)
 
     def fragment_count(self):
@@ -845,7 +845,7 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         """The example image is for looking at, so it must never fail the
         fragment whose barcodes are already written."""
         if not (self.parameters['write_filtered_images']
-                and fragmentIndex in self.parameters['write_filtered_FOVs']):
+                and fragmentIndex in self.parameters['write_filtered_fovs']):
             return
         try:
             self._write_filtered_images(fragmentIndex, barcodes)
@@ -909,7 +909,7 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
     # same function from decode.py
     def _remove_z_duplicate_barcodes(self, bc):
         bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(
-            bc, self.parameters['z_duplicate_zPlane_threshold'],
+            bc, self.parameters['z_duplicate_z_threshold'],
             self.parameters['z_duplicate_xy_pixel_threshold'],
             self.dataSet.get_z_positions())
         return bc
@@ -934,8 +934,8 @@ class LogisticFilterBarcodes(AbstractFilterBarcodes):
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
-            if 'z_duplicate_zPlane_threshold' not in self.parameters:
-                self.parameters['z_duplicate_zPlane_threshold'] = 1
+            if 'z_duplicate_z_threshold' not in self.parameters:
+                self.parameters['z_duplicate_z_threshold'] = 1
             if 'z_duplicate_xy_pixel_threshold' not in self.parameters:
                 self.parameters['z_duplicate_xy_pixel_threshold'] = np.sqrt(2)
 
@@ -1063,7 +1063,7 @@ class LogisticFilterBarcodes(AbstractFilterBarcodes):
 
     def _remove_z_duplicate_barcodes(self, bc):
         bc = barcodefilters.remove_zplane_duplicates_all_barcodeids(
-            bc, self.parameters['z_duplicate_zPlane_threshold'],
+            bc, self.parameters['z_duplicate_z_threshold'],
             self.parameters['z_duplicate_xy_pixel_threshold'],
             self.dataSet.get_z_positions())
         return bc

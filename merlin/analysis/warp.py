@@ -34,8 +34,8 @@ class Warp(analysistask.ParallelAnalysisTask):
             self.parameters['write_fiducial_images'] = False
         if 'write_aligned_images' not in self.parameters:
             self.parameters['write_aligned_images'] = False
-        if 'write_aligned_FOVs' not in self.parameters:
-            self.parameters['write_aligned_FOVs'] = [-1]
+        if 'write_aligned_fovs' not in self.parameters:
+            self.parameters['write_aligned_fovs'] = [-1]
         if 'write_aligned_z' not in self.parameters:
             # None = save all z; otherwise list of zIndexes to write
             self.parameters['write_aligned_z'] = None
@@ -47,8 +47,8 @@ class Warp(analysistask.ParallelAnalysisTask):
             self.parameters['write_averaged_post_lowpass_sigma'] = None  
         if 'write_averaged_reverse_transform' not in self.parameters:
             self.parameters['write_averaged_reverse_transform'] = True 
-        if 'write_fiducial_FOVs' not in self.parameters:
-            self.parameters['write_fiducial_FOVs'] = [-1]
+        if 'write_fiducial_fovs' not in self.parameters:
+            self.parameters['write_fiducial_fovs'] = [-1]
 
         # this is an attempt to fix boundary issues for excessive warping
         # may be useful for long codebooks
@@ -135,7 +135,7 @@ class Warp(analysistask.ParallelAnalysisTask):
 
         dataChannels = self.dataSet.get_data_organization().get_data_channels()
 
-        _alignedFOVs = self.parameters['write_aligned_FOVs']
+        _alignedFOVs = self.parameters['write_aligned_fovs']
         _alignedZ = self.parameters['write_aligned_z']
         if self.parameters['write_aligned_images'] \
                 and (_alignedFOVs == [-1] or fov in _alignedFOVs):
@@ -202,7 +202,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         metadata=imageDescription)
         
         if self.parameters['write_fiducial_images']:
-            fiducialFOVs = self.parameters['write_fiducial_FOVs']
+            fiducialFOVs = self.parameters['write_fiducial_fovs']
             if isinstance(fiducialFOVs, np.ndarray):
                 fiducialFOVs = fiducialFOVs.tolist()
             elif not isinstance(fiducialFOVs, list):
@@ -577,8 +577,8 @@ class FiducialCorrelationWarp(Warp):
         fov = list(self.dataSet.get_fovs())[fragmentIndex]
 
         if self.parameters['write_fiducial_images']:
-            if self.parameters['write_fiducial_FOVs'] == [-1]:
-                self.parameters['write_fiducial_FOVs'] = self.dataSet.get_fovs()
+            if self.parameters['write_fiducial_fovs'] == [-1]:
+                self.parameters['write_fiducial_fovs'] = self.dataSet.get_fovs()
 
         dataChannels, results = self._find_2D_offsets(fov)
         offsets = [r[0] for r in results]      # (y, x)
@@ -790,8 +790,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         if 'edge_width_to_remove' not in self.parameters:
             self.parameters['edge_width_to_remove'] = 20
         # Zero every pixel below this percentile of the high-passed frame.
-        # 5 keeps the brightest 95%, matching DenseZWarp's
-        # percentile_pixel_to_keep=95. Note this is the opposite sense to the
+        # 5 keeps the brightest 95%. Note this is the opposite sense to the
         # inherited percentile_pixel_to_keep, which is a keep-above threshold.
         if 'zero_below_percentile' not in self.parameters:
             self.parameters['zero_below_percentile'] = 5
@@ -1639,7 +1638,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         """
         dataChannels = self.dataSet.get_data_organization().get_data_channels()
 
-        alignedFOVs = self.parameters['write_aligned_FOVs']
+        alignedFOVs = self.parameters['write_aligned_fovs']
         alignedZ = self.parameters['write_aligned_z']
         if self.parameters['write_aligned_images'] \
                 and (alignedFOVs == [-1] or fov in alignedFOVs):
@@ -1658,7 +1657,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                             metadata=imageDescription)
 
         if self.parameters['write_fiducial_images']:
-            fiducialFOVs = self.parameters['write_fiducial_FOVs']
+            fiducialFOVs = self.parameters['write_fiducial_fovs']
             if not isinstance(fiducialFOVs, list):
                 fiducialFOVs = list(fiducialFOVs)
             if fiducialFOVs == [-1] or fov in fiducialFOVs:
