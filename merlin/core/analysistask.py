@@ -19,6 +19,32 @@ class InvalidParameterException(Exception):
     pass
 
 
+# Options renamed so that no option name has a capital letter. An analysis json
+# or a saved task.json that still uses an old name is read as the new name; if
+# both are given, the new one wins.
+RENAMED_PARAMETERS = {
+    'write_fiducial_FOVs': 'write_fiducial_fovs',
+    'write_aligned_FOVs': 'write_aligned_fovs',
+    'write_preprocessed_FOVs': 'write_preprocessed_fovs',
+    'write_decoded_FOVs': 'write_decoded_fovs',
+    'write_filtered_FOVs': 'write_filtered_fovs',
+    'dump_segmented_FOVs': 'dump_segmented_fovs',
+    'cellpose_3D_stitching': 'cellpose_3d_stitching',
+    'z_duplicate_zPlane_threshold': 'z_duplicate_z_threshold',
+    'zIndices': 'z_indices',
+    'codebookNum': 'codebook_num',
+}
+
+
+def rename_parameters(parameters: dict) -> dict:
+    """Move every old option name in parameters to its new name, in place."""
+    for oldName, newName in RENAMED_PARAMETERS.items():
+        if oldName in parameters:
+            value = parameters.pop(oldName)
+            parameters.setdefault(newName, value)
+    return parameters
+
+
 class AnalysisTask(ABC):
 
     """
@@ -48,7 +74,7 @@ class AnalysisTask(ABC):
         if parameters is None:
             self.parameters = {}
         else:
-            self.parameters = copy.deepcopy(parameters)
+            self.parameters = rename_parameters(copy.deepcopy(parameters))
 
         if analysisName is None:
             self.analysisName = type(self).__name__
@@ -69,8 +95,8 @@ class AnalysisTask(ABC):
         self.parameters['module'] = type(self).__module__
         self.parameters['class'] = type(self).__name__
 
-        if 'codebookNum' in self.parameters:
-            self.codebookNum = self.parameters['codebookNum']
+        if 'codebook_num' in self.parameters:
+            self.codebookNum = self.parameters['codebook_num']
 
     def save(self, overwrite=False) -> None:
         """Save a copy of this AnalysisTask into the data set.

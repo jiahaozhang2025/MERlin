@@ -156,9 +156,9 @@
         "tiling_num_threads": 1,
         "decode_z_index": null,
         "remove_z_duplicated_barcodes": true,
-        "z_duplicate_zPlane_threshold": 1,
+        "z_duplicate_z_threshold": 1,
         "write_decoded_images": true,
-        "write_decoded_FOVs": [
+        "write_decoded_fovs": [
           0
         ],
         "write_decoded_z": [
@@ -194,7 +194,7 @@
         "adaptive_task": "AdaptiveThreshold",
         "misidentification_rate": 0.05,
         "write_filtered_images": true,
-        "write_filtered_FOVs": [
+        "write_filtered_fovs": [
           0
         ],
         "write_filtered_z": [
@@ -213,14 +213,14 @@
         "channel_name": "DAPI",
         "path_to_user_model": "cpsam_v2",
         "use_gpu": true,
-        "cellpose_3D_stitching": true,
+        "cellpose_3d_stitching": true,
         "stitch_threshold": 0.25,
         "anisotropy": 1,
         "diameter": 50,
         "downsample_factor": null,
         "dump_segmented_masks": true,
         "dump_segmented_images": false,
-        "dump_segmented_FOVs": [
+        "dump_segmented_fovs": [
           0
         ]
       }

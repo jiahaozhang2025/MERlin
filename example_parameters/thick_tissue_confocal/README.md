@@ -62,7 +62,7 @@ MERlin. What is included here is a plain single-channel DAPI segmentation with
 this class does forward it to the model, though note the 2D
 `CellPoseSegmentSingleChannel` class does not.
 
-`cellpose_3D_stitching: true` segments each plane in 2D and links them across z
+`cellpose_3d_stitching: true` segments each plane in 2D and links them across z
 by IoU, which on this kind of slab gives smoother cells than the `do_3D`
 anisotropy path. `diameter` is largely vestigial for cpsam.
 
