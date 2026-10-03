@@ -17,6 +17,8 @@ class SumSignal(analysistask.ParallelAnalysisTask):
     RNA species that were stained individually.
     """
 
+    outputGroup = 'Export'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
@@ -123,9 +125,12 @@ class SumSignal(analysistask.ParallelAnalysisTask):
                 [self.get_sum_signals(fov) for fov in self.dataSet.get_fovs()]
             )
 
-        return self.dataSet.load_dataframe_from_csv(
+        signals = self.dataSet.load_dataframe_from_csv(
             'sequential_signal', self.get_analysis_name(),
             fov, 'signals', index_col=0)
+        # cell ids (128-bit integers) as str under every pandas version
+        signals.index = signals.index.astype(str)
+        return signals
 
     def _run_analysis(self, fragmentIndex):
         zIndex = int(self.parameters['z_index'])
@@ -142,6 +147,8 @@ class SumSignal(analysistask.ParallelAnalysisTask):
 
 
 class ExportSumSignals(analysistask.AnalysisTask):
+    outputGroup = 'Export'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 

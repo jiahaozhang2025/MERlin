@@ -31,7 +31,7 @@ dependencies = [
   "h5py",
   "matplotlib",
   "networkx>=3.0",
-  "numpy==1.26.4",
+  "numpy>=1.26",
   "opencv-python",
   "pandas",
   "pyclustering",
@@ -42,8 +42,6 @@ dependencies = [
   "scikit-learn",
   "scipy",
   "shapely>=2.0",
-  "snakemake>=7,<8",
-  "pulp==2.7.0",
   "tables",
   "tifffile",
   "xmltodict",
@@ -51,7 +49,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-segmentation = ["cellpose==2.2"]
+segmentation = ["cellpose>=4"]  # Cellpose-SAM (cpsam_v2); cellpose 2/3 support removed 2026-10-02
+snakemake = ["snakemake>=7,<8", "pulp==2.7.0"]  # only for running a whole json without -t
 care = ["tensorflow", "csbdeep"]
 model = ["torch"]
 gui = ["PyQt5"]

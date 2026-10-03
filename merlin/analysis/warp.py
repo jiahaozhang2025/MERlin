@@ -25,6 +25,8 @@ class Warp(analysistask.ParallelAnalysisTask):
     pixels align between images taken in different imaging rounds.
     """
 
+    outputGroup = 'Prepare'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
@@ -150,7 +152,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         inputImage = self.dataSet.get_raw_image(x, fov, z)
                         transformedImage = transform.warp(
                             inputImage, t, preserve_range=True).astype(inputImage.dtype)
-                        outputTif.save(
+                        outputTif.write(
                             transformedImage,
                             photometric='MINISBLACK',
                             contiguous=True,
@@ -193,7 +195,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         filterSize = int(2 * np.ceil(2 * lowPassSigma) + 1)
                         avgImage = cv2.GaussianBlur(avgImage, (filterSize, filterSize), lowPassSigma, borderType=cv2.BORDER_REPLICATE)
                             
-                    outputTif.save(
+                    outputTif.write(
                         avgImage.astype(inputImage.dtype),
                         photometric='MINISBLACK',
                         contiguous=True,
@@ -216,7 +218,7 @@ class Warp(analysistask.ParallelAnalysisTask):
                         inputImage = self.dataSet.get_fiducial_image(x, fov)
                         transformedImage = transform.warp(
                             inputImage, t, preserve_range=True).astype(inputImage.dtype)
-                        outputTif.save(
+                        outputTif.write(
                             transformedImage, 
                             photometric='MINISBLACK',
                             contiguous=True,
@@ -652,6 +654,40 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     ramp in z; setting them to 0 recovers a rigid offset per round with a
     constant z shift.
 
+    THE Z FIT IS GATED, AND A STACK THAT CANNOT BE FITTED BORROWS ITS CURVE
+    FROM ITS NEIGHBOURS. Step 2 above assumes every sampled plane produced a
+    usable correlation peak. Deep in a thick gel that is not true: the bead
+    signal can be gone over a contiguous run of planes, and the argmax of a
+    flat landscape is arbitrary. On 20260609 that put a 5.4 um swing on one
+    (fov, round) -- eleven planes -- out of a fit whose median swing is 0.85.
+    So:
+
+      a) a z sample is DROPPED if its peak ZNCC is below z_min_score, or if
+         |offset| sits on the +-(z_search_range * plane spacing) ceiling,
+         which means the argmax railed rather than found a peak;
+      b) if fewer than z_min_good_samples survive, NO POLYNOMIAL IS FITTED --
+         the z coefficients are zero and the round falls back to its rigid xy,
+         which is honest about having no depth information;
+      c) finalize() then replaces those zeroed curves with the curve of the
+         same round in the spatially adjacent fovs, if z_neighbor_substitution
+         is on. This is a cross-fov step, so it cannot happen inside a
+         per-fov fragment; it runs once, from `merlin -t <task> --check-done`.
+
+    The substitution is justified by leave-one-out over the 1,700 fully
+    sampled 20260609 stacks: a curve borrowed from the 8-neighbourhood
+    reproduces a stack's own fit to 0.084 um RMS (p90 0.226) against curves
+    that span a median 0.847 um. Measured end to end on the decode, at a
+    matched misidentification rate, the worst fov gained 13.1% (misID 0.15)
+    and 19.8% (0.05) coding barcodes over the ungated cubic, while falling all
+    the way back to a rigid offset at the first plane LOST 79.6% and 93.2%.
+    The depth-dependent xy polynomial is doing most of the work even when the
+    z fit is broken, so dropping to rigid is the worst option, not the safe
+    one.
+
+    To restore the pre-gate behaviour exactly: z_min_score 0,
+    z_reject_at_search_limit false, z_min_good_samples 0,
+    z_neighbor_substitution false, z_polynomial_order 3.
+
     All correlations use plain cross-correlation rather than phase
     correlation. Whitening the spectrum amplifies the high-frequency noise
     that dominates the deep, dim planes and was the direct cause of the large
@@ -663,10 +699,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
         # ---- drift model ----
         # Order of the polynomial in z used for the z offset and for the xy
-        # residual. 3 (cubic) is the default; 1 gives a linear ramp and 0 a
-        # constant offset.
+        # residual. 1 gives a linear ramp, 0 a constant offset, 3 a cubic.
+        #
+        # z defaults to 1, xy stays at 3. Gel expansion between rounds is a
+        # bulk strain, which is linear in depth; the extra cubic freedom buys
+        # nothing and costs stability where the samples are sparse. Measured
+        # on 20260609 by leave-one-out over the sampled planes -- hold one
+        # sample out, fit the rest, predict it -- order 1 gives 0.098 um
+        # against order 3's 0.124, and wins on 84% of stacks. The xy residual
+        # is not a bulk strain (it is stage and optical) and is left cubic.
         if 'z_polynomial_order' not in self.parameters:
-            self.parameters['z_polynomial_order'] = 3
+            self.parameters['z_polynomial_order'] = 1
         if 'xy_polynomial_order' not in self.parameters:
             self.parameters['xy_polynomial_order'] = 3
 
@@ -674,6 +717,39 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # Half-width, in fiducial planes, of the integer z search.
         if 'z_search_range' not in self.parameters:
             self.parameters['z_search_range'] = 6
+
+        # ---- z sample gate (see the class docstring) ----
+        # Minimum peak ZNCC for a z sample to enter the fit. 0.5 on 20260609
+        # removes 221 of 16,900 samples; it is well below the 0.9-1.0 a real
+        # bead lock scores and well above the 0.2-0.4 of a dead plane. 0
+        # disables the gate.
+        if 'z_min_score' not in self.parameters:
+            self.parameters['z_min_score'] = 0.5
+        # Also drop a sample whose |offset| is at the search ceiling. A railed
+        # argmax is not a measurement, and its score can still be high because
+        # ZNCC is measured against whatever tissue is there. This caught 7
+        # samples that the score gate alone let through on 20260609.
+        if 'z_reject_at_search_limit' not in self.parameters:
+            self.parameters['z_reject_at_search_limit'] = True
+        # Fewer surviving samples than this and no polynomial is fitted at all.
+        # 4 leaves order 1 two degrees of freedom of slack. 0 disables.
+        if 'z_min_good_samples' not in self.parameters:
+            self.parameters['z_min_good_samples'] = 4
+
+        # ---- neighbour substitution, applied in finalize() ----
+        if 'z_neighbor_substitution' not in self.parameters:
+            self.parameters['z_neighbor_substitution'] = True
+        # Stage-coordinate radii, in microns, tried in order until one holds
+        # at least z_neighbor_min_donors usable donors. The defaults are the
+        # 8-neighbourhood, the two-step ring and one wider, for a 280 um
+        # pitch; scale them with the tile pitch on other layouts.
+        if 'z_neighbor_rings_um' not in self.parameters:
+            self.parameters['z_neighbor_rings_um'] = [400.0, 580.0, 800.0]
+        if 'z_neighbor_min_donors' not in self.parameters:
+            self.parameters['z_neighbor_min_donors'] = 3
+        # A donor must itself be well measured, not merely fitted.
+        if 'z_neighbor_min_samples' not in self.parameters:
+            self.parameters['z_neighbor_min_samples'] = 8
         # Sample every n'th fiducial plane when measuring z / xy. The fits need
         # far fewer points than there are planes, and the z search is the
         # expensive half of the task.
@@ -1173,8 +1249,26 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         results = self._map_over_planes(measure_one, planeIndices)
         measuredZ, measuredOffset, measuredScore = (
             zip(*results) if results else ((), (), ()))
+        # The ceiling is returned rather than recomputed by the caller so the
+        # gate can never disagree with the search that produced the numbers.
         return (np.array(measuredZ), np.array(measuredOffset),
-                np.array(measuredScore))
+                np.array(measuredScore), searchRange * planeSpacing)
+
+    def _z_sample_gate(self, offsets: np.ndarray, scores: np.ndarray,
+                       ceiling: float) -> np.ndarray:
+        """Which z samples may enter the fit. See the class docstring.
+
+        Two independent failure modes, and the score alone does not catch the
+        second: a railed argmax is still scored against whatever tissue sits
+        at the edge of the search, which can correlate perfectly well.
+        """
+        good = np.isfinite(offsets) & np.isfinite(scores)
+        minScore = float(self.parameters['z_min_score'] or 0.0)
+        if minScore > 0:
+            good &= scores >= minScore
+        if self.parameters['z_reject_at_search_limit'] and ceiling > 0:
+            good &= np.abs(offsets) < ceiling - 1e-6
+        return good
 
     def _measure_xy_offsets(self, fov: int, dataChannel: int,
                             rigidY: float, rigidX: float,
@@ -1273,6 +1367,164 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         return self.dataSet.load_dataframe_from_csv(
             'polynomial_coefficients', self, resultIndex=fov,
             subdirectory='transformations')
+
+    def get_z_fit_status(self, fov: int) -> pd.DataFrame:
+        return self.dataSet.load_dataframe_from_csv(
+            'z_fit_status', self, resultIndex=fov,
+            subdirectory='transformations')
+
+    # ==================================================================
+    # cross-fov repair
+    # ==================================================================
+
+    def finalize(self) -> None:
+        """Give every unfitted z stack the curve of its neighbouring fovs.
+
+        Runs once, from `merlin -t <task> --check-done`, which is the only
+        point in the DAG where every fragment is finished and nothing
+        downstream has started. It has to be here rather than in
+        _run_analysis: a fragment knows one fov, and the donors are other
+        fovs that may not have been solved yet when it ran.
+
+        Idempotent, as finalize() must be: the decision of WHICH stacks to
+        repair comes from z_fit_status, which records the gate result and is
+        never rewritten, and the donors are by definition stacks that fitted,
+        whose coefficients this never touches. Running it twice writes the
+        same numbers.
+        """
+        if not self.parameters['z_neighbor_substitution']:
+            return
+
+        fovs = list(self.dataSet.get_fovs())
+        try:
+            status = pd.concat([self.get_z_fit_status(f) for f in fovs],
+                               ignore_index=True)
+        except FileNotFoundError:
+            print('%s: no z_fit_status tables, nothing to substitute'
+                  % self.get_analysis_name(), flush=True)
+            return
+        needed = status[status.source == 'unfitted']
+        if not len(needed):
+            print('%s: every z stack fitted, no neighbour substitution needed'
+                  % self.get_analysis_name(), flush=True)
+            return
+
+        zPositions = np.asarray(self.dataSet.get_z_positions(), dtype=float)
+        zOrder = self.parameters['z_polynomial_order']
+        minSamples = int(self.parameters['z_neighbor_min_samples'])
+        minDonors = int(self.parameters['z_neighbor_min_donors'])
+        rings = [float(r) for r in self.parameters['z_neighbor_rings_um']]
+        xy = {f: self.dataSet.get_fov_offset(f) for f in fovs}
+        coeffCache = {}
+
+        def coefficients_of(fov):
+            if fov not in coeffCache:
+                coeffCache[fov] = self.get_polynomial_coefficients(
+                    fov).set_index('dataChannel')
+            return coeffCache[fov]
+
+        def z_curve(fov, dataChannel):
+            row = coefficients_of(fov).loc[dataChannel]
+            poly = [row['z_c%d' % k]
+                    for k in range(zOrder, -1, -1) if 'z_c%d' % k in row]
+            return np.polyval(poly, zPositions)
+
+        fitted = {(int(r.fov), int(r.dataChannel)): int(r.n_good)
+                  for r in status.itertuples()
+                  if r.source == 'fit' and int(r.n_good) >= minSamples}
+
+        records = []
+        for target in needed.itertuples():
+            fov, dataChannel = int(target.fov), int(target.dataChannel)
+            tx, ty = xy[fov]
+            donors, usedRing = [], rings[-1]
+            for ring in rings:
+                donors = [f for f in fovs
+                          if f != fov and (f, dataChannel) in fitted
+                          and np.hypot(xy[f][0] - tx, xy[f][1] - ty) <= ring]
+                if len(donors) >= minDonors:
+                    usedRing = ring
+                    break
+            if not donors:
+                print('  fov %d channel %d: NO usable donor within %.0f um, '
+                      'left unfitted' % (fov, dataChannel, rings[-1]),
+                      flush=True)
+                continue
+            # Pointwise median of the donors' curves, then re-fit at the
+            # task's own order. Order-agnostic, and for the order-1 default it
+            # reproduces the median-slope / median-intercept estimator that
+            # the leave-one-out validation was run on.
+            curve = np.median(np.vstack([z_curve(f, dataChannel)
+                                         for f in donors]), axis=0)
+            newPoly = np.polyfit(zPositions, curve, zOrder)
+            records.append(dict(
+                fov=fov, dataChannel=dataChannel, n_donors=len(donors),
+                ring_um=usedRing, donors=','.join(str(f) for f in sorted(donors)),
+                span_um=float(np.ptp(np.polyval(newPoly, zPositions))),
+                coefficients=newPoly))
+
+        if not records:
+            print('%s: %d unfitted stacks but no donors for any of them'
+                  % (self.get_analysis_name(), len(needed)), flush=True)
+            return
+
+        byFov = OrderedDict()
+        for rec in records:
+            byFov.setdefault(rec['fov'], []).append(rec)
+        for fov, recs in byFov.items():
+            coeff = self.get_polynomial_coefficients(fov).set_index('dataChannel')
+            for rec in recs:
+                for k, value in enumerate(rec['coefficients'][::-1]):
+                    coeff.loc[rec['dataChannel'], 'z_c%d' % k] = value
+            coeff = coeff.reset_index()
+            self.dataSet.save_dataframe_to_csv(
+                coeff, 'polynomial_coefficients', self.get_analysis_name(),
+                resultIndex=fov, subdirectory='transformations', index=False)
+            self._rewrite_transformation_table(fov, coeff, zPositions, zOrder)
+            st = self.get_z_fit_status(fov)
+            touched = {r['dataChannel'] for r in recs}
+            st.loc[st.dataChannel.isin(touched), 'source'] = 'neighbor'
+            self.dataSet.save_dataframe_to_csv(
+                st, 'z_fit_status', self.get_analysis_name(), resultIndex=fov,
+                subdirectory='transformations', index=False)
+            coeffCache.pop(fov, None)
+
+        report = pd.DataFrame([{k: v for k, v in rec.items()
+                                if k != 'coefficients'} for rec in records])
+        self.dataSet.save_dataframe_to_csv(
+            report, 'z_neighbor_substitutions', self.get_analysis_name(),
+            subdirectory='transformations', index=False)
+        print('%s: substituted %d z stacks in %d fovs from their neighbours'
+              % (self.get_analysis_name(), len(records), len(byFov)),
+              flush=True)
+        print(report.to_string(index=False), flush=True)
+
+    def _rewrite_transformation_table(self, fov, coeff, zPositions, zOrder):
+        """Recompute only the z columns of an existing transformation table.
+
+        xy is deliberately left alone. It was measured at the plane the
+        UNFITTED (zero) z curve pointed at, and re-measuring it at the
+        substituted depth would mean going back to the images from finalize().
+        It is not worth it: the fitted xy drift spans about 2.6 px over this
+        dataset's 80 um, so the largest substitution seen (1.1 um, two planes)
+        moves the xy by ~0.03 px -- two orders of magnitude below the
+        measurement noise. This is also exactly the construction that the
+        end-to-end decode comparison was run on.
+        """
+        table = self.get_transformation_table(fov)
+        byChannel = coeff.set_index('dataChannel')
+        for dataChannel in table['dataChannel'].unique():
+            row = byChannel.loc[dataChannel]
+            poly = [row['z_c%d' % k]
+                    for k in range(zOrder, -1, -1) if 'z_c%d' % k in row]
+            select = table['dataChannel'] == dataChannel
+            zPos = table.loc[select, 'zPos'].to_numpy(float)
+            offset = np.polyval(poly, zPos)
+            table.loc[select, 'z_offset'] = offset
+            table.loc[select, 'zPos_new'] = zPos + offset
+        self.dataSet.save_dataframe_to_csv(
+            table, 'transformation_table', self.get_analysis_name(),
+            resultIndex=fov, subdirectory='transformations', index=False)
 
     def get_transformation(self, fov: int, dataChannel: int = None,
                            zIndex: int = None):
@@ -1400,7 +1652,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     for zIndex in range(len(zPositions)):
                         if alignedZ is not None and zIndex not in alignedZ:
                             continue
-                        outputTif.save(
+                        outputTif.write(
                             self.get_aligned_image(fov, dataChannel, zIndex),
                             photometric='MINISBLACK', contiguous=True,
                             metadata=imageDescription)
@@ -1419,7 +1671,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                               dataChannels):
                         inputImage = self.dataSet.get_fiducial_image(
                             dataChannel, fov)
-                        outputTif.save(
+                        outputTif.write(
                             transform.warp(inputImage, t, preserve_range=True)
                             .astype(inputImage.dtype),
                             photometric='MINISBLACK', contiguous=True,
@@ -1456,10 +1708,25 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         def solve_stack(item):
             key, members = item
             dataChannel, rigidY, rigidX = members[0]
-            zSampleZ, zSampleOffset, zSampleScore = self._measure_z_offsets(
-                fov, dataChannel, rigidY, rigidX)
-            zCoefficients, zKept = self._robust_polyfit(
-                zSampleZ, zSampleOffset, zOrder)
+            zSampleZ, zSampleOffset, zSampleScore, zCeiling = \
+                self._measure_z_offsets(fov, dataChannel, rigidY, rigidX)
+            zGate = self._z_sample_gate(zSampleOffset, zSampleScore, zCeiling)
+            nGood = int(zGate.sum())
+            zFitted = nGood >= int(self.parameters['z_min_good_samples'] or 0)
+            if zFitted:
+                zCoefficients, gateKept = self._robust_polyfit(
+                    zSampleZ[zGate], zSampleOffset[zGate], zOrder)
+                # gateKept indexes the gated subset; lift it back so the QC
+                # table keeps one row per sample and a gated-out sample reads
+                # as not kept rather than vanishing.
+                zKept = np.zeros(len(zGate), bool)
+                zKept[np.flatnonzero(zGate)] = gateKept
+            else:
+                # No depth information worth having. Zero coefficients mean
+                # this round falls back to its rigid xy, and finalize() may
+                # replace the curve from the neighbouring fovs.
+                zCoefficients = np.zeros(zOrder + 1)
+                zKept = np.zeros(len(zGate), bool)
 
             xySampleZ, xySampleY, xySampleX, xySnr, xyEdge = \
                 self._measure_xy_offsets(fov, dataChannel, rigidY, rigidX,
@@ -1471,6 +1738,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
             entry = {'z': zCoefficients, 'y': yCoefficients,
                      'x': xCoefficients}
+            status = {'fov': fov, 'dataChannel': dataChannel,
+                      'n_samples': int(len(zGate)), 'n_good': nGood,
+                      'n_gated_out': int(len(zGate) - nGood),
+                      'fitted': bool(zFitted),
+                      'source': 'fit' if zFitted else 'unfitted'}
 
             stackMeasurements = []
             if self.parameters['write_qc_table']:
@@ -1525,7 +1797,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                         'z_residual_um': zResidual, 'y_residual_px': yResidual,
                         'x_residual_px': xResidual, 'fraction_kept': keptFraction,
                         'reasons': '; '.join(reasons)}
-            return key, entry, stackMeasurements, line, flag
+            if not zFitted:
+                line += ('\n  *** Z NOT FITTED, fov %d channel %d: only %d of '
+                         '%d samples passed the gate (min %s). z_offset is 0 '
+                         'here; finalize() will substitute the neighbouring '
+                         'fovs curve if z_neighbor_substitution is on. ***'
+                         % (fov, dataChannel, nGood, len(zGate),
+                            self.parameters['z_min_good_samples']))
+            return key, entry, stackMeasurements, line, flag, status
 
         stackThreads = max(1, int(self.parameters['stack_num_threads']))
         items = list(stackMembers.items())
@@ -1540,9 +1819,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # whatever order the threads happened to finish in.
         coefficients = {}
         measurements = []
-        entryOf = {key: entry for key, entry, _, _, _ in solvedStacks}
+        entryOf = {key: entry for key, entry, _, _, _, _ in solvedStacks}
         qcFlags = []
-        for key, _, stackMeasurements, line, flag in solvedStacks:
+        zStatus = []
+        for key, _, stackMeasurements, line, flag, status in solvedStacks:
+            zStatus.append(status)
             measurements.extend(stackMeasurements)
             print(line, flush=True)
             if flag is not None:
@@ -1555,10 +1836,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 'x_residual_px', 'fraction_kept', 'reasons']),
             'fit_quality_flags', self.get_analysis_name(), resultIndex=fov,
             subdirectory='transformations', index=False)
+        statusOf = {row['dataChannel']: row for row in zStatus}
+        statusRows = []
         for key, members in stackMembers.items():
+            owner = members[0][0]
             for dataChannel, rigidY, rigidX in members:
                 coefficients[dataChannel] = dict(
                     entryOf[key], rigid_y=rigidY, rigid_x=rigidX)
+                # Channels sharing a fiducial stack share its fit, so they
+                # share its status; `owner` names the one actually measured.
+                statusRows.append(dict(statusOf[owner], dataChannel=dataChannel,
+                                       owner_channel=owner))
         for dataChannel, rigidY, rigidX in rigidOnlyMembers:
             coefficients[dataChannel] = {
                 'z': np.zeros(zOrder + 1), 'y': np.zeros(xyOrder + 1),
@@ -1566,6 +1854,22 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 'rigid_y': rigidY, 'rigid_x': rigidX}
             print('fov %d channel %d: rigid only (%.2f, %.2f), no 3D warp '
                   'fitted' % (fov, dataChannel, rigidY, rigidX), flush=True)
+            statusRows.append(dict(
+                fov=fov, dataChannel=dataChannel, owner_channel=dataChannel,
+                n_samples=0, n_good=0, n_gated_out=0, fitted=False,
+                source='rigid_only'))
+
+        # One row per data channel, always written, so finalize() can find the
+        # stacks needing substitution without re-reading any measurement, and
+        # so the ABSENCE of a row never has to be read as "the gate did not
+        # run". source is 'fit', 'unfitted' or 'rigid_only'; finalize()
+        # rewrites 'unfitted' to 'neighbor' when it substitutes one.
+        self.dataSet.save_dataframe_to_csv(
+            pd.DataFrame(statusRows, columns=[
+                'fov', 'dataChannel', 'owner_channel', 'n_samples', 'n_good',
+                'n_gated_out', 'fitted', 'source']).sort_values('dataChannel'),
+            'z_fit_status', self.get_analysis_name(), resultIndex=fov,
+            subdirectory='transformations', index=False)
 
         self._save_results(fov, coefficients, measurements)
         self._planeCache.clear()

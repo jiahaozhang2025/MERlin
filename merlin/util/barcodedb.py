@@ -257,20 +257,48 @@ class PyTablesBarcodeDB(BarcodeDB):
                 self.write_barcodes(
                         barcodeInformation.loc[barcodeInformation['fov'] == f],
                         fov=f)
+            # Without this the per-fov slices are written and then the whole
+            # frame is appended again to a fov=None store. Unreachable today --
+            # all nine call sites in this fork pass fov explicitly -- but the
+            # branch is wrong as written.
+            return
+
+        # Compressed by default. Measured on one fov of this dataset, 2e6 rows:
+        # blosc:zstd-5 is 6.10x on an all-NaN intensity block and 1.56x on real
+        # traces, for 0.21 s against 0.12 s to read a column back. zlib matches
+        # it on size but reads 8-14x slower, so zstd is the only one worth
+        # defaulting to. Compression applies to newly created tables only, so a
+        # task directory may hold a mix; reads do not care.
+        parameters = getattr(self._analysisTask, 'parameters', None) or {}
 
         with self._dataSet.open_pandas_hdfstore(
-                'a', 'barcode_data', self._analysisTask, fov, 'barcodes'
+                'a', 'barcode_data', self._analysisTask, fov, 'barcodes',
+                complib=parameters.get('barcode_complib', 'blosc:lz4'),
+                complevel=int(parameters.get('barcode_complevel', 5) or 0)
         ) as pandasHDF:
             tablesType = self._get_bc_column_types()
             barcodeInformation = barcodeInformation.copy()
+            # Fill only columns the writer genuinely forgot. An absent
+            # intensity_* block means the decode ran with
+            # extract_intensity_traces false, and materialising it as NaN costs
+            # 84 bytes on every row -- 57.5 per cent of the row, and 259 GB
+            # across this dataset's four such tasks, on a 748 GB dataset. Let
+            # the schema follow the data instead. _get_bc_column_types stays
+            # unchanged because it also names the columns for the zero-row
+            # fallback, which must keep its full shape.
             missingColumns = [
                 column for column in tablesType
                 if column not in barcodeInformation.columns
+                and not column.startswith('intensity_')
             ]
             for column in missingColumns:
                 barcodeInformation[column] = np.nan
 
+            presentType = {column: dtype for column, dtype
+                           in tablesType.items()
+                           if column in barcodeInformation.columns}
+
             pandasHDF.append(
                 'barcodes',
-                barcodeInformation.astype(tablesType),
+                barcodeInformation.astype(presentType),
                 format='table')

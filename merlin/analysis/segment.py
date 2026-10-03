@@ -11,6 +11,8 @@ from typing import List, Dict, Tuple
 from scipy.spatial import cKDTree
 import scipy.ndimage
 import cellpose.models
+import importlib.metadata
+import tifffile
 
 from merlin.core import dataset
 from merlin.core import analysistask
@@ -19,6 +21,26 @@ from merlin.util import watershed
 import pandas
 import networkx as nx
 
+# Segmentation is Cellpose-SAM only (cellpose >= 4, e.g. cpsam_v2). The
+# cellpose 2/3 classes and code paths (models.Cellpose, cyto2/nuclei, CP3 user
+# models) were removed on 2026-10-02; they are in the git history before then.
+# The module still imports under older cellpose so its other tasks can run.
+CELLPOSE_MAJOR = int(importlib.metadata.version('cellpose').split('.')[0])
+
+
+def _label_footprints(masks: np.ndarray, micronsPerPixel: float) -> pandas.DataFrame:
+    """Area (um2) and width (minor axis, um) of each label of a [z, y, x]
+    label image, measured on the plane where the label is largest."""
+    rows = []
+    for region in measure.regionprops(masks):
+        z = np.bincount(region.coords[:, 0]).argmax()
+        _, r0, c0, _, r1, c1 = region.bbox
+        plane = measure.regionprops(
+            (masks[z, r0:r1, c0:c1] == region.label).astype(np.uint8))[0]
+        rows.append((region.label, plane.area * micronsPerPixel ** 2,
+                     plane.minor_axis_length * micronsPerPixel))
+    return pandas.DataFrame(rows, columns=['label', 'area_um2', 'width_um'])
+
 
 class FeatureSavingAnalysisTask(analysistask.ParallelAnalysisTask):
 
@@ -26,6 +48,8 @@ class FeatureSavingAnalysisTask(analysistask.ParallelAnalysisTask):
     An abstract analysis class that saves features into a spatial feature
     database.
     """
+
+    outputGroup = 'Segment'
 
     def __init__(self, dataSet: dataset.DataSet, parameters=None,
                  analysisName=None):
@@ -125,632 +149,70 @@ class WatershedSegment(FeatureSavingAnalysisTask):
             for z in range(len(self.dataSet.get_z_positions()))])
 
 
-class CellPoseSegment(FeatureSavingAnalysisTask):
-    '''A task that determines the boundaries of features in the
-    image data in each field of view using the Cellpose method
-    '''
-    def __init__(self, dataSet, parameters=None, analysisName=None):
-        super().__init__(dataSet, parameters, analysisName)
-        if 'nuclear_channel' not in self.parameters:
-            self.parameters['nuclear_channel'] = 'DAPI'
-        if 'membrane_channel' not in self.parameters:
-            self.parameters['membrane_channel'] = 'conA'
-        if 'use_gpu' not in self.parameters:
-            self.parameters['use_gpu'] = False
-        if 'diameter' not in self.parameters:
-            self.parameters['diameter'] = 60
-        if 'min_size' not in self.parameters:
-            self.parameters['min_size'] = 200
-        if 'combine_two_models' not in self.parameters:
-            self.parameters['combine_two_models'] = True
-        if 'dump_preprocessed_images' not in self.parameters:
-            self.parameters['dump_preprocessed_images'] = True
-        if 'dump_segmented_masks' not in self.parameters:
-            self.parameters['dump_segmented_masks'] = True
-
-    def fragment_count(self):
-        return len(self.dataSet.get_fovs())
-
-    def get_estimated_memory(self):
-        # TODO - refine estimate
-        return 2048
-
-    def get_estimated_time(self):
-        # TODO - refine estimate
-        return 5
-
-    def get_dependencies(self):
-        return [self.parameters['warp_task'],
-                self.parameters['global_align_task']]
-
-    def get_cell_boundaries(self) -> List[spatialfeature.SpatialFeature]:
-        featureDB = self.get_feature_database()
-        return featureDB.read_features()
-
-    def scale_image(self, img, saturation_percentile=99.9):
-        return np.minimum(img, np.percentile(img, saturation_percentile))
-
-    def high_pass_filter_individual_z(self, image, sigma, truncate):
-        lowpass = np.array([scipy.ndimage.gaussian_filter(image[z], sigma, mode='nearest', truncate=truncate)
-                           for z in range(image.shape[0])])
-        gauss_highpass = image - lowpass
-        gauss_highpass[lowpass > image] = 0
-        return gauss_highpass
-
-    def adaptive_equalize_hist_individual_z(self, image, clip_limit=0.03):
-        image_normalized = [image[z] / np.max(image[z]) for z in range(image.shape[0])]
-        return np.array([exposure.equalize_adapthist(image_normalized[z], clip_limit=clip_limit) 
-                        for z in range(image.shape[0])])
-
-    def preprocess_image_channels(self, nuclear_image, membrane_marker_image):
-        # Remove the hot-pixels
-        nuclear_image = self.scale_image(nuclear_image, 99.9)
-        membrane_marker_image = self.scale_image(membrane_marker_image, 99.9)
-        
-        # Run the high-pass filter for the membrance channel
-        sigma = 5
-        truncate = 2
-        membrane_marker_image = self.high_pass_filter_individual_z(membrane_marker_image, sigma, truncate)
-         
-        # Enhance the contrast by adaptive histogram equalization
-        nuclear_image = self.adaptive_equalize_hist_individual_z(nuclear_image, clip_limit=0.05)
-        membrane_marker_image = self.adaptive_equalize_hist_individual_z(membrane_marker_image, clip_limit=0.05)
-        
-        return nuclear_image, membrane_marker_image
-
-    def get_overlapping_objects(self, segmentationZ0: np.ndarray,
-                                segmentationZ1: np.ndarray,
-                                n0: int,
-                                fraction_threshold0: float=0.2,
-                                fraction_threshold1: float=0.2) -> Tuple[float, 
-                                                                    float,
-                                                                    float]:
-        """compare cell labels in adjacent image masks
-        Args:
-            segmentationZ0: a 2 dimensional numpy array containing a
-                segmentation mask in position Z
-            segmentationZ1: a 2 dimensional numpy array containing a
-                segmentation mask adjacent to segmentationZ0
-            n0: an integer with the index of the object (cell/nuclei)
-                to be compared between the provided segmentation masks
-        Returns:
-            a tuple (n1, f0, f1) containing the label of the cell in Z1
-            overlapping n0 (n1), the fraction of n0 overlaping n1 (f0) and
-            the fraction of n1 overlapping n0 (f1)
-        """
-    
-        z1Indexes = np.unique(segmentationZ1[segmentationZ0 == n0])
-    
-        z1Indexes = z1Indexes[z1Indexes > 0]
-    
-        if z1Indexes.shape[0] > 0:
-    
-            # calculate overlap fraction
-            n0Area = np.count_nonzero(segmentationZ0 == n0)
-            n1Area = np.zeros(len(z1Indexes))
-            overlapArea = np.zeros(len(z1Indexes))
-    
-            for ii in range(len(z1Indexes)):
-                n1 = z1Indexes[ii]
-                n1Area[ii] = np.count_nonzero(segmentationZ1 == n1)
-                overlapArea[ii] = np.count_nonzero((segmentationZ0 == n0) *
-                                                   (segmentationZ1 == n1))
-    
-            n0OverlapFraction = np.asarray(overlapArea / n0Area)
-            n1OverlapFraction = np.asarray(overlapArea / n1Area)
-            index = list(range(len(n0OverlapFraction)))
-    
-            # select the nuclei that has the highest fraction in n0 and n1
-            r1, r2, indexSorted = zip(*sorted(zip(n0OverlapFraction,
-                                                  n1OverlapFraction,
-                                                  index),
-                                      key=lambda x:x[0]+x[1],
-                                      reverse=True))
-                  
-            if (n0OverlapFraction[indexSorted[0]] > fraction_threshold0 and
-                    n1OverlapFraction[indexSorted[0]] > fraction_threshold1):
-                return (z1Indexes[indexSorted[0]],
-                        n0OverlapFraction[indexSorted[0]],
-                        n1OverlapFraction[indexSorted[0]])
-            else:
-                return (False, False, False)
-        else:
-            return (False, False, False)
-
-
-    def combine_2d_segmentation_masks_into_3d(self, segmentationOutput:
-                                              np.ndarray) -> np.ndarray:
-        """Take a 3 dimensional segmentation masks and relabel them so that
-        nuclei in adjacent sections have the same label if the area their
-        overlap surpases certain threshold
-        Args:
-            segmentationOutput: a 3 dimensional numpy array containing the
-                segmentation masks arranged as (z, x, y).
-        Returns:
-            ndarray containing a 3 dimensional mask arranged as (z, x, y) of
-                relabeled segmented cells
-        """
-    
-        # Initialize empty array with size as segmentationOutput array
-        segmentationCombinedZ = np.zeros(segmentationOutput.shape)
-    
-        # copy the mask of the section farthest to the coverslip to start
-        segmentationCombinedZ[-1, :, :] = segmentationOutput[-1, :, :]
-        
-        # starting far from coverslip
-        for z in range(segmentationOutput.shape[0]-1, 0, -1):
-    
-            # get non-background cell indexes for plane Z
-            zIndex = np.unique(segmentationCombinedZ[z, :, :])[
-                                    np.unique(segmentationCombinedZ[z, :, :]) > 0]
-    
-            # get non-background cell indexes for plane Z-1
-            zm1Index = np.unique(segmentationOutput[z-1, :, :])[
-                                    np.unique(segmentationOutput[z-1, :, :]) > 0]
-            assigned_zm1Index = []
-            
-            # compare each cell in z0
-            for n0 in zIndex:
-                n1, f0, f1 = self.get_overlapping_objects(segmentationCombinedZ[z, :, :],
-                                                     segmentationOutput[z-1, :, :],
-                                                     n0)
-                if n1:
-                    segmentationCombinedZ[z-1, :, :][
-                        (segmentationOutput[z-1, :, :] == n1)] = n0
-                    assigned_zm1Index.append(n1)
-            
-            # keep the un-assigned indices in the Z-1 plane
-            unassigned_zm1Index = [i for i in zm1Index if i not in assigned_zm1Index]
-            max_current_id = np.max(segmentationCombinedZ[z-1:, :, :])
-            for i in range(len(unassigned_zm1Index)):
-                unassigned_id = unassigned_zm1Index[i]
-                segmentationCombinedZ[z-1, :, :][
-                        (segmentationOutput[z-1, :, :] == unassigned_id)] = max_current_id + 1 +i
-     
-        return segmentationCombinedZ
-
-    def add_new_segmentation_masks_to_existing_mask(self, existing_mask:np.ndarray, 
-                                                    new_mask:np.ndarray) -> np.ndarray:
-        '''Add the cells found in the new segmentation mask to an existing mask.
-        Only cells that doesn't overlap with the existing mask will be added.
-        Return:
-            The cell segmentation mask after the addition.
-        '''
-        combined_mask = existing_mask.copy()
-        
-        # Get a binary mask of the segmented regions
-        binary_segemented_mask = existing_mask > 0
-        
-        # Add the cells from the new mask to the existing mask
-        # Run the processs for each z plane
-        for z in range(combined_mask.shape[0]):
-        
-            current_highest_id = np.max(combined_mask[z])
-            new_cell_ids = np.unique(new_mask[z])
-            new_cell_ids = new_cell_ids[new_cell_ids > 0]
-        
-            for nc_id in new_cell_ids:
-            
-                # Only add cells that don't overlap with existing cells
-                overlap_size = np.count_nonzero(binary_segemented_mask[z] * (new_mask[z] == nc_id))
-            
-                if 0 == overlap_size:
-                    current_highest_id += 1
-                    combined_mask[z][new_mask[z] == nc_id] = current_highest_id
-        
-        return combined_mask
-
-    def _read_image_stack(self, fov: int, channelIndex: int) -> np.ndarray:
-        warpTask = self.dataSet.load_analysis_task(
-            self.parameters['warp_task'])
-        return np.array([warpTask.get_aligned_image(fov, channelIndex, z)
-                         for z in range(len(self.dataSet.get_z_positions()))])
-
-    def _save_tiff_images(self, fov, filename_prefix, image_stack):
-        '''Save a stack of images as a tiff file.'''
-        with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
-             for i in range(image_stack.shape[0]):
-                    outputTif.save(image_stack[i].astype(np.float32),
-                                   photometric='MINISBLACK',
-                                   contiguous=True)
-
-    def _run_analysis(self, fragmentIndex):
-        globalTask = self.dataSet.load_analysis_task(
-                self.parameters['global_align_task'])
-
-        # read membrane and nuclear indices
-        nuclear_ids = self.dataSet.get_data_organization().get_data_channel_index(
-                self.parameters['nuclear_channel'])
-        membrane_ids = self.dataSet.get_data_organization().get_data_channel_index(
-                self.parameters['membrane_channel'])
-
-        # read images and perform segmentation
-        nuclear_images = self._read_image_stack(fragmentIndex, nuclear_ids)
-        membrane_images = self._read_image_stack(fragmentIndex, membrane_ids)
-
-        # preprocess the images 
-        nuclear_images_pp, membrane_images_pp = self.preprocess_image_channels(nuclear_images, membrane_images)
-
-        if self.parameters['dump_preprocessed_images']:
-            self._save_tiff_images(fragmentIndex, 'preprocessed_nuclear_images', nuclear_images_pp)
-            self._save_tiff_images(fragmentIndex, 'preprocessed_membrane_images', membrane_images_pp)
-
-        # Combine the images into a stack
-        zero_images = np.zeros(nuclear_images.shape)
-        stacked_images_cyto = np.stack((zero_images, membrane_images_pp, nuclear_images_pp), axis=3)
-
-        # Load the cellpose model. 'cyto2' performs better than 'cyto'.
-        model_cyto = cellpose.models.Cellpose(gpu=self.parameters['use_gpu'], model_type='cyto2')
-
-        # Run the cellpose prediction using the nuclear and membrane stains
-        masks_cyto, flows_cyto, styles_cyto, diams_cyto = model_cyto.eval(stacked_images_cyto, 
-                                        diameter=self.parameters['diameter'], 
-                                        do_3D=False, channels=[2, 3], 
-                                        resample=True, min_size=self.parameters['min_size'])
-
-        # Run a separate segmentation using only the nuclear stain
-        if self.parameters['combine_two_models']:
-            stacked_images_nuclei = np.stack((zero_images, zero_images, nuclear_images_pp), axis=3)
-            
-            # Load the nuclei model
-            model_nuclei = cellpose.models.Cellpose(gpu=self.parameters['use_gpu'], model_type='nuclei')
-
-            # Run the cellpose prediction using the nuclear stain
-            masks_nuclei, flows_nuclei, styles_nuclei, diams_nuclei = model_nuclei.eval(stacked_images_nuclei, 
-                                            diameter=self.parameters['diameter'], 
-                                            do_3D=False, channels=[3, 0], 
-                                            resample=True, min_size=self.parameters['min_size'])
-
-            # Combine the masks from the cyto2 and the nuclei models
-            masks_combined = self.add_new_segmentation_masks_to_existing_mask(masks_cyto, masks_nuclei)
-
-        else:
-            masks_combined = masks_cyto
-
-
-        # Combine 2D segmentation to 3D segmentation
-        if len(masks_combined.shape) == 3: 
-            masks3d = self.combine_2d_segmentation_masks_into_3d(masks_combined)
-        else:
-            masks3d = np.array([masks_combined])
-        
-        if self.parameters['dump_segmented_masks']:
-            self._save_tiff_images(fragmentIndex, 'segmented_mask', masks3d)
-
-        # Get the boundary features
-        zPos = np.array(self.dataSet.get_data_organization().get_z_positions())
-        featureList = [spatialfeature.SpatialFeature.feature_from_label_matrix(
-            (masks3d == i), fragmentIndex,
-            globalTask.fov_to_global_transform(fragmentIndex), zPos)
-            for i in np.unique(masks3d) if i != 0]
-
-        featureDB = self.get_feature_database()
-        featureDB.write_features(featureList, fragmentIndex)
-
-
-
-class CellPoseSegmentSingleChannel(FeatureSavingAnalysisTask):
-
-    """
-    An analysis task that determines the boundaries of features in the
-    image data in each field of view using cellpose (https://github.com/
-    MouseLand/cellpose).
-
-    """
-
-    def __init__(self, dataSet, parameters=None, analysisName=None):
-        super().__init__(dataSet, parameters, analysisName)
-
-        # if 'method' not in self.parameters:
-        #     self.parameters['method'] = 'cellpose'
-        if 'diameter' not in self.parameters:
-            self.parameters['diameter'] = 50
-        if 'channel_name' not in self.parameters:
-            self.parameters['channel_name'] = 'DAPI'
-        if 'flow_threshold' not in self.parameters:
-            self.parameters['flow_threshold'] = 0.5
-        if 'cellprob_threshold' not in self.parameters:
-            self.parameters['cellprob_threshold'] = 1
-        if 'model_type' not in self.parameters:
-            self.parameters['model_type'] = 'cyto2' 
-        if 'path_to_user_model' not in self.parameters:
-            self.parameters['path_to_user_model'] = False
-        if 'dump_preprocessed_images' not in self.parameters:
-            self.parameters['dump_preprocessed_images'] = True
-        if 'dump_segmented_masks' not in self.parameters:
-            self.parameters['dump_segmented_masks'] = True
-        if 'min_size' not in self.parameters:
-            self.parameters['min_size'] = 100
-        if 'use_gpu' not in self.parameters:
-            self.parameters['use_gpu'] = False
-
-    def fragment_count(self):
-        return len(self.dataSet.get_fovs())
-
-    def get_estimated_memory(self):
-        # TODO - refine estimate
-        return 2048
-
-    def get_estimated_time(self):
-        # TODO - refine estimate
-        return 5
-
-    def get_dependencies(self):
-        return [self.parameters['warp_task'],
-                self.parameters['global_align_task']]
-
-    def get_cell_boundaries(self) -> List[spatialfeature.SpatialFeature]:
-        featureDB = self.get_feature_database()
-        return featureDB.read_features()
-
-    def scale_image(self, img, saturation_percentile=99.9):
-        return np.minimum(img, np.percentile(img, saturation_percentile))
-
-    def high_pass_filter_individual_z(self, image, sigma, truncate):
-        lowpass = np.array([scipy.ndimage.gaussian_filter(image[z], sigma, mode='nearest', truncate=truncate)
-                           for z in range(image.shape[0])])
-        gauss_highpass = image - lowpass
-        gauss_highpass[lowpass > image] = 0
-        return gauss_highpass
-
-    def adaptive_equalize_hist_individual_z(self, image, clip_limit=0.03):
-        image_normalized = [image[z] / np.max(image[z]) for z in range(image.shape[0])]
-        return np.array([exposure.equalize_adapthist(image_normalized[z], clip_limit=clip_limit) 
-                        for z in range(image.shape[0])])
-
-    def preprocess_image_channels(self, seg_image):
-        # Remove the hot-pixels
-        seg_image = self.scale_image(seg_image, 99.9)
-         
-        # Enhance the contrast by adaptive histogram equalization
-        seg_image = self.adaptive_equalize_hist_individual_z(seg_image, clip_limit=0.05)
-
-        return seg_image
-
-    def get_overlapping_objects(self, segmentationZ0: np.ndarray,
-                                segmentationZ1: np.ndarray,
-                                n0: int,
-                                fraction_threshold0: float=0.2,
-                                fraction_threshold1: float=0.2) -> Tuple[float, 
-                                                                         float,
-                                                                         float]:
-        """compare cell labels in adjacent image masks
-        Args:
-            segmentationZ0: a 2 dimensional numpy array containing a
-                segmentation mask in position Z
-            segmentationZ1: a 2 dimensional numpy array containing a
-                segmentation mask adjacent to segmentationZ0
-            n0: an integer with the index of the object (cell/nuclei)
-                to be compared between the provided segmentation masks
-        Returns:
-            a tuple (n1, f0, f1) containing the label of the cell in Z1
-            overlapping n0 (n1), the fraction of n0 overlaping n1 (f0) and
-            the fraction of n1 overlapping n0 (f1)
-        """
-    
-        z1Indexes = np.unique(segmentationZ1[segmentationZ0 == n0])
-    
-        z1Indexes = z1Indexes[z1Indexes > 0]
-    
-        if z1Indexes.shape[0] > 0:
-    
-            # calculate overlap fraction
-            n0Area = np.count_nonzero(segmentationZ0 == n0)
-            n1Area = np.zeros(len(z1Indexes))
-            overlapArea = np.zeros(len(z1Indexes))
-    
-            for ii in range(len(z1Indexes)):
-                n1 = z1Indexes[ii]
-                n1Area[ii] = np.count_nonzero(segmentationZ1 == n1)
-                overlapArea[ii] = np.count_nonzero((segmentationZ0 == n0) *
-                                                   (segmentationZ1 == n1))
-    
-            n0OverlapFraction = np.asarray(overlapArea / n0Area)
-            n1OverlapFraction = np.asarray(overlapArea / n1Area)
-            index = list(range(len(n0OverlapFraction)))
-    
-            # select the nuclei that has the highest fraction in n0 and n1
-            r1, r2, indexSorted = zip(*sorted(zip(n0OverlapFraction,
-                                                  n1OverlapFraction,
-                                                  index),
-                                      key=lambda x:x[0]+x[1],
-                                      reverse=True))
-                  
-            if (n0OverlapFraction[indexSorted[0]] > fraction_threshold0 and
-                    n1OverlapFraction[indexSorted[0]] > fraction_threshold1):
-                return (z1Indexes[indexSorted[0]],
-                        n0OverlapFraction[indexSorted[0]],
-                        n1OverlapFraction[indexSorted[0]])
-            else:
-                return (False, False, False)
-        else:
-            return (False, False, False)
-
-    def combine_2d_segmentation_masks_into_3d(self, segmentationOutput:
-                                              np.ndarray) -> np.ndarray:
-        """Take a 3 dimensional segmentation masks and relabel them so that
-        nuclei in adjacent sections have the same label if the area their
-        overlap surpases certain threshold
-        Args:
-            segmentationOutput: a 3 dimensional numpy array containing the
-                segmentation masks arranged as (z, x, y).
-        Returns:
-            ndarray containing a 3 dimensional mask arranged as (z, x, y) of
-                relabeled segmented cells
-        """
-    
-        # Initialize empty array with size as segmentationOutput array
-        segmentationCombinedZ = np.zeros(segmentationOutput.shape)
-    
-        # copy the mask of the section farthest to the coverslip to start
-        segmentationCombinedZ[-1, :, :] = segmentationOutput[-1, :, :]
-        
-        # starting far from coverslip
-        for z in range(segmentationOutput.shape[0]-1, 0, -1):
-    
-            # get non-background cell indexes for plane Z
-            zIndex = np.unique(segmentationCombinedZ[z, :, :])[
-                                    np.unique(segmentationCombinedZ[z, :, :]) > 0]
-    
-            # get non-background cell indexes for plane Z-1
-            zm1Index = np.unique(segmentationOutput[z-1, :, :])[
-                                    np.unique(segmentationOutput[z-1, :, :]) > 0]
-            assigned_zm1Index = []
-            
-            # compare each cell in z0
-            for n0 in zIndex:
-                n1, f0, f1 = self.get_overlapping_objects(segmentationCombinedZ[z, :, :],
-                                                     segmentationOutput[z-1, :, :],
-                                                     n0)
-                if n1:
-                    segmentationCombinedZ[z-1, :, :][
-                        (segmentationOutput[z-1, :, :] == n1)] = n0
-                    assigned_zm1Index.append(n1)
-            
-            # keep the un-assigned indices in the Z-1 plane
-            unassigned_zm1Index = [i for i in zm1Index if i not in assigned_zm1Index]
-            max_current_id = np.max(segmentationCombinedZ[z-1:, :, :])
-            for i in range(len(unassigned_zm1Index)):
-                unassigned_id = unassigned_zm1Index[i]
-                segmentationCombinedZ[z-1, :, :][
-                        (segmentationOutput[z-1, :, :] == unassigned_id)] = max_current_id + 1 +i
-     
-        return segmentationCombinedZ
-
-    def _read_image_stack(self, fov: int, channelIndex: int) -> np.ndarray:
-        warpTask = self.dataSet.load_analysis_task(
-            self.parameters['warp_task'])
-        return np.array([warpTask.get_aligned_image(fov, channelIndex, z)
-                         for z in range(len(self.dataSet.get_z_positions()))])
-
-    def _save_tiff_images(self, fov, filename_prefix, image_stack):
-        '''Save a stack of images as a tiff file.'''
-        with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
-             for i in range(image_stack.shape[0]):
-                    outputTif.save(image_stack[i].astype(np.float32),
-                                   photometric='MINISBLACK',
-                                   contiguous=True)
-
-
-    def _run_analysis(self, fragmentIndex):
-
-        globalTask = self.dataSet.load_analysis_task(
-                self.parameters['global_align_task'])
-
-        # read channel index
-        channel_ids = self.dataSet.get_data_organization().get_data_channel_index(
-                self.parameters['channel_name'])
-
-        # read images and perform segmentation
-        seg_images = self._read_image_stack(fragmentIndex, channel_ids)
-
-        # preprocess the images 
-        seg_images_pp = self.preprocess_image_channels(seg_images)
-
-        if self.parameters['dump_preprocessed_images']:
-            self._save_tiff_images(fragmentIndex, 'preprocessed_seg_images', seg_images_pp)
-
-        # Combine the images into a stack
-        zero_images = np.zeros(seg_images.shape)
-        stacked_images = np.stack((zero_images, zero_images, seg_images_pp), axis=3)
-            
-        # if path_to_user_model exist, override and use user model
-        if self.parameters['path_to_user_model']:
-            model = cellpose.models.CellposeModel(pretrained_model=self.parameters['path_to_user_model'])
-
-            # Run the cellpose prediction 
-            masks, flows, styles    = model.eval(stacked_images, 
-                                            diameter=None, 
-                                            do_3D=False, channels=[3, 0],
-                                            resample=True, min_size=self.parameters['min_size'])
-        else:
-            # Load the cellpose model. 'cyto2' performs better than 'cyto'.
-            # Use also for dapi 
-            model = cellpose.models.Cellpose(gpu=self.parameters['use_gpu'], model_type=self.parameters['model_type'])
-
-            # Run the cellpose prediction 
-            masks, flows, styles, diams = model.eval(stacked_images, 
-                                                diameter=self.parameters['diameter'], 
-                                                do_3D=False, channels=[3, 0], 
-                                                resample=True, min_size=self.parameters['min_size'])
-
-        # Combine 2D segmentation to 3D segmentation
-        if len(masks.shape) == 3: 
-            masks3d = self.combine_2d_segmentation_masks_into_3d(masks)
-        else:
-            masks3d = np.array([masks])
-        
-        if self.parameters['dump_segmented_masks']:
-            self._save_tiff_images(fragmentIndex, 'segmented_mask', masks3d)
-
-        # Get the boundary features
-        zPos = np.array(self.dataSet.get_data_organization().get_z_positions())
-        featureList = [spatialfeature.SpatialFeature.feature_from_label_matrix(
-            (masks3d == i), fragmentIndex,
-            globalTask.fov_to_global_transform(fragmentIndex), zPos)
-            for i in np.unique(masks3d) if i != 0]
-
-        featureDB = self.get_feature_database()
-        featureDB.write_features(featureList, fragmentIndex)
-
-
 class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
 
     """
-    An analysis task that determines the boundaries of features in the
-    image data in each field of view using cellpose (https://github.com/
-    MouseLand/cellpose).
+    Segment the cells of each field of view with Cellpose-SAM (cellpose >= 4,
+    https://github.com/MouseLand/cellpose), from one channel.
 
-    3D implementation for spinning disk
+    The model is `path_to_user_model` if set (a path, or a cellpose-4 model
+    name such as a fine-tuned cpsam), otherwise `model_type` ('cpsam_v2').
+    By default every z plane is segmented in 2D and stitched into 3D
+    (`stitch_threshold`); `cellpose_3D_stitching: false` runs cellpose's 3D
+    mode instead. `z_index` segments that one plane only and repeats its
+    outlines on every plane, so barcodes from all planes are partitioned
+    into these 2D cells. `diameter` null runs at native resolution (cpsam
+    needs no diameter); a value scales the image by 30 / diameter.
 
+    Writes the cell outlines (feature database), segmented_mask<fov>.tif
+    (labels, zlib) and feature_labels_<fov>.csv (mask label -> feature id).
     """
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
         if 'diameter' not in self.parameters:
-            self.parameters['diameter'] = 50
+            self.parameters['diameter'] = None
         if 'channel_name' not in self.parameters:
             self.parameters['channel_name'] = 'DAPI'
-        
-        # better to supply a user trained model
         if 'model_type' not in self.parameters:
-            self.parameters['model_type'] = 'cyto2' # specify cp model if not using user trained model path
+            self.parameters['model_type'] = 'cpsam_v2'
         if 'path_to_user_model' not in self.parameters:
             self.parameters['path_to_user_model'] = False
-            
-        # save mask file
+
         if 'dump_segmented_masks' not in self.parameters:
             self.parameters['dump_segmented_masks'] = True
-        # save the raw images
         if 'dump_segmented_images' not in self.parameters:
             self.parameters['dump_segmented_images'] = True
-        # only save for certain FOVs?
         if 'dump_segmented_FOVs' not in self.parameters:
             self.parameters['dump_segmented_FOVs'] = list(range(self.fragment_count()))
 
         if 'use_gpu' not in self.parameters:
             self.parameters['use_gpu'] = False
 
+        # true: segment each plane in 2D and stitch planes whose masks overlap
+        # by stitch_threshold (IoU); false: cellpose's 3D mode, with z scaled
+        # by anisotropy (z step / pixel size)
         if 'cellpose_3D_stitching' not in self.parameters:
-            self.parameters['cellpose_3D_stitching'] = True # cellpose way of doing stitching
-            # if this is true cellpose will stitch 2D planes into 3D
-            # if this is false cellpose will run the model along the Z axis... I believe...
-
-        if 'anisotropy' not in self.parameters:
-            # not used for 3d stitching
-            # ex. 2 if z is samples half as dense as XY
-            # so should be z step size / pixel size
-            self.parameters['anisotropy'] = 1 
+            self.parameters['cellpose_3D_stitching'] = True
         if 'stitch_threshold' not in self.parameters:
             self.parameters['stitch_threshold'] = 0.4
-            # CP model.eval documentation:
-            # if stitch_threshold>0.0 and not do_3D, masks are stitched in 3D to return volume segmentation
-            
-        # downsample to save on memory for cellpose
-            # ex downsample_factor 2 will reduce the image size in half, but keep the same number of z planes
+        if 'anisotropy' not in self.parameters:
+            self.parameters['anisotropy'] = 1
+
+        # shrink the images by this factor before cellpose to save memory;
+        # the masks are scaled back up
         if 'downsample_factor' not in self.parameters:
             self.parameters['downsample_factor'] = None
+
+        # segment only this z index and put its outlines on every z plane
+        if 'z_index' not in self.parameters:
+            self.parameters['z_index'] = None
+
+        if 'flow_threshold' not in self.parameters:
+            self.parameters['flow_threshold'] = 0.4
+        if 'cellprob_threshold' not in self.parameters:
+            self.parameters['cellprob_threshold'] = 0.0
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -770,533 +232,165 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
     def get_cell_boundaries(self) -> List[spatialfeature.SpatialFeature]:
         featureDB = self.get_feature_database()
         return featureDB.read_features()
+
+    def _load_cellpose_model(self):
+        if CELLPOSE_MAJOR < 4:
+            raise RuntimeError(
+                '%s needs cellpose >= 4 (Cellpose-SAM); this environment has '
+                'cellpose %s' % (type(self).__name__,
+                                 importlib.metadata.version('cellpose')))
+        return cellpose.models.CellposeModel(
+            gpu=self.parameters['use_gpu'],
+            pretrained_model=(self.parameters['path_to_user_model']
+                              or self.parameters['model_type']))
+
+    def _eval_cellpose(self, model, images, diameter, channelAxis):
+        """Masks [z, y, x] for a z-first stack, [z, y, x] or [z, y, x, c];
+        channels are used in the order given."""
+        kwargs = dict(diameter=diameter, z_axis=0, channel_axis=channelAxis,
+                      flow_threshold=self.parameters['flow_threshold'],
+                      cellprob_threshold=self.parameters['cellprob_threshold'])
+        if self.parameters['cellpose_3D_stitching']:
+            kwargs.update(do_3D=False,
+                          stitch_threshold=self.parameters['stitch_threshold'])
+        else:
+            kwargs.update(do_3D=True, anisotropy=self.parameters['anisotropy'])
+        # copy: cellpose normalises a float32 input in place
+        masks = model.eval(np.array(images, copy=True), **kwargs)[0]
+        # eval squeezes a single plane to 2D
+        return masks.reshape(images.shape[:3])
 
     def _read_image_stack(self, fov: int, channelIndex: int) -> np.ndarray:
         warpTask = self.dataSet.load_analysis_task(
             self.parameters['warp_task'])
         zPositions = self.dataSet.get_z_positions()
         zIndices = [self.dataSet.position_to_z_index(z) for z in zPositions]
-
-        # check - get aligned images is asking for zIndex not z position
+        if self.parameters['z_index'] is not None:
+            zIndices = [self.parameters['z_index']]
         return np.array([warpTask.get_aligned_image(fov, channelIndex, z)
                          for z in zIndices])
+
+    def _segmentation_images(self, fov):
+        """The images cellpose segments and their channel axis (None: one
+        channel)."""
+        channel = self.dataSet.get_data_organization().get_data_channel_index(
+            self.parameters['channel_name'])
+        return self._read_image_stack(fov, channel), None
+
+    def _extend_to_all_planes(self, masks):
+        """The one segmented plane (z_index) repeated on every z plane."""
+        return np.repeat(masks.reshape((1,) + masks.shape[-2:]),
+                         len(self.dataSet.get_z_positions()), axis=0)
+
+    def _features_from_masks(self, masks, fov, transformationMatrix, zPos):
+        """One feature per label of a [z, y, x] label image. Same result as
+        feature_from_label_matrix(masks == label) on the whole image (~0.4 s
+        per label at 2048 x 2048 x 8), computed on the label's bounding box
+        plus a 1 px margin, which is all its contours depend on, and shifted
+        back through the transform. Also returns the labels, in feature order."""
+        rows, cols = masks.shape[1:]
+        features, labels = [], []
+        for region in measure.regionprops(masks):
+            _, r0, c0, _, r1, c1 = region.bbox
+            r0, c0 = max(r0 - 1, 0), max(c0 - 1, 0)
+            r1, c1 = min(r1 + 1, rows), min(c1 + 1, cols)
+            # contour points are (x, y) = (column, row)
+            shift = np.array([[1, 0, c0], [0, 1, r0], [0, 0, 1]], dtype=float)
+            features.append(
+                spatialfeature.SpatialFeature.feature_from_label_matrix(
+                    masks[:, r0:r1, c0:c1] == region.label, fov,
+                    transformationMatrix @ shift, zPos))
+            labels.append(region.label)
+        return features, labels
+
+    def _save_feature_labels(self, fov, features, labels):
+        """feature_labels_<fov>.csv: mask label -> feature id, so later tasks
+        (FilterCells) can map cells back onto segmented_mask<fov>.tif."""
+        self.dataSet.save_dataframe_to_csv(
+            pandas.DataFrame({'label': labels, 'feature_id': [
+                str(f.get_feature_id()) for f in features]}),
+            'feature_labels', self, fov, index=False)
 
     def _save_tiff_images(self, fov, filename_prefix, image_stack):
         '''Save a stack of images as a tiff file.'''
         with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
-            if len(image_stack.shape)>2:
+            if len(image_stack.shape) == 3:
+                # one call -> one [z, y, x] series of z pages (zlib); written
+                # frame by frame, compressed pages would each be a series
+                outputTif.write(image_stack,photometric='MINISBLACK',compression='zlib')
+            elif len(image_stack.shape)>2:
                 for frame in image_stack:
-                    outputTif.save(frame,photometric='MINISBLACK',contiguous=True)
+                    outputTif.write(frame,photometric='MINISBLACK',contiguous=True)
             else:
-                outputTif.save(image_stack,photometric='MINISBLACK',contiguous=True)
+                outputTif.write(image_stack,photometric='MINISBLACK',compression='zlib')
 
-    ###
-    # make a reader for segmented masks
-    # is this the best place to do this?
-    # probably should be in dataset...
-    # note we need to load a zIndex not a frameIndex or a zPosition
+    # reader for the segmented masks (used by Decode/Optimize with
+    # use_segmentation_mask); takes a z index, not a frame or z position
     def _load_mask_image(self, fov, zIndex, filename_prefix = 'segmented_mask'):
         imagePath = self.dataSet._analysis_image_name(self, filename_prefix, fov)
         return self.dataSet.load_image(imagePath, zIndex, transform = False)
-    ###
 
     def _run_analysis(self, fragmentIndex):
-
         globalTask = self.dataSet.load_analysis_task(
                 self.parameters['global_align_task'])
+        images, channelAxis = self._segmentation_images(fragmentIndex)
+        model = self._load_cellpose_model()
 
-        # read channel index
-        channel_ids = self.dataSet.get_data_organization().get_data_channel_index(
-                self.parameters['channel_name'])
+        diameter = self.parameters['diameter']
+        factor = self.parameters['downsample_factor']
+        if factor is not None:
+            fullShape = images.shape
+            images = transform.resize(
+                images, (fullShape[0], int(fullShape[1] / factor),
+                         int(fullShape[2] / factor)) + fullShape[3:],
+                preserve_range=True).astype(images.dtype)
+            if diameter:
+                diameter = diameter / factor
 
-        # read images and perform segmentation
-        seg_images = self._read_image_stack(fragmentIndex, channel_ids)
+        masks = self._eval_cellpose(model, images, diameter, channelAxis)
 
-        # select the model    
-        # if path_to_user_model exist, override and use user model
-        if self.parameters['path_to_user_model']:
-            model = cellpose.models.CellposeModel(
-                            gpu = self.parameters['use_gpu'],
-                            pretrained_model=self.parameters['path_to_user_model'])
-        else:
-            model = cellpose.models.Cellpose(gpu=self.parameters['use_gpu'],
-                                             model_type=self.parameters['model_type'])
+        if factor is not None:
+            masks = transform.resize(masks, fullShape[:3], order=0,
+                                     preserve_range=True).astype(masks.dtype)
+        if self.parameters['z_index'] is not None:
+            masks = self._extend_to_all_planes(masks)
 
-        # downsample the image to save on memory
-        if self.parameters['downsample_factor'] is not None:
-            factor = self.parameters['downsample_factor']
-            num_frames, rows_i, cols_i = seg_images.shape
-            rows_f = int(rows_i / factor)
-            cols_f = int(cols_i / factor)
-            seg_images = transform.resize(seg_images, [num_frames,rows_f,cols_f],
-                preserve_range = True).astype(seg_images.dtype)
-            # scale the diameter factor too
-            self.parameters['diameter'] = self.parameters['diameter']/factor
-
-        # evaluate the model using one of two ways, 3d vs 2d stitching
-        # 2d stitching seems smoother imo
-        if self.parameters['cellpose_3D_stitching']:
-            # 2d-3d stitching method
-            cellpose_output = model.eval(seg_images, 
-                                            diameter = self.parameters['diameter'], 
-                                            do_3D = False,
-                                            channels = [0,0], channel_axis=0, 
-                                            stitch_threshold=self.parameters['stitch_threshold']
-                                            )
-        else:
-            # 3d anisotropy method
-            cellpose_output = model.eval(seg_images, 
-                                            diameter = self.parameters['diameter'], 
-                                            do_3D = True,
-                                            channels = [0,0], channel_axis=0, 
-                                            anisotropy = self.parameters['anisotropy']
-                                            )
-                                            
-        # only take the mask output of cellpose
-        # do it this way since sometimes cellpose responds with 3 or 4 outputs... weird...
-        masks = cellpose_output[0]
-        
-        # upsample the mask image if it was downsampled
-        if self.parameters['downsample_factor'] is not None:
-            masks = transform.resize(masks, [num_frames,rows_i,cols_i],
-                order = 0,
-                preserve_range = True).astype(masks.dtype)
-        
         if self.parameters['dump_segmented_masks'] and fragmentIndex in self.parameters['dump_segmented_FOVs']:
             self._save_tiff_images(fragmentIndex, 'segmented_mask', masks)
         if self.parameters['dump_segmented_images'] and fragmentIndex in self.parameters['dump_segmented_FOVs']:
-            self._save_tiff_images(fragmentIndex, 'segmented_images', seg_images)
+            self._save_tiff_images(fragmentIndex, 'segmented_images', images)
 
-        # Get the boundary features
         zPos = np.array(self.dataSet.get_data_organization().get_z_positions())
+        featureList, labels = self._features_from_masks(
+            masks, fragmentIndex,
+            globalTask.fov_to_global_transform(fragmentIndex), zPos)
+        self._save_feature_labels(fragmentIndex, featureList, labels)
+        self.get_feature_database().write_features(featureList, fragmentIndex)
 
-        mask_values = np.unique(masks)[1:] # ignore the zero mask value
-
-        featureList = [spatialfeature.SpatialFeature.feature_from_label_matrix(
-                        (masks == val),
-                        fragmentIndex,
-                        globalTask.fov_to_global_transform(fragmentIndex),
-                        zPos) for val in mask_values]
-
-        featureDB = self.get_feature_database()
-        featureDB.write_features(featureList, fragmentIndex)
 
 class CellPoseSegmentTwoChannel3D(CellPoseSegmentSingleChannel3D):
 
     """
-    An analysis task that determines the boundaries of features in the
-    image data in each field of view using cellpose (https://github.com/
-    MouseLand/cellpose).
-
-    3D implementation for spinning disk
-    For two channel images
+    CellPoseSegmentSingleChannel3D on two channels, stacked
+    [channel_1_name, channel_2_name] (e.g. polyT, DAPI) in that order.
     """
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
-        if 'diameter' not in self.parameters:
-            self.parameters['diameter'] = 120
-
         if 'channel_1_name' not in self.parameters:
-            self.parameters['channel_1_name'] = 'polyT' # maybe sharper to segment on
+            self.parameters['channel_1_name'] = 'polyT'
         if 'channel_2_name' not in self.parameters:
             self.parameters['channel_2_name'] = 'DAPI'
 
-        # cellpose channel selector, [cytoplasm, nucleus], 1-indexed into the
-        # stacked [channel_1, channel_2] image with 0 meaning grayscale.
-        # This used to be hardcoded to [0, 1], which is a no-op for the second
-        # channel: any channels[0]==0 makes cellpose average the stack down to
-        # one grayscale plane and zero the nuclear plane, so channel_2 never
-        # reached the model. Measured on this dataset (FOV 107, z3, membrane +
-        # DAPI, CP_20260301_mem_dapi_v3, diameter 95): [0,1] -> 26 cells,
-        # identical to [0,0] -> 26, versus [1,2] -> 194.
-        if 'cellpose_channels' not in self.parameters:
-            self.parameters['cellpose_channels'] = [1, 2]
-
-    def _run_analysis(self, fragmentIndex):
-
-        globalTask = self.dataSet.load_analysis_task(
-                self.parameters['global_align_task'])
-
-        # read channel index
-        channel_1_id = self.dataSet.get_data_organization().get_data_channel_index(
-                self.parameters['channel_1_name'])
-                # read channel index
-        channel_2_id = self.dataSet.get_data_organization().get_data_channel_index(
-                self.parameters['channel_2_name'])
-
-        # read images and perform segmentation
-        seg_images_1 = self._read_image_stack(fragmentIndex, channel_1_id)
-        seg_images_2 = self._read_image_stack(fragmentIndex, channel_2_id)
-
-        # select the model    
-        # if path_to_user_model exist, override and use user model
-        if self.parameters['path_to_user_model']:
-            model = cellpose.models.CellposeModel(
-                            gpu = self.parameters['use_gpu'],
-                            pretrained_model=self.parameters['path_to_user_model'])
-        else:
-            model = cellpose.models.Cellpose(
-                            gpu=self.parameters['use_gpu'],
-                            model_type=self.parameters['model_type'])
-
-        # downsample the image to save on memory
-        if self.parameters['downsample_factor'] is not None:
-            factor = self.parameters['downsample_factor']
-            num_frames, rows_i, cols_i = seg_images_1.shape
-            rows_f = int(rows_i / factor)
-            cols_f = int(cols_i / factor)
-            # do both channels assuming they are the same shape
-            seg_images_1 = transform.resize(seg_images_1, [num_frames,rows_f,cols_f],
-                preserve_range = True).astype(seg_images_1.dtype)
-            seg_images_2 = transform.resize(seg_images_2, [num_frames,rows_f,cols_f],
-                preserve_range = True).astype(seg_images_2.dtype)
-
-            # scale the diameter factor too
-            self.parameters['diameter'] = self.parameters['diameter']/factor
-
-        seg_images = np.stack([seg_images_1, seg_images_2], axis = 3) # this should be a [z,x,y,c] stack
-
-        # evaluate the model using one of two ways, 3d vs 2d stitching
-        # 2d stitching seems smoother imo
-        if self.parameters['cellpose_3D_stitching']:
-            # 2d-3d stitching method
-            if seg_images.shape[0]==1:
-                seg_images=np.concatenate((seg_images,seg_images))
-                cellpose_output = model.eval(seg_images, 
-                                            diameter=self.parameters['diameter'],
-                                            do_3D = False,
-                                            channels = self.parameters['cellpose_channels'],
-                                            stitch_threshold=self.parameters['stitch_threshold']
-                                            )
-                cellpose_output=cellpose_output[0]
-            else:
-                cellpose_output = model.eval(seg_images, 
-                                            diameter=self.parameters['diameter'],
-                                            do_3D = False,
-                                            channels = self.parameters['cellpose_channels'],
-                                            stitch_threshold=self.parameters['stitch_threshold']
-                                            )
-        else:
-            # 3d anisotropy method
-            cellpose_output = model.eval(seg_images, 
-                                            diameter = self.parameters['diameter'], 
-                                            do_3D = True,
-                                            channels = self.parameters['cellpose_channels'], channel_axis=3,
-                                            anisotropy = self.parameters['anisotropy']
-                                            )
-                                            
-        # only take the mask output of cellpose
-        # do it this way since sometimes cellpose responds with 3 or 4 outputs... weird...
-        masks = cellpose_output[0]
-        if len(masks.shape)<3:
-            masks = masks[None, ...]
-            
-        # upsample the mask image if it was downsampled
-        if self.parameters['downsample_factor'] is not None:
-            masks = transform.resize(masks, [num_frames,rows_i,cols_i],
-                order = 0,
-                preserve_range = True).astype(masks.dtype)
-        
-        if self.parameters['dump_segmented_masks'] and fragmentIndex in self.parameters['dump_segmented_FOVs']:
-            self._save_tiff_images(fragmentIndex, 'segmented_mask', masks)
-        if self.parameters['dump_segmented_images'] and fragmentIndex in self.parameters['dump_segmented_FOVs']:
-            self._save_tiff_images(fragmentIndex, 'segmented_images', seg_images)
-
-        # Get the boundary features
-        zPos = np.array(self.dataSet.get_data_organization().get_z_positions())
-        mask_values = np.unique(masks)[1:] # ignore the zero mask value
-
-        featureList = [spatialfeature.SpatialFeature.feature_from_label_matrix(
-                        (masks == val),
-                        fragmentIndex,
-                        globalTask.fov_to_global_transform(fragmentIndex),
-                        zPos) for val in mask_values]
-
-        featureDB = self.get_feature_database()
-        featureDB.write_features(featureList, fragmentIndex)
-
-class CellPoseSegmentMultiChannel(FeatureSavingAnalysisTask):
-
-    """
-    An analysis task that determines the boundaries of features in the
-    image data in each field of view using cellpose (https://github.com/
-    MouseLand/cellpose).
-
-    """
-
-    def __init__(self, dataSet, parameters=None, analysisName=None):
-        super().__init__(dataSet, parameters, analysisName)
-
-        # if 'method' not in self.parameters:
-        #     self.parameters['method'] = 'cellpose'
-        if 'diameter' not in self.parameters:
-            self.parameters['diameter'] = 50
-        if 'channel_names' not in self.parameters:
-            self.parameters['channel_names'] = ['polyT','DAPI']
-        if 'channels' not in self.parameters:
-            self.parameters['channels'] = [1,2]
-        if 'flow_threshold' not in self.parameters:
-            self.parameters['flow_threshold'] = 0.4
-        if 'cellprob_threshold' not in self.parameters:
-            self.parameters['cellprob_threshold'] = 0.0
-        if 'model_type' not in self.parameters:
-            self.parameters['model_type'] = 'cyto2' 
-        if 'path_to_user_model' not in self.parameters:
-            self.parameters['path_to_user_model'] = False
-        if 'dump_preprocessed_images' not in self.parameters:
-            self.parameters['dump_preprocessed_images'] = True
-        if 'dump_segmented_masks' not in self.parameters:
-            self.parameters['dump_segmented_masks'] = True
-        if 'min_size' not in self.parameters:
-            self.parameters['min_size'] = 15
-        if 'use_gpu' not in self.parameters:
-            self.parameters['use_gpu'] = False
-
-    def fragment_count(self):
-        return len(self.dataSet.get_fovs())
-
-    def get_estimated_memory(self):
-        # TODO - refine estimate
-        return 2048
-
-    def get_estimated_time(self):
-        # TODO - refine estimate
-        return 5
-
-    def get_dependencies(self):
-        return [self.parameters['warp_task'],
-                self.parameters['global_align_task']]
-
-    def get_cell_boundaries(self) -> List[spatialfeature.SpatialFeature]:
-        featureDB = self.get_feature_database()
-        return featureDB.read_features()
-
-    def scale_image(self, img, saturation_percentile=99.9):
-        return np.minimum(img, np.percentile(img, saturation_percentile))
-
-    def high_pass_filter_individual_z(self, image, sigma, truncate):
-        lowpass = np.array([scipy.ndimage.gaussian_filter(image[z], sigma, mode='nearest', truncate=truncate)
-                           for z in range(image.shape[0])])
-        gauss_highpass = image - lowpass
-        gauss_highpass[lowpass > image] = 0
-        return gauss_highpass
-
-    def adaptive_equalize_hist_individual_z(self, image, clip_limit=0.03):
-        image_normalized = [image[z] / np.max(image[z]) for z in range(image.shape[0])]
-        return np.array([exposure.equalize_adapthist(image_normalized[z], clip_limit=clip_limit) 
-                        for z in range(image.shape[0])])
-
-    def preprocess_image_channels(self, seg_image):
-        # Remove the hot-pixels
-        seg_image = self.scale_image(seg_image, 99.9)
-         
-        # Enhance the contrast by adaptive histogram equalization
-        seg_image = self.adaptive_equalize_hist_individual_z(seg_image, clip_limit=0.05)
-
-        return seg_image
-
-    def get_overlapping_objects(self, segmentationZ0: np.ndarray,
-                                segmentationZ1: np.ndarray,
-                                n0: int,
-                                fraction_threshold0: float=0.2,
-                                fraction_threshold1: float=0.2) -> Tuple[np.float64, 
-                                                  np.float64, np.float64]:
-        """compare cell labels in adjacent image masks
-        Args:
-            segmentationZ0: a 2 dimensional numpy array containing a
-                segmentation mask in position Z
-            segmentationZ1: a 2 dimensional numpy array containing a
-                segmentation mask adjacent to segmentationZ0
-            n0: an integer with the index of the object (cell/nuclei)
-                to be compared between the provided segmentation masks
-        Returns:
-            a tuple (n1, f0, f1) containing the label of the cell in Z1
-            overlapping n0 (n1), the fraction of n0 overlaping n1 (f0) and
-            the fraction of n1 overlapping n0 (f1)
-        """
-    
-        z1Indexes = np.unique(segmentationZ1[segmentationZ0 == n0])
-    
-        z1Indexes = z1Indexes[z1Indexes > 0]
-    
-        if z1Indexes.shape[0] > 0:
-    
-            # calculate overlap fraction
-            n0Area = np.count_nonzero(segmentationZ0 == n0)
-            n1Area = np.zeros(len(z1Indexes))
-            overlapArea = np.zeros(len(z1Indexes))
-    
-            for ii in range(len(z1Indexes)):
-                n1 = z1Indexes[ii]
-                n1Area[ii] = np.count_nonzero(segmentationZ1 == n1)
-                overlapArea[ii] = np.count_nonzero((segmentationZ0 == n0) *
-                                                   (segmentationZ1 == n1))
-    
-            n0OverlapFraction = np.asarray(overlapArea / n0Area)
-            n1OverlapFraction = np.asarray(overlapArea / n1Area)
-            index = list(range(len(n0OverlapFraction)))
-    
-            # select the nuclei that has the highest fraction in n0 and n1
-            r1, r2, indexSorted = zip(*sorted(zip(n0OverlapFraction,
-                                                  n1OverlapFraction,
-                                                  index),
-                                      key=lambda x:x[0]+x[1],
-                                      reverse=True))
-                  
-            if (n0OverlapFraction[indexSorted[0]] > fraction_threshold0 and
-                    n1OverlapFraction[indexSorted[0]] > fraction_threshold1):
-                return (z1Indexes[indexSorted[0]],
-                        n0OverlapFraction[indexSorted[0]],
-                        n1OverlapFraction[indexSorted[0]])
-            else:
-                return (False, False, False)
-        else:
-            return (False, False, False)
-
-    def combine_2d_segmentation_masks_into_3d(self, segmentationOutput:
-                                              np.ndarray) -> np.ndarray:
-        """Take a 3 dimensional segmentation masks and relabel them so that
-        nuclei in adjacent sections have the same label if the area their
-        overlap surpases certain threshold
-        Args:
-            segmentationOutput: a 3 dimensional numpy array containing the
-                segmentation masks arranged as (z, x, y).
-        Returns:
-            ndarray containing a 3 dimensional mask arranged as (z, x, y) of
-                relabeled segmented cells
-        """
-    
-        # Initialize empty array with size as segmentationOutput array
-        segmentationCombinedZ = np.zeros(segmentationOutput.shape)
-    
-        # copy the mask of the section farthest to the coverslip to start
-        segmentationCombinedZ[-1, :, :] = segmentationOutput[-1, :, :]
-        
-        # starting far from coverslip
-        for z in range(segmentationOutput.shape[0]-1, 0, -1):
-    
-            # get non-background cell indexes for plane Z
-            zIndex = np.unique(segmentationCombinedZ[z, :, :])[
-                                    np.unique(segmentationCombinedZ[z, :, :]) > 0]
-    
-            # get non-background cell indexes for plane Z-1
-            zm1Index = np.unique(segmentationOutput[z-1, :, :])[
-                                    np.unique(segmentationOutput[z-1, :, :]) > 0]
-            assigned_zm1Index = []
-            
-            # compare each cell in z0
-            for n0 in zIndex:
-                n1, f0, f1 = self.get_overlapping_objects(segmentationCombinedZ[z, :, :],
-                                                     segmentationOutput[z-1, :, :],
-                                                     n0)
-                if n1:
-                    segmentationCombinedZ[z-1, :, :][
-                        (segmentationOutput[z-1, :, :] == n1)] = n0
-                    assigned_zm1Index.append(n1)
-            
-            # keep the un-assigned indices in the Z-1 plane
-            unassigned_zm1Index = [i for i in zm1Index if i not in assigned_zm1Index]
-            max_current_id = np.max(segmentationCombinedZ[z-1:, :, :])
-            for i in range(len(unassigned_zm1Index)):
-                unassigned_id = unassigned_zm1Index[i]
-                segmentationCombinedZ[z-1, :, :][
-                        (segmentationOutput[z-1, :, :] == unassigned_id)] = max_current_id + 1 +i
-     
-        return segmentationCombinedZ
-
-    def _read_image_stack(self, fov: int, channelIndex: int) -> np.ndarray:
-        warpTask = self.dataSet.load_analysis_task(
-            self.parameters['warp_task'])
-        return np.array([warpTask.get_aligned_image(fov, channelIndex, z)
-                         for z in range(len(self.dataSet.get_z_positions()))])
-
-    def _save_tiff_images(self, fov, filename_prefix, image_stack):
-        '''Save a stack of images as a tiff file.'''
-        with self.dataSet.writer_for_analysis_images(self, filename_prefix, fov) as outputTif:
-             for i in range(image_stack.shape[0]):
-                    outputTif.save(image_stack[i].astype(np.float32),
-                                   photometric='MINISBLACK',
-                                   contiguous=True)
+    def _segmentation_images(self, fov):
+        dataOrganization = self.dataSet.get_data_organization()
+        stacks = [self._read_image_stack(
+            fov, dataOrganization.get_data_channel_index(self.parameters[name]))
+            for name in ('channel_1_name', 'channel_2_name')]
+        return np.stack(stacks, axis=3), 3
 
 
-    def _run_analysis(self, fragmentIndex):
-
-        globalTask = self.dataSet.load_analysis_task(
-                self.parameters['global_align_task'])
-
-        for i, channelName in enumerate(self.parameters['channel_names']):
-            ch_id = self.dataSet.get_data_organization().get_data_channel_index(channelName)
-            ch_imgStack = self._read_image_stack(fragmentIndex,ch_id)
-            ch_imgStack = np.expand_dims(ch_imgStack,axis=1)
-            
-            if i == 0:
-                finalStack = ch_imgStack
-            else:
-                finalStack = np.concatenate((finalStack,ch_imgStack),axis = 1)
-
-        # read channel index
-        #channel_ids = self.dataSet.get_data_organization().get_data_channel_index(
-        #        self.parameters['channel_name'])
-
-        # read images and perform segmentation
-        #seg_images = self._read_image_stack(fragmentIndex, channel_ids)
-
-        # preprocess the images 
-        #seg_images_pp = self.preprocess_image_channels(seg_images)
-
-        if self.parameters['dump_preprocessed_images']:
-            self._save_tiff_images(fragmentIndex, 'preprocessed_seg_images', finalStack)
-
-        # Combine the images into a stack
-        #zero_images = np.zeros(seg_images.shape)
-        #stacked_images = np.stack((zero_images, zero_images, seg_images_pp), axis=3)
-            
-        # if path_to_user_model exist, override and use user model
-        if self.parameters['path_to_user_model']:
-            model = cellpose.models.CellposeModel(pretrained_model=self.parameters['path_to_user_model'])
-
-            # Run the cellpose prediction 
-            masks, flows, styles    = model.eval(finalStack, 
-                                            diameter=None, 
-                                            do_3D=False, channels=self.parameters['channels'], 
-                                            resample=True, min_size=self.parameters['min_size'])
-        else:
-            # Load the cellpose model. 'cyto2' performs better than 'cyto'.
-            # Use also for dapi 
-            model = cellpose.models.Cellpose(gpu=self.parameters['use_gpu'], model_type=self.parameters['model_type'])
-
-            # Run the cellpose prediction 
-            masks, flows, styles, diams = model.eval(finalStack, 
-                                                diameter=self.parameters['diameter'], 
-                                                do_3D=False, channels=self.parameters['channels'], 
-                                                resample=True, min_size=self.parameters['min_size'])
-            #masks, flows, styles, diams = model.eval(stacked_images, 
-            #                                    diameter=self.parameters['diameter'], 
-            #                                    do_3D=False, channels=[3, 0], 
-            #                                    resample=True, min_size=self.parameters['min_size'])
-
-        # Combine 2D segmentation to 3D segmentation
-        if len(masks.shape) == 3: 
-            masks3d = self.combine_2d_segmentation_masks_into_3d(masks)
-        else:
-            masks3d = np.array([masks])
-        
-        if self.parameters['dump_segmented_masks']:
-            self._save_tiff_images(fragmentIndex, 'segmented_mask', masks3d)
-
-        # Get the boundary features
-        zPos = np.array(self.dataSet.get_data_organization().get_z_positions())
-        featureList = [spatialfeature.SpatialFeature.feature_from_label_matrix(
-            (masks3d == i), fragmentIndex,
-            globalTask.fov_to_global_transform(fragmentIndex), zPos)
-            for i in np.unique(masks3d) if i != 0]
-
-        featureDB = self.get_feature_database()
-        featureDB.write_features(featureList, fragmentIndex)
-        
-        
 class CleanCellBoundaries(analysistask.ParallelAnalysisTask):
     '''
     A task to construct a network graph where each cell is a node, and overlaps
@@ -1305,6 +399,9 @@ class CleanCellBoundaries(analysistask.ParallelAnalysisTask):
     to eliminate overlapping cells to leave a single cell occupying a given
     position.
     '''
+
+    outputGroup = 'Segment'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
@@ -1369,6 +466,9 @@ class CombineCleanedBoundaries(analysistask.AnalysisTask):
     position.
 
     """
+
+    outputGroup = 'Segment'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
@@ -1387,7 +487,9 @@ class CombineCleanedBoundaries(analysistask.AnalysisTask):
         return [self.parameters['cleaning_task']]
 
     def return_exported_data(self):
-        kwargs = {'index_col': 0}
+        # cell ids are 128-bit integers: pandas >= 3 would parse them as int,
+        # pandas 1.x as str; read them as str so they match str(feature id)
+        kwargs = {'index_col': 0, 'dtype': {'cell_id': str}}
         return self.dataSet.load_dataframe_from_csv(
             'all_cleaned_cells', analysisTask=self.analysisName, **kwargs)
 
@@ -1437,16 +539,133 @@ class RefineCellDatabases(FeatureSavingAnalysisTask):
         cleanedC = cleanedCells[cleanedCells['originalFOV'] == fragmentIndex]
         cleanedGroups = cleanedC.groupby('assignedFOV')
         for k, g in cleanedGroups:
-            cellsToConsider = g['cell_id'].values.tolist()
+            cellsToConsider = set(g['cell_id'].astype(str))
             featureList = [x for x in originalCells if
                            str(x.get_feature_id()) in cellsToConsider]
             featureDB.write_features(featureList, fragmentIndex)
+
+
+class FilterCells(FeatureSavingAnalysisTask):
+
+    """Remove non-cell objects from a cell database, using the barcodes a
+    partition assigned to each cell and its footprint in the segmentation
+    masks. It runs after a (provisional) partition because the barcode
+    criteria need assigned barcodes; partition into this task to get count
+    tables of the kept cells only.
+
+    Per fov it writes the kept cells as its feature database, cell_qc_<fov>.csv
+    with one row per segmented label (measurements and status: 'kept',
+    'overlap_duplicate' = dropped by assignment_task's overlap cleaning, or
+    the failed criteria joined by ';'), and filtered_mask<fov>.tif, an ImageJ
+    [z, c, y, x] hyperstack with c0 = segment_task's labels (before) and c1 =
+    the kept cells (after), same label ids.
+
+    Needs segment_task's dumped masks and feature_labels. Criteria, each
+    optional (null = not applied):
+        min_area_um2, min_width_um   footprint area and minor axis, on the
+                                     label's largest plane
+        min_barcodes                 coding barcodes assigned by partition_task
+        min_barcode_density          those barcodes per um2 of footprint
+    """
+
+    CRITERIA = (('min_area_um2', 'area_um2', 'small'),
+                ('min_width_um', 'width_um', 'thin'),
+                ('min_barcodes', 'barcodes', 'few_barcodes'),
+                ('min_barcode_density', 'barcode_density', 'low_density'))
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+        for key, _, _ in self.CRITERIA:
+            if key not in self.parameters:
+                self.parameters[key] = None
+        if 'write_masks' not in self.parameters:
+            self.parameters['write_masks'] = True
+
+    def fragment_count(self):
+        return len(self.dataSet.get_fovs())
+
+    def get_estimated_memory(self):
+        return 4096
+
+    def get_estimated_time(self):
+        return 1
+
+    def get_dependencies(self):
+        return [self.parameters['segment_task'],
+                self.parameters['assignment_task'],
+                self.parameters['partition_task']]
+
+    def get_cell_qc(self, fov: int) -> pandas.DataFrame:
+        return self.dataSet.load_dataframe_from_csv(
+            'cell_qc', self, fov, dtype={'feature_id': str})
+
+    def _run_analysis(self, fragmentIndex):
+        segmentTask = self.dataSet.load_analysis_task(
+            self.parameters['segment_task'])
+        assignmentTask = self.dataSet.load_analysis_task(
+            self.parameters['assignment_task'])
+        partitionTask = self.dataSet.load_analysis_task(
+            self.parameters['partition_task'])
+
+        masks = tifffile.imread(self.dataSet._analysis_image_name(
+            segmentTask, 'segmented_mask', fragmentIndex))
+        masks = masks.reshape((-1,) + masks.shape[-2:])
+        qc = _label_footprints(masks, self.dataSet.get_microns_per_pixel())
+        qc = qc.merge(self.dataSet.load_dataframe_from_csv(
+            'feature_labels', segmentTask, fragmentIndex,
+            dtype={'feature_id': str}), on='label', how='left')
+
+        cells = {str(c.get_feature_id()): c for c in
+                 assignmentTask.get_feature_database().read_features(
+                     fragmentIndex)}
+        counts = partitionTask.get_partitioned_barcodes(fragmentIndex)
+        counts.index = counts.index.astype(str)
+        codebook = self.dataSet.load_analysis_task(
+            partitionTask.parameters['filter_task']).get_codebook()
+        blanks = {codebook.get_name_for_barcode_index(i)
+                  for i in codebook.get_blank_indexes()}
+        coding = [g for g in counts.columns if g not in blanks]
+        qc['barcodes'] = counts[coding].sum(axis=1).reindex(
+            qc.feature_id).values
+        qc['barcode_density'] = qc.barcodes / qc.area_um2
+
+        status = []
+        for row in qc.itertuples():
+            if row.feature_id not in cells:
+                status.append('overlap_duplicate')
+                continue
+            failed = [reason for key, column, reason in self.CRITERIA
+                      if self.parameters[key] is not None
+                      and getattr(row, column) < self.parameters[key]]
+            status.append(';'.join(failed) if failed else 'kept')
+        qc['status'] = status
+        kept = qc.status == 'kept'
+
+        self.get_feature_database().write_features(
+            [cells[i] for i in qc.feature_id[kept]], fragmentIndex)
+        self.dataSet.save_dataframe_to_csv(
+            qc, 'cell_qc', self, fragmentIndex, index=False)
+
+        if self.parameters['write_masks']:
+            keep = np.zeros(masks.max() + 1, bool)
+            keep[qc.label[kept].values] = True
+            tifffile.imwrite(
+                self.dataSet._analysis_image_name(
+                    self, 'filtered_mask', fragmentIndex),
+                np.stack([masks, np.where(keep[masks], masks, 0)],
+                         axis=1).astype(np.uint16),
+                imagej=True, compression='zlib',
+                metadata={'axes': 'ZCYX', 'Labels': [
+                    '%s z%d' % (c, z) for z in range(masks.shape[0])
+                    for c in ('before', 'after')]})
 
 
 class ExportCellMetadata(analysistask.AnalysisTask):
     """
     An analysis task exports cell metadata.
     """
+
+    outputGroup = 'Export'
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)

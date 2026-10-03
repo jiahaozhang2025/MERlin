@@ -3,7 +3,6 @@ import cProfile
 import os
 import json
 import sys
-import snakemake
 import time
 import requests
 from typing import TextIO
@@ -220,6 +219,9 @@ def run_with_snakemake(
         dataSet: dataset.MERFISHDataSet, snakefilePath: str, coreCount: int,
         snakemakeParameters: Dict = {}, report: bool = False):
     print('Running MERlin pipeline through snakemake')
+    # imported here: generating tasks and running them with -t need no
+    # snakemake (this snakemake.snakemake() call is the snakemake 7 API)
+    import snakemake
     snakemake.snakemake(snakefilePath, 
                         cores=coreCount,
                         workdir=dataSet.get_snakemake_path(),

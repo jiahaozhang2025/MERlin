@@ -10,6 +10,7 @@ from merlin.core import analysistask
 from merlin.util import deconvolve
 from merlin.util import aberration
 from merlin.util import imagefilters
+from merlin.util import imagesample
 from merlin.data import codebook
 
 from skimage import transform
@@ -20,6 +21,8 @@ class Preprocess(analysistask.ParallelAnalysisTask):
     """
     An abstract class for preparing data for barcode calling.
     """
+
+    outputGroup = 'Prepare'
 
     def _image_name(self, fov):
         destPath = self.dataSet.get_analysis_subdirectory(
@@ -53,6 +56,43 @@ class DeconvolutionPreprocess(Preprocess):
         # transfer function is 1 - exp(-|k|^2 / (2 sigma^2)) with |k| measured in
         # FFT bins from the centred spectrum, matching the fft_hp3 filter that
         # won the M1 preprocessing comparison. Off by default; 0 disables it.
+        if 'highpass_clip' not in self.parameters:
+            # Zero the negative half of image - blur(image). True is the stock
+            # behaviour and stays the default; imagefilters.highpass_filter
+            # documents what it costs. Do NOT combine False with
+            # OptimizeIteration -- the rectified pedestal props up the measured
+            # on-bit mean of low-SNR bits, so removing it drives their scale
+            # factors lower still. Clip removal belongs on an ImageScaleFactors
+            # path only.
+            self.parameters['highpass_clip'] = True
+        if 'clip_stage' not in self.parameters:
+            # WHERE the clip happens, when highpass_clip is True.
+            #   'highpass' -- stock: rectify immediately after image - blur(image),
+            #                 so the lowpass then smears the rectified noise into a
+            #                 positive pedestal across the whole plane. Measured on
+            #                 synthetic planes with realistic spot density: pedestal
+            #                 +5.04, median 3.60, nothing at exactly zero.
+            #   'lowpass'  -- rectify AFTER the lowpass instead. The smoothing then
+            #                 operates on the symmetric signal, so positive and
+            #                 negative excursions cancel locally before anything is
+            #                 discarded. Same non-negativity guarantee, 2.6x smaller
+            #                 pedestal (+1.92), median back to 0.0000 with 56.6 per
+            #                 cent of pixels exactly zero, and the spot peak is
+            #                 preserved identically to not clipping at all
+            #                 (219.83 against 219.83, versus 220.96 for 'highpass').
+            #
+            # DEFAULT is 'lowpass' as of 2026-09-25 (was 'highpass'). The
+            # rectified pedestal is what makes pure background decode as one
+            # specific codeword -- with it, a background pixel's nearest codeword
+            # on 20260609 lib1 is Opalin, rank 1 of 246; without it, rank 246 --
+            # and on lib2 the same mechanism floods empty glass with Lmo1.
+            # Tasks created BEFORE this change recorded 'highpass' in their
+            # task.json and keep it; only new tasks pick up the new default.
+            # CAUTION, still to be measured end to end: OptimizeIteration's
+            # barcode loop leans on the pedestal to prop up the on-bit mean of
+            # low-SNR bits, so a smaller pedestal can push their scale factors
+            # lower. Pair with the per-bit bias freeze if dim bits run away.
+            self.parameters['clip_stage'] = 'lowpass'
         if 'fft_highpass_sigma' not in self.parameters:
             self.parameters['fft_highpass_sigma'] = 0
         if 'fft_highpass_clip' not in self.parameters:
@@ -83,11 +123,20 @@ class DeconvolutionPreprocess(Preprocess):
         if 'codebook_index' not in self.parameters:
             self.parameters['codebook_index'] = 0
         
-        # add some options to save preprocessed images
+        # Example images, on by default for a few fovs and one plane. The fovs
+        # and plane come from merlin.util.imagesample with write_images_seed,
+        # the same draw Decode and the adaptive filters make, so all three
+        # write the same fields. write_preprocessed_z None = every plane.
+        if 'write_images_seed' not in self.parameters:
+            self.parameters['write_images_seed'] = imagesample.DEFAULT_SEED
         if 'write_preprocessed_images' not in self.parameters:
-            self.parameters['write_preprocessed_images'] = False                
-        if 'write_preprocessed_FOVs' not in self.parameters:
-            self.parameters['write_preprocessed_FOVs'] = list(range(self.fragment_count()))
+            self.parameters['write_preprocessed_images'] = True
+        if 'write_preprocessed_FOVs' not in self.parameters \
+                or 'write_preprocessed_z' not in self.parameters:
+            fovs, zIndexes = imagesample.default_image_selection(
+                self.dataSet, self.parameters['write_images_seed'])
+            self.parameters.setdefault('write_preprocessed_FOVs', fovs)
+            self.parameters.setdefault('write_preprocessed_z', zIndexes)
         if 'save_pixel_histogram' not in self.parameters:
             self.parameters['save_pixel_histogram'] = True
         if 'deconvolve_after_highpass' not in self.parameters:
@@ -111,6 +160,10 @@ class DeconvolutionPreprocess(Preprocess):
             self.parameters['preprocess_threads'] = 1
 
         self._highPassSigma = self.parameters['highpass_sigma']
+        self._highPassClip = self.parameters['highpass_clip']
+        self._clipStage = str(self.parameters['clip_stage']).lower()
+        if self._clipStage not in ('highpass', 'lowpass'):
+            raise ValueError("clip_stage must be 'highpass' or 'lowpass'")
         self._fftHighPassSigma = self.parameters['fft_highpass_sigma']
         self._fftHighPassClip = self.parameters['fft_highpass_clip']
         self._fftTransfer = None            # cached per image shape
@@ -199,7 +252,10 @@ class DeconvolutionPreprocess(Preprocess):
             highPassFilterSize = int(2 * np.ceil(2 * self._highPassSigma) + 1)
             hpImage = imagefilters.highpass_filter(inputImage.astype(np.float32),
                                                     highPassFilterSize,
-                                                    self._highPassSigma)
+                                                    self._highPassSigma,
+                                                    clip=(self._highPassClip
+                                                          and self._clipStage
+                                                          == 'highpass'))
         return hpImage.astype(np.float32)
 
     def _fft_transfer(self, shape) -> np.ndarray:
@@ -295,25 +351,36 @@ class DeconvolutionPreprocess(Preprocess):
             borderType=cv2.BORDER_REPLICATE).astype(np.float32)
 
     def _run_analysis(self, fragmentIndex):
-            
-        if self.parameters['save_pixel_histogram'] or (fragmentIndex in self.parameters['write_preprocessed_FOVs']):
-    
-            warpTask = self.dataSet.load_analysis_task(
-                    self.parameters['warp_task'])
+        # Nothing is kept from preprocessing except the pixel histograms and the
+        # example images, so a fov that needs neither is a no-op.
+        saveHistogram = self.parameters['save_pixel_histogram']
+        writeImages = (self.parameters['write_preprocessed_images'] and
+                       fragmentIndex in self.parameters['write_preprocessed_FOVs'])
+        if not (saveHistogram or writeImages):
+            return
 
+        warpTask = self.dataSet.load_analysis_task(
+                self.parameters['warp_task'])
+
+        processZ = self._get_z_indexes_to_preprocess()
+        histogramZ = processZ if saveHistogram else []
+        writeZ = self._get_z_indexes_to_write(processZ) if writeImages else []
+        zIndexes = sorted(set(histogramZ) | set(writeZ))
+
+        if saveHistogram:
+            # only used to estimate initial scale factors
             histogramBins = np.arange(0, np.iinfo(np.uint16).max, 1)
             pixelHistogram = np.zeros(
                     (self.get_codebook().get_bit_count(), len(histogramBins)-1))
 
-                # this currently only is to calculate the pixel histograms in order
-                # to estimate the initial scale factors. This is likely unnecessary?
-            
-            outputTif = None
-            zIndexes = self._get_z_indexes_to_preprocess()
+        # one multi-page tif per fov: every bit at each written plane, in
+        # codebook bit order
+        outputTif = None
+        try:
             for bi, b in enumerate(self.get_codebook().get_bit_names()):
                 dataChannel = self.dataSet.get_data_organization()\
                         .get_data_channel_for_bit(b)
-                
+
                 for i in zIndexes:
                     inputImage = warpTask.get_aligned_image(
                             fragmentIndex, dataChannel, i)
@@ -321,20 +388,40 @@ class DeconvolutionPreprocess(Preprocess):
                         deconvolvedImage = self._preprocess_image(inputImage)
                     else:
                         deconvolvedImage = self._preprocess_image_reversed(inputImage)
-                    
-                    pixelHistogram[bi, :] += np.histogram(
-                        deconvolvedImage.astype(np.uint16), bins=histogramBins)[0]
-                        
-                    if self.parameters['write_preprocessed_images'] and fragmentIndex in self.parameters['write_preprocessed_FOVs']:
+
+                    if i in histogramZ:
+                        pixelHistogram[bi, :] += np.histogram(
+                            deconvolvedImage.astype(np.uint16),
+                            bins=histogramBins)[0]
+
+                    if i in writeZ:
                         if outputTif is None:
                             outputTif = self.dataSet.writer_for_analysis_images(
-                                self.analysisName, 'preprocessed_images', fragmentIndex).__enter__() 
-                        outputTif.save(deconvolvedImage, photometric='MINISBLACK')
-                            
+                                self.analysisName, 'preprocessed_images',
+                                fragmentIndex).__enter__()
+                        outputTif.write(deconvolvedImage, photometric='MINISBLACK')
+        finally:
             if outputTif is not None:
                 outputTif.__exit__(None, None, None)
-            
+
+        if saveHistogram:
             self._save_pixel_histogram(pixelHistogram, fragmentIndex)
+
+    def _get_z_indexes_to_write(self, processZ: list[int]) -> list[int]:
+        """Planes to write example images for, among those preprocessed.
+
+        Falls back to the first preprocessed plane if none of the requested
+        ones is preprocessed, as Decode does, so the fov still leaves an image.
+        """
+        requested = self.parameters.get('write_preprocessed_z')
+        if requested is None:
+            return list(processZ)
+        if not isinstance(requested, (list, tuple)):
+            requested = [requested]
+        zIndexes = [int(z) for z in requested if int(z) in processZ]
+        if not zIndexes and processZ:
+            zIndexes = [processZ[0]]
+        return zIndexes
 
     def _get_z_indexes_to_preprocess(self) -> list[int]:
         zPositionCount = len(self.dataSet.get_z_positions())
@@ -357,9 +444,18 @@ class DeconvolutionPreprocess(Preprocess):
         filteredImage = self._highpass_filter(filteredImage)
         filteredImage = self._subtract_global_threshold(filteredImage)
         if self.parameters['lowpass_after_deconvolution']:
-            return self._lowpass_filter(self._deconvolve(filteredImage))
-        filteredImage = self._lowpass_filter(filteredImage)
-        return self._deconvolve(filteredImage)
+            filteredImage = self._lowpass_filter(
+                self._deconvolve(filteredImage))
+        else:
+            filteredImage = self._deconvolve(
+                self._lowpass_filter(filteredImage))
+        return self._clip_after_lowpass(filteredImage)
+
+    def _clip_after_lowpass(self, inputImage: np.ndarray) -> np.ndarray:
+        """Rectify at the very end, if clip_stage says so. No-op otherwise."""
+        if self._highPassClip and self._clipStage == 'lowpass':
+            return np.maximum(inputImage, 0)
+        return inputImage
 
     def _preprocess_image_reversed(self, inputImage: np.ndarray) -> np.ndarray:
         deconvolvedImage = self._deconvolve(inputImage.astype(np.float32))
@@ -647,7 +743,7 @@ class DeconvolutionPreprocessDW(Preprocess):
                 
                 for zPosition in self.dataSet.get_z_positions():
                         frame = self.dataSet.get_raw_image(dataChannel, fragmentIndex, zPosition)
-                        outputTif.save(frame, photometric='MINISBLACK')
+                        outputTif.write(frame, photometric='MINISBLACK')
 
             # this is the path of the image that was just saved
             inputImagePath = self.get_raw_image_path(dataChannel, fragmentIndex)

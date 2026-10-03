@@ -30,6 +30,17 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   worker only when `chromatic_from_fragments` is disabled.
 - `chromatic_max_groups`: Limits the FOV/z workers used for chromatic fitting
   only when `chromatic_from_fragments` is disabled.
+- `OptimizeLoop`: Writes a chain of optimize iterations once in the analysis
+  json. It expands into ordinary `OptimizeIteration` tasks
+  `<name>1 .. <name>N`, linked by `previous_iteration`, and these are identical
+  to a hand-written chain. Loop parameters: `iterations` (default 10),
+  `random_seeds` or `random_seed_start` (default seeds 1..N), `per_iteration`
+  (per-iteration values of any other parameter), `iteration_task`,
+  `previous_iteration`, and `num_workers` (spawned processes for fragments;
+  default 1). Every other parameter goes to every iteration. Running the loop
+  runs the unfinished iterations in order and finalizes each one. It is
+  complete once its last iteration is, including when the iterations were run
+  by name. As an `optimize_task` it answers with its last iteration.
 
 ### Preprocess (`merlin/analysis/preprocess.py`)
 
@@ -50,6 +61,93 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   decoding distance, and area.
 - `l2_regularization`: Controls regularization strength for the logistic filter.
 - `max_iterations`: Limits logistic-model optimization iterations.
+
+### Example images (Preprocess, Decode, adaptive filters; `merlin/util/imagesample.py`)
+
+- On by default in all three: `write_preprocessed_images` now defaults to
+  `True`; Decode and the adaptive filters already did.
+- `write_images_seed` (default 1): When `write_*_FOVs` or `write_*_z` is not
+  given, 3 fovs and one z plane are drawn at random from this seed. All three
+  tasks draw the same way, so by default they write the same fovs and plane.
+  The draw is stored in `task.json`. Explicit lists are kept as they are.
+- `write_preprocessed_z`: New. The planes Preprocess writes; `None` means every
+  preprocessed plane. Preprocess no longer runs at all for a fov that needs
+  neither a histogram nor an image.
+- `decoded_image_format`: `'tif'` (default) writes one 2D file per output
+  channel per written plane, `images/decoded_<channel>_fov<fov>_z<z>.tif`, for
+  `barcodes`, `magnitude`, `distance`, and `unique_id` when
+  `write_unique_id_images` is on. `'zarr'` keeps the old single array per fov.
+  `Decode.get_decoded_image` reads either format.
+- The adaptive filters read decoded images through `get_decoded_image`, so they
+  work on old zarr decodes too. `AdaptiveFilterBarcodesLocal` now writes
+  filtered images as well. A failed filtered-image write is logged as a warning
+  and no longer fails the fragment.
+
+### Grouped output layout (`merlin/core/dataset.py`, `merlin/util/regroup.py`)
+
+- New datasets put each task folder under a group folder and the dataset files
+  under `Files`:
+  - `Prepare`: GlobalAlign, warps, Preprocess
+  - `Optimize`: OptimizeLoop and its iterations, ImageScaleFactors
+  - `Decode`: Decode, Threshold, the barcode filters
+  - `Segment`: segmentation, CleanBoundaries, CombineBoundaries, RefineCells,
+    FilterCells
+  - `Export`: Partition, ExportPartitioned, ExportBarcodes, CellMetadata,
+    SumSignal
+  - `Other`: anything else (GenerateMosaic, PlotPerformance, SlurmReport)
+  - `Files`: codebooks, data organization, file map, positions, microscope
+    parameters, `dataset.json`
+
+  `snakemake/` and `logs/` stay at the top level.
+- The group is the task class's `outputGroup` attribute, inherited by
+  subclasses. A task that already has a folder is used wherever it is, so
+  changing a group never orphans finished output.
+- A dataset whose `dataset.json` is at the top level was created before this
+  change and keeps the flat layout. Nothing about it changes.
+- `python -m merlin.util.regroup ANALYSIS_HOME/<dataset>` moves a flat dataset
+  into the grouped layout: it shows the plan, and moves only with `--apply`. It
+  refuses while fragments are unfinished or relative symlinks would break, and
+  writes the move list to `logs/`. Regenerate the Snakefile afterwards.
+- Scripts that build task paths themselves (`$DS/$T/tasks/...`) have to look
+  under the group folder. `dataSet.get_analysis_subdirectory(name)` works in
+  both layouts.
+
+### Segmentation: Cellpose-SAM only (`merlin/analysis/segment.py`)
+
+- Segmentation now uses only Cellpose-SAM, i.e. cellpose >= 4 with models such as `cpsam_v2`.
+  `CellPoseSegment`, `CellPoseSegmentSingleChannel`, `CellPoseSegmentMultiChannel` and every
+  cellpose 2/3 code path were removed. The old code is in the history before this change.
+  cellpose 4 cannot load cellpose 2/3 models, so datasets segmented with them are
+  re-segmented with cpsam (or a cpsam fine-tune).
+- `CellPoseSegmentSingleChannel3D` / `CellPoseSegmentTwoChannel3D` (the latter stacks
+  `[channel_1_name, channel_2_name]`) now share one `_run_analysis`.
+- The model is `path_to_user_model` (a path, or a cellpose-4 model name) or else
+  `model_type`, which now defaults to `cpsam_v2`. `diameter: null`, the new default, runs
+  at native resolution; a value scales the image by 30 / diameter. `flow_threshold` and
+  `cellprob_threshold` are passed to cellpose; before, `flow_threshold` was ignored.
+- The module still imports under older cellpose, so its non-cellpose tasks run anywhere.
+  A cellpose task raises a clear error there.
+- `z_index`: Segments one z plane and repeats its outlines on every plane, so
+  `PartitionBarcodes` assigns barcodes from all planes to these 2D cells. This is the
+  middle-plane convention of Vizgen/Allen, e.g. Yao 2023, 10.1038/s41586-023-06812-z.
+- Cell outlines are traced on each label's bounding box. The polygons are identical, and
+  this takes ~1 s per fov instead of ~0.4 s per cell.
+- New outputs: `feature_labels_<fov>.csv` maps each mask label to its feature id. The
+  `segmented_mask` / `segmented_images` dumps are zlib-compressed, ~0.5 MB instead of
+  67 MB per fov; a z-stack is written in one call, so it stays one series.
+- `FilterCells` (new task): Removes non-cell objects after a provisional partition,
+  because its barcode criteria need assigned barcodes:
+  - `min_area_um2`, `min_width_um`: footprint area and minor axis on the label's
+    largest plane
+  - `min_barcodes`, `min_barcode_density`: coding barcodes from `partition_task`, and
+    the same per um2 of footprint
+
+  Every criterion is optional. It writes the kept cells as its feature database,
+  `cell_qc_<fov>.csv` (every label with its measurements and status: `kept`,
+  `overlap_duplicate`, or the failed criteria), and `filtered_mask<fov>.tif` (ImageJ
+  [z, c, y, x]: c0 = segmented labels, c1 = kept cells). Partition into `FilterCells` to
+  get tables of the kept cells. Chain used for 20260909 DS-4: Segment -> CleanBoundaries
+  -> CombineBoundaries -> RefineCells -> PartitionQC -> FilterCells -> Partition*.
 
 ## Minor changes
 
@@ -115,10 +213,19 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 - `write_filtered_FOVs`: Selects FOVs for filtered-image output.
 - `write_filtered_z`: Selects z planes for filtered-image output.
 
-### Segmentation (`merlin/analysis/segment.py`)
+### Segmentation (`merlin/analysis/segment.py`, `merlin/util/spatialfeature.py`)
 
-- `cellpose_channels`: Selects the two Cellpose input channels and defaults to
-  `[1, 2]`, fixing the previous two-channel configuration.
+- `cellpose_channels` (a cellpose 2/3 channel selector) was removed with the old
+  cellpose code; cpsam reads the channels in the order they are stacked.
+- `read_feature_metadata`: A fov with no features returns an empty table instead
+  of failing, so `ExportCellMetadata` works when a filter empties a fov.
+- `contains_positions`: Rounds z without writing into its input array. With
+  pandas >= 3, `DataFrame.values` is read-only, and the old in-place write failed.
+- Cell ids read back from CSV are strings under every pandas version. They are 128-bit
+  integers, which pandas >= 3 parses as int and pandas 1.x as str. The change covers
+  `CombineCleanedBoundaries.return_exported_data`, `get_partitioned_barcodes` and
+  `get_sum_signals`. Before it, `RefineCellDatabases` under pandas 3 matched no
+  cells and silently wrote empty databases. It also uses a set lookup now.
 
 ### Restoration (`merlin/analysis/preprocess.py`, `merlin/analysis/modelrestore.py`)
 
@@ -147,6 +254,50 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
 - Registration metrics: Saves per-channel x/y shifts, registration error, and
   phase difference.
 
+#### `DeconvolutionPreprocess` clip stage default
+
+- `clip_stage`: now defaults to **`lowpass`** (was `highpass`). The negative
+  clip happens after the lowpass instead of straight after the highpass, which
+  shrinks the rectified-noise pedestal on background about 2.6x. That pedestal
+  is what makes empty background decode as one specific codeword. Tasks created
+  before the change keep the `highpass` recorded in their task.json. Caution:
+  the barcode optimize loop leans on the pedestal for low-SNR bits.
+
+#### `FiducialPolynomialWarp3D` z-fit gate and neighbour substitution
+
+- `z_polynomial_order`: Now defaults to **1**, not 3. Gel expansion between
+  rounds is a bulk strain and so linear in depth; leave-one-out over the
+  sampled planes on 20260609 gives 0.098 um for order 1 against 0.124 for
+  order 3, and order 1 wins on 84% of stacks. `xy_polynomial_order` is
+  unchanged at 3.
+- `z_min_score` (default 0.5): Drops a z sample whose peak ZNCC is below it.
+- `z_reject_at_search_limit` (default True): Also drops a sample whose
+  |offset| sits on the +-(`z_search_range` x plane spacing) ceiling, which
+  means the argmax railed. The score gate alone does not catch this, because
+  ZNCC is still measured against whatever tissue lies at the edge of the
+  search.
+- `z_min_good_samples` (default 4): Below this many surviving samples no
+  polynomial is fitted; the z coefficients are zero and the round falls back
+  to its rigid xy. Without the gate, one 20260609 stack whose bead signal was
+  dead on all ten sampled planes received a 5.4 um -- eleven plane -- swing
+  out of a fit whose median swing is 0.85 um.
+- `z_neighbor_substitution` (default True), with `z_neighbor_rings_um`,
+  `z_neighbor_min_donors`, `z_neighbor_min_samples`: In `finalize()`, an
+  unfitted stack takes the pointwise-median curve of the SAME round in the
+  spatially adjacent fovs, re-fitted at `z_polynomial_order`. This is a
+  cross-fov step and so cannot run inside a per-fov fragment; it happens once,
+  from `merlin -t <task> --check-done`. It is idempotent: which stacks to
+  repair is read from `z_fit_status`, which records the gate result and is
+  never rewritten, and donors are by definition stacks that fitted.
+- `z_fit_status_<fov>.csv`: New per-fov QC output, one row per data channel,
+  recording sample counts, whether the z polynomial was fitted, and whether
+  the curve came from a fit, a neighbour, or the rigid-only path.
+- `z_neighbor_substitutions.csv`: New task-level record of every substitution
+  and its donors.
+- To restore the previous behaviour exactly: `z_min_score` 0,
+  `z_reject_at_search_limit` false, `z_min_good_samples` 0,
+  `z_neighbor_substitution` false, `z_polynomial_order` 3.
+
 ### Pipeline and compatibility
 
 - Snakemake latency wait: Increases shared-filesystem latency handling from 10
@@ -159,3 +310,18 @@ Compared with `aaronhalpern/MERlin:gpu_decoding` at commit
   with a local implementation.
 - Repository cleanup: Removes obsolete utility modules and inherited CI service
   configuration.
+- Python 3.12 / numpy 2 / pandas 3: MERlin runs in the `merlin` conda env built by
+  `envs/setup_merlin_env.sh` (Python 3.12, cellpose 4.2.1.1, numpy 2.4, pandas 3.0, torch
+  2.8 cu128, tensorflow 2.20 + csbdeep; exact versions in `envs/merlin_freeze.txt`). On
+  20260909 DS-4 inputs, RigidWarp, Decode, the adaptive filter, Optimize, Partition,
+  FilterCells, the overlap-cleaning chain (after the cell-id fix above) and the
+  metadata/partition readers give identical results to the Python 3.9 /
+  numpy 1.26 / pandas 1.5 env. GenerateAdaptiveThreshold bin edges differ by <= 6.5e-7,
+  so a few borderline barcodes change bin.
+- tifffile: `TiffWriter.save` (removed from tifffile) -> `TiffWriter.write` everywhere.
+- snakemake: Imported only when running a whole analysis json with snakemake.
+  Generating tasks and running them with `-t` need no snakemake. It is an optional
+  extra in `pyproject.toml` (`snakemake>=7,<8`; snakemake 8 removed
+  `snakemake.snakemake()`).
+- `pyproject.toml`: `numpy>=1.26` (was pinned to 1.26.4); `segmentation` extra is
+  `cellpose>=4`.

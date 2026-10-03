@@ -3,6 +3,7 @@ import pandas
 import os
 import tempfile
 import zarr
+import tifffile
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -13,6 +14,11 @@ from merlin.util import decoding
 from merlin.util import barcodedb
 from merlin.data.codebook import Codebook
 from merlin.util import barcodefilters
+from merlin.util import imagesample
+
+# Output channels of a decoded plane, in the order _process_independent_z_slice
+# returns them; unique_id only exists with write_unique_id_images.
+DECODED_IMAGE_CHANNELS = ('barcodes', 'magnitude', 'distance', 'unique_id')
 
 
 def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
@@ -59,12 +65,22 @@ class BarcodeSavingParallelAnalysisTask(analysistask.ParallelAnalysisTask):
     def _reset_analysis(self, fragmentIndex: int = None) -> None:
         super()._reset_analysis(fragmentIndex)
 
-        ### testing this for resumable decoding ###
-        if 'resumable_z_decoding' not in self.parameters:
+        # Empty unless resumable decoding is explicitly ON.
+        #
+        # This used to key off the ABSENCE of 'resumable_z_decoding', with an
+        # `elif ... == True` for the present-and-true case -- so
+        # present-and-FALSE matched neither branch and the table was neither
+        # emptied nor deliberately kept. Re-running such a fragment appended a
+        # second copy of every barcode, silently. Measured on 20260609: fov 0
+        # of BFDecode and fov 20 of L2DecodeL each held every row exactly
+        # twice, which propagates through the filters and inflates counts and
+        # any enrichment computed from them. Every Decode task in this project
+        # sets the key explicitly, so every one of them was exposed.
+        if not self.parameters.get('resumable_z_decoding', False):
             self.parameters['resumable_z_decoding'] = False
             print(f'emptying barcode database for fragment {fragmentIndex}')
             self.get_barcode_database().empty_database(fragmentIndex)
-        elif self.parameters['resumable_z_decoding'] == True:
+        else:
             print(f'keeping barcode database for fragment {fragmentIndex}')
 
     def get_barcode_database(self) -> barcodedb.BarcodeDB:
@@ -80,6 +96,8 @@ class Decode(BarcodeSavingParallelAnalysisTask):
     """
     An analysis task that extracts barcodes from images.
     """
+
+    outputGroup = 'Decode'
 
     def __init__(self, dataSet: dataset.MERFISHDataSet,
                  parameters=None, analysisName=None):
@@ -116,17 +134,31 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             self.parameters['crop_in_image_space'] = True
         if 'write_decoded_images' not in self.parameters:
             self.parameters['write_decoded_images'] = True
-        # Default to one fov and one z plane rather than everything: a decoded
-        # image per fov per plane is enormous, which is why runs used to switch
-        # this off entirely and end up with nothing to look at. One plane of
-        # one fov is cheap and always worth having.
-        if 'write_decoded_FOVs' not in self.parameters:
-            self.parameters['write_decoded_FOVs'] = [0]
-        if 'write_decoded_z' not in self.parameters:
-            # None = save every decoded plane; otherwise a list of zIndexes
-            self.parameters['write_decoded_z'] = [0]
+        # Default to a few fovs and one z plane rather than everything: a
+        # decoded image per fov per plane is enormous, which is why runs used to
+        # switch this off entirely and end up with nothing to look at. The fovs
+        # and plane come from merlin.util.imagesample with write_images_seed,
+        # the same draw Preprocess and the adaptive filters make, so all three
+        # write the same fields. write_decoded_z None = every decoded plane.
+        if 'write_images_seed' not in self.parameters:
+            self.parameters['write_images_seed'] = imagesample.DEFAULT_SEED
+        if 'write_decoded_FOVs' not in self.parameters \
+                or 'write_decoded_z' not in self.parameters:
+            fovs, zIndexes = imagesample.default_image_selection(
+                self.dataSet, self.parameters['write_images_seed'])
+            self.parameters.setdefault('write_decoded_FOVs', fovs)
+            self.parameters.setdefault('write_decoded_z', zIndexes)
+        # 'tif': one 2D file per output channel per written plane,
+        #   images/decoded_<channel>_fov<fov>_z<z>.tif, channel one of
+        #   DECODED_IMAGE_CHANNELS (unique_id only with write_unique_id_images).
+        # 'zarr': the previous single (z, channel, y, x) float32 array per fov.
+        # Either way read them back with get_decoded_image.
+        if 'decoded_image_format' not in self.parameters:
+            self.parameters['decoded_image_format'] = 'tif'
+        if self.parameters['decoded_image_format'] not in ('tif', 'zarr'):
+            raise ValueError("decoded_image_format must be 'tif' or 'zarr'")
         if 'minimum_area' not in self.parameters:
-            self.parameters['minimum_area'] = 0
+            self.parameters['minimum_area'] = 2
         if 'distance_threshold' not in self.parameters:
             self.parameters['distance_threshold'] = 0.5167
         # Buffer added around each tile so objects spanning a tile edge survive.
@@ -327,7 +359,9 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         else:
             zarrChannels = 3
             
-        if self.parameters['write_decoded_images'] and (fragmentIndex in self.parameters['write_decoded_FOVs']):
+        writeZarr = self.parameters['decoded_image_format'] == 'zarr'
+        if writeZarr and self.parameters['write_decoded_images'] \
+                and (fragmentIndex in self.parameters['write_decoded_FOVs']):
             zarr_path = self.dataSet._analysis_zarr_name(self, "decoded", fragmentIndex)
             zarr_out = zarr.open(zarr_path, mode = 'a',
                 shape = (zPositionCount, zarrChannels, *imageShape),
@@ -367,11 +401,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                     and (fragmentIndex in self.parameters['write_decoded_FOVs']) \
                     and zIndex in writeZIndexes:
                 with self._sliceWriteLock:
-                    zarr_out[zIndex,0,:,:] = outputImages[0]
-                    zarr_out[zIndex,1,:,:] = outputImages[1]
-                    zarr_out[zIndex,2,:,:] = outputImages[2]
-                    if self.parameters['write_unique_id_images']:
-                        zarr_out[zIndex,3,:,:] = outputImages[3]
+                    if writeZarr:
+                        zarr_out[zIndex,0,:,:] = outputImages[0]
+                        zarr_out[zIndex,1,:,:] = outputImages[1]
+                        zarr_out[zIndex,2,:,:] = outputImages[2]
+                        if self.parameters['write_unique_id_images']:
+                            zarr_out[zIndex,3,:,:] = outputImages[3]
+                    else:
+                        self._write_decoded_tifs(
+                            fragmentIndex, zIndex, outputImages)
 
         perZThreads, tilingThreads, _ = self._thread_allocation()
         self._pin_torch_threads(perZThreads)
@@ -470,6 +508,54 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             decoding.torch.set_num_threads(max(1, int(requested)))
         except Exception as e:
             print('could not set torch threads: %s' % e, flush=True)
+
+    def get_decoded_image_path(self, fov: int, zIndex: int,
+                               channel: str = 'barcodes') -> str:
+        if channel not in DECODED_IMAGE_CHANNELS:
+            raise ValueError('channel must be one of %s'
+                             % (DECODED_IMAGE_CHANNELS,))
+        return os.sep.join([
+            self.dataSet.get_analysis_subdirectory(self, subdirectory='images'),
+            'decoded_%s_fov%d_z%d.tif' % (channel, fov, zIndex)])
+
+    def _write_decoded_tifs(self, fov: int, zIndex: int, outputImages) -> None:
+        for channel, image in zip(DECODED_IMAGE_CHANNELS, outputImages):
+            tifffile.imwrite(self.get_decoded_image_path(fov, zIndex, channel),
+                             np.asarray(image, dtype=np.float32),
+                             photometric='minisblack')
+
+    def get_decoded_image(self, fov: int, zIndex: int,
+                          channel: str = 'barcodes'):
+        """One decoded plane of one output channel, from whichever format it
+        was written in (tif, or the older zarr). None if it was not written.
+
+        'barcodes' is the codeword index per pixel (-1 where nothing decoded),
+        'magnitude' the pixel trace norm, 'distance' the distance to that
+        codeword, 'unique_id' the barcode label (write_unique_id_images only).
+        """
+        path = self.get_decoded_image_path(fov, zIndex, channel)
+        if os.path.exists(path):
+            return tifffile.imread(path)
+        zarrPath = self.dataSet._analysis_zarr_name(self, 'decoded', fov)
+        if os.path.exists(zarrPath):
+            source = zarr.open(zarrPath, mode='r')
+            channelIndex = DECODED_IMAGE_CHANNELS.index(channel)
+            if zIndex < source.shape[0] and channelIndex < source.shape[1]:
+                return np.asarray(source[zIndex, channelIndex])
+        return None
+
+    def get_decoded_image_z(self, fov: int):
+        """z indexes with a decoded tif for this fov, or None when the fov
+        has an older zarr instead -- a zarr does not record which of its
+        planes were written."""
+        tifZ = [z for z in range(len(self.dataSet.get_z_positions()))
+                if os.path.exists(self.get_decoded_image_path(fov, z))]
+        if tifZ:
+            return tifZ
+        if os.path.exists(self.dataSet._analysis_zarr_name(
+                self, 'decoded', fov)):
+            return None
+        return []
 
     def _get_z_indexes_to_decode(self, zPositionCount: int) -> list[int]:
         decodeZIndex = self.parameters.get('decode_z_index')
@@ -710,15 +796,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             with self.dataSet.writer_for_analysis_images(
                     self, 'decoded', fov) as outputTif:
                 for i in range(zPositionCount):
-                    outputTif.save(decodedImages[i].astype(np.float32),
+                    outputTif.write(decodedImages[i].astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True,
                                    metadata=imageDescription)
-                    outputTif.save(magnitudeImages[i].astype(np.float32),
+                    outputTif.write(magnitudeImages[i].astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True,
                                    metadata=imageDescription)
-                    outputTif.save(distanceImages[i].astype(np.float32),
+                    outputTif.write(distanceImages[i].astype(np.float32),
                                    photometric='MINISBLACK',
                                    contiguous=True,
                                    metadata=imageDescription)

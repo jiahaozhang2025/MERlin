@@ -46,6 +46,8 @@ if _PKG not in sys.path:
 class ModelRestorePreprocess(analysistask.ParallelAnalysisTask):
     """Restore warped bit images with the trained per-FOV soft-decode model."""
 
+    outputGroup = 'Prepare'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 

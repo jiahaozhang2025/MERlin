@@ -8,6 +8,7 @@ from scipy import optimize, special
 from merlin.core import analysistask
 from merlin.analysis import decode
 from merlin.util import barcodefilters
+from merlin.util import imagesample
 
 
 def _extract_finite_threshold_candidates(blank_fraction_hist: np.ndarray,
@@ -285,6 +286,8 @@ class AbstractFilterBarcodes(decode.BarcodeSavingParallelAnalysisTask):
     An abstract class for filtering barcodes identified by pixel-based decoding.
     """
 
+    outputGroup = 'Decode'
+
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
@@ -343,6 +346,8 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
     An analysis task that generates a three-dimension mean intenisty,
     area, minimum distance histogram for barcodes as they are decoded.
     """
+
+    outputGroup = 'Decode'
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
@@ -770,14 +775,21 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         # survive, median component area 1 px. Judging decode quality from that
         # image judges the unfiltered decode. This writes the same field with
         # only the surviving barcodes, which is what should be inspected.
-        # On by default for one fov and one plane, to match Decode: the point
-        # is that every run leaves behind at least one image to eyeball.
+        # On by default for a few fovs and one plane: the point is that every
+        # run leaves behind images to eyeball. The fovs and plane come from
+        # merlin.util.imagesample with write_images_seed, the same draw
+        # Preprocess and Decode make, so the filtered image is of a field
+        # whose decoded and preprocessed images exist too.
+        if 'write_images_seed' not in self.parameters:
+            self.parameters['write_images_seed'] = imagesample.DEFAULT_SEED
         if 'write_filtered_images' not in self.parameters:
             self.parameters['write_filtered_images'] = True
-        if 'write_filtered_FOVs' not in self.parameters:
-            self.parameters['write_filtered_FOVs'] = [0]
-        if 'write_filtered_z' not in self.parameters:
-            self.parameters['write_filtered_z'] = [0]
+        if 'write_filtered_FOVs' not in self.parameters \
+                or 'write_filtered_z' not in self.parameters:
+            fovs, zIndexes = imagesample.default_image_selection(
+                self.dataSet, self.parameters['write_images_seed'])
+            self.parameters.setdefault('write_filtered_FOVs', fovs)
+            self.parameters.setdefault('write_filtered_z', zIndexes)
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -793,37 +805,53 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         from skimage import measure
         decodeTask = self.dataSet.load_analysis_task(
             self.parameters['decode_task'])
-        zarrPath = self.dataSet._analysis_zarr_name(
-            decodeTask, 'decoded', fragmentIndex)
-        if not os.path.exists(zarrPath):
+
+        # Only planes that were decoded carry anything, and only planes Decode
+        # wrote an image for can be drawn. Fall back to such a plane if the
+        # requested ones are not among them, for the same reason Decode does.
+        decodedZ = sorted(barcodes['z'].astype(int).unique().tolist())
+        imageZ = decodeTask.get_decoded_image_z(fragmentIndex)   # None = zarr
+        candidates = decodedZ if imageZ is None \
+            else [z for z in decodedZ if z in imageZ]
+        zSel = self.parameters['write_filtered_z']
+        if zSel is None:
+            zIndexes = candidates
+        else:
+            zIndexes = [z for z in zSel if z in candidates]
+            if not zIndexes and candidates:
+                zIndexes = [candidates[0]]
+        planes = [(z, decodeTask.get_decoded_image(fragmentIndex, z))
+                  for z in zIndexes]
+        planes = [(z, im) for z, im in planes if im is not None]
+        if not planes:
             self.dataSet.get_logger(self).info(
                 'no decoded image for fov %s, skipping filtered image',
                 fragmentIndex)
             return
-        source = zarr.open(zarrPath, mode='r')
 
-        # Only planes that were decoded carry anything; the rest of the zarr
-        # is zeros. Fall back to a decoded plane if the requested ones were
-        # not decoded, for the same reason Decode does.
-        decodedZ = sorted(barcodes['z'].astype(int).unique().tolist())
-        zSel = self.parameters['write_filtered_z']
-        if zSel is None:
-            zIndexes = decodedZ
-        else:
-            zIndexes = [z for z in zSel if z in decodedZ]
-            if not zIndexes and decodedZ:
-                zIndexes = [decodedZ[0]]
-        zIndexes = [z for z in zIndexes if z < source.shape[0]]
         with self.dataSet.writer_for_analysis_images(
                 self, 'filtered', fragmentIndex) as outputTif:
-            for z in zIndexes:
-                decoded = np.asarray(source[z, 0]).astype(np.int32)
+            for z, decodedImage in planes:
+                decoded = np.asarray(decodedImage).astype(np.int32)
                 labels = measure.label(decoded + 1)
                 keep = barcodes.loc[barcodes['z'] == z,
                                     'unique_id'].to_numpy(np.int64)
                 out = np.where(np.isin(labels, keep), decoded, -1)
-                outputTif.save(out.astype(np.float32),
+                outputTif.write(out.astype(np.float32),
                                photometric='MINISBLACK', contiguous=True)
+
+    def _write_filtered_images_if_requested(self, fragmentIndex,
+                                            barcodes) -> None:
+        """The example image is for looking at, so it must never fail the
+        fragment whose barcodes are already written."""
+        if not (self.parameters['write_filtered_images']
+                and fragmentIndex in self.parameters['write_filtered_FOVs']):
+            return
+        try:
+            self._write_filtered_images(fragmentIndex, barcodes)
+        except Exception as e:
+            self.dataSet.get_logger(self, fragmentIndex).warning(
+                'filtered image for fov %s not written: %r', fragmentIndex, e)
 
     def get_estimated_memory(self):
         return 1000
@@ -872,10 +900,7 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
             currentBarcodes = self._remove_z_duplicate_barcodes(currentBarcodes)
 
         bcDatabase.write_barcodes(currentBarcodes, fov=fragmentIndex)
-
-        if (self.parameters['write_filtered_images']
-                and fragmentIndex in self.parameters['write_filtered_FOVs']):
-            self._write_filtered_images(fragmentIndex, currentBarcodes)
+        self._write_filtered_images_if_requested(fragmentIndex, currentBarcodes)
 
 
 
@@ -1057,6 +1082,8 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
     4x4 FOV area set neighbors = 15
     NxN FOV area set neighbors = N^2 - 1
     """
+
+    outputGroup = 'Decode'
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
@@ -1424,5 +1451,7 @@ class AdaptiveFilterBarcodesLocal(AdaptiveFilterBarcodes):
         currentBarcodes = decodeTask.get_barcode_database()\
             .get_barcodes(fragmentIndex)
 
-        bcDatabase.write_barcodes(adaptiveTask.extract_barcodes_with_threshold(
-            threshold, currentBarcodes, fragmentIndex), fov=fragmentIndex)
+        currentBarcodes = adaptiveTask.extract_barcodes_with_threshold(
+            threshold, currentBarcodes, fragmentIndex)
+        bcDatabase.write_barcodes(currentBarcodes, fov=fragmentIndex)
+        self._write_filtered_images_if_requested(fragmentIndex, currentBarcodes)
