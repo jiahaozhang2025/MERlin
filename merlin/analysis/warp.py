@@ -1133,8 +1133,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         The rigid offset and the plane WALK still run, and both are worth
         having: on the five fovs whose 2D nuclear frame is weak the walk moves
         the answer by up to 3.8 px and raises the confidence from snr 36 to
-        320. Only the polynomial is skipped; its coefficients are written as
-        zero.
+        320. Only the depth fit is skipped: the z coefficients are zero and
+        the y/x polynomials are the constant rigid offset, so the
+        transformation table carries the rigid xy at every plane.
 
         Accepts channel names or indices. Empty by default.
         """
@@ -1847,9 +1848,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 statusRows.append(dict(statusOf[owner], dataChannel=dataChannel,
                                        owner_channel=owner))
         for dataChannel, rigidY, rigidX in rigidOnlyMembers:
+            # The y/x polynomials are the TOTAL shift (a fitted channel's xy
+            # samples are measured about its rigid offset, not relative to
+            # it), and they are what the transformation table and therefore
+            # get_aligned_image apply. A rigid-only channel's polynomial is
+            # therefore the constant rigid offset, not zero: all-zero
+            # coefficients left these channels unregistered in the table.
             coefficients[dataChannel] = {
-                'z': np.zeros(zOrder + 1), 'y': np.zeros(xyOrder + 1),
-                'x': np.zeros(xyOrder + 1),
+                'z': np.zeros(zOrder + 1),
+                'y': np.r_[np.zeros(xyOrder), rigidY],
+                'x': np.r_[np.zeros(xyOrder), rigidX],
                 'rigid_y': rigidY, 'rigid_x': rigidX}
             print('fov %d channel %d: rigid only (%.2f, %.2f), no 3D warp '
                   'fitted' % (fov, dataChannel, rigidY, rigidX), flush=True)

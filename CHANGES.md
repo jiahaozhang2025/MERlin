@@ -133,6 +133,10 @@ major change was made.
   space used to estimate its scale factors and backgrounds.
 - `chromatic_max_barcodes_per_group`, `chromatic_max_groups`: Limit the barcode
   samples and FOV/z workers for chromatic fitting when `chromatic_from_fragments` is off.
+- Chromatic fit: each bit's colour is read through its data channel; the bit index was
+  used as a data-channel index, mislabelling bits whose dataorganization rows are not in
+  codebook order. The single-job path (`chromatic_from_fragments: false`) now shares the
+  fragments' measurement.
 - `scale_factor_floor_ratio` (default 0, off): Raises every scale factor to at
   least this fraction of the largest.
 - `initial_scale_factors` (`ones` or `image_mean`), `initial_scale_factor_planes`:
@@ -206,8 +210,8 @@ major change was made.
     rigid offset by stepping into the stack while correlation improves.
   - `rigid_search_bound`, `rigid_walk_bound`: Bound the first step and each
     later step of that search.
-  - `rigid_only_channels`: Channels that keep the rigid offset and skip the
-    depth fit.
+  - `rigid_only_channels`: Channels that keep the rigid offset (a constant xy in
+    the transformation table) and skip the depth fit.
   - `z_min_score`, `z_reject_at_search_limit`, `z_min_good_samples`: Drop weak
     z samples and skip the z fit when too few remain.
   - `z_neighbor_substitution` (with `z_neighbor_rings_um`,
@@ -262,6 +266,8 @@ major change was made.
   env (cellpose 4); outputs match the previous Python 3.9 env.
 - Option names are lowercase (e.g. `write_decoded_FOVs` -> `write_decoded_fovs`,
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
+- Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
+  synthetic spots, PolyWarp rigid-only channels.
 - `-i`: Accepts a fragment range (`0-25`) or list (`3,8,11`), run in one process.
 - snakemake: Imported only when running a whole analysis with snakemake; an
   optional extra.

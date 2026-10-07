@@ -334,8 +334,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         identically; only where it runs and which images it sees differ.
         """
         codebook = self.get_codebook()
-        org = self.dataSet.get_data_organization()
-        usedColors = self._get_used_colors()
+        bitColors = self._get_bit_colors()
+        usedColors = sorted(set(bitColors))
         out = {u: {v: ([], []) for v in usedColors if v >= u} for u in usedColors}
         X = barcodes['x'].to_numpy(float)
         Y = barcodes['y'].to_numpy(float)
@@ -349,8 +349,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             refined = np.array([registration.refine_position(images[i], bx, by)
                                 for i in onBits])
             for p in itertools.combinations(enumerate(onBits), 2):
-                c1 = org.get_data_channel_color(p[0][1])
-                c2 = org.get_data_channel_color(p[1][1])
+                c1 = bitColors[p[0][1]]
+                c2 = bitColors[p[1][1]]
                 if c1 < c2:
                     out[c1][c2][0].append((bx, by))
                     out[c1][c2][1].append(refined[p[1][0]] - refined[p[0][0]])
@@ -581,11 +581,24 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         print(f'total time in optimize{fragmentIndex}: {t4-t0}')
 
     def _get_used_colors(self) -> List[str]:
+        return sorted(set(self._get_bit_colors()))
+
+    def _get_bit_colors(self) -> List[str]:
+        """The colour of each codebook bit, in codebook bit order.
+
+        Images and on-bits are indexed by BIT, colours are stored per DATA
+        CHANNEL, so the colour has to be looked up through
+        get_data_channel_for_bit. The two orders differ whenever the data
+        organization lists a round's colours in a different order from the
+        codebook or carries rows that are not codebook bits; using the bit
+        index as a channel index then gives those bits the wrong colour, and
+        a cross-colour pair labelled the wrong way round enters the fit with
+        its displacement negated.
+        """
         dataOrganization = self.dataSet.get_data_organization()
-        codebook = self.get_codebook()
-        return sorted({dataOrganization.get_data_channel_color(
+        return [dataOrganization.get_data_channel_color(
             dataOrganization.get_data_channel_for_bit(x))
-            for x in codebook.get_bit_names()})
+            for x in self.get_codebook().get_bit_names()]
 
     def _calculate_initial_scale_factors(self) -> np.ndarray:
         preprocessTask = self.dataSet.load_analysis_task(
@@ -816,8 +829,6 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                 self.parameters['warp_task'])
 
             usedColors = self._get_used_colors()
-            colorPairDisplacements = {u: {v: [] for v in usedColors if v >= u}
-                                      for u in usedColors}
 
             # Each (fov, z) group is independent: it loads its own 24 warped
             # images and contributes displacement samples that are pooled into
@@ -831,8 +842,6 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
 
             def measure_group(group):
                 fov, z = group
-                local = {u: {v: [] for v in usedColors if v >= u}
-                         for u in usedColors}
                 currentBarcodes = barcodes[(barcodes['fov'] == fov)
                                            & (barcodes['z'] == z)]
                 # The fit is a 4-DOF similarity transform per colour pair, so
@@ -850,43 +859,14 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                     fov, dataOrganization.get_data_channel_for_bit(b),
                     int(z),  previousCorrector)
                     for b in codebook.get_bit_names()])
-
-                # pandas iterrows costs 14.5 us per row against 0.1 us for a
-                # plain numpy column read, which is real money next to the
-                # ~300 us of refinement it wraps
-                bcX = currentBarcodes['x'].to_numpy(float)
-                bcY = currentBarcodes['y'].to_numpy(float)
-                bcId = currentBarcodes['barcode_id'].to_numpy(int)
-                hLimit = warpedImages.shape[1] - 10
-                wLimit = warpedImages.shape[2] - 10
-                for bx, by, bid in zip(bcX, bcY, bcId):
-                    onBits = np.where(codebook.get_barcode(bid))[0]
-
-                    # TODO this can be done by crop width when decoding
-                    if bx > 10 and by > 10 and hLimit > bx and wLimit > by:
-
-                        refinedPositions = np.array(
-                            [registration.refine_position(
-                                warpedImages[i, :, :], bx, by)
-                                for i in onBits])
-                        for p in itertools.combinations(
-                                enumerate(onBits), 2):
-                            c1 = dataOrganization.get_data_channel_color(
-                                p[0][1])
-                            c2 = dataOrganization.get_data_channel_color(
-                                p[1][1])
-
-                            if c1 < c2:
-                                local[c1][c2].append(
-                                    [np.array([bx, by]),
-                                     refinedPositions[p[1][0]]
-                                     - refinedPositions[p[0][0]]])
-                            else:
-                                local[c2][c1].append(
-                                    [np.array([bx, by]),
-                                     refinedPositions[p[0][0]]
-                                     - refinedPositions[p[1][0]]])
-                return local
+                # The same measurement the per-fragment path makes. It returns
+                # (positions, displacements) arrays per colour pair, which is
+                # what the merge below unpacks; the inline copy this replaces
+                # returned lists of [position, displacement] pairs (so the
+                # merge raised "too many values to unpack") and read each
+                # bit's colour with the bit index as a data-channel index.
+                return self._measure_chromatic_samples(warpedImages,
+                                                       currentBarcodes)
 
             maxGroups = self.parameters['chromatic_max_groups']
             if maxGroups and len(groups) > maxGroups:
