@@ -211,6 +211,11 @@ major change was made.
     rigid offset by stepping into the stack while correlation improves.
   - `rigid_search_bound`, `rigid_walk_bound`: Bound the first step and each
     later step of that search.
+  - `rigid_walk_confirm` (default false): A first step far from the 2D answer
+    counts only if a wide search on the next walk plane agrees with it;
+    otherwise the walk restarts from the 2D answer. This stops a ghost peak
+    from overruling the 2D frame. The branch taken per channel goes to
+    `rigid_walk_<fov>.csv`, and far first steps get a `fit_quality_flags` row.
   - `rigid_only_channels`: Channels that keep the rigid offset (a constant xy in
     the transformation table) and skip the depth fit.
   - `z_min_score`, `z_reject_at_search_limit`, `z_min_good_samples`: Drop weak
@@ -228,6 +233,12 @@ major change was made.
     of the frame centre). `offsets_<fov>.npy` and fiducial QC images include
     the angle; `rigid_only_channels` get angle 0 and a `fit_quality_flags` row.
     Design after Lida Cheng's `rotation_correction`.
+  - `rotation_neighbor_substitution` (default true; acts only with
+    `rotation_correction`): `finalize()` gives a stack whose angle fell back to
+    0, or whose per-plane angles scatter, the median angle of the same channel
+    over neighbouring FOVs (same rings as the z substitution). The per-channel
+    verdict is in `rotation_status_<fov>.csv`; the report is
+    `rotation_neighbor_substitutions.csv`.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:

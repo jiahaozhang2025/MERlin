@@ -49,6 +49,13 @@ misidentification rate and all of `Segment`.
   offset is refined by stepping into the bead stack while the correlation
   improves. The first step may move far, to overrule a bad 2D answer; later
   steps are kept close to the running best so the search cannot drift.
+- `rigid_walk_confirm`: Turn it on when the bead field is dense and
+  self-similar, or when `rigid_search_bound` must be wide (hundreds of px). A
+  far first step then has to be confirmed one step deeper, so a ghost peak
+  cannot overrule a correct 2D answer.
+- `rotation_correction` + `rotation_neighbor_substitution`: Edge FOVs whose
+  angle cannot be measured borrow the neighbours' median angle in `finalize()`
+  (`merlin -t <task> --check-done`).
 - `max_z_fit_residual`, `max_xy_fit_residual`, `min_xy_planes_kept`: A wrong
   rigid offset shows up as a large residual of the fit on top of it; such fits
   are listed in `transformations/fit_quality_flags_<fov>.csv`.
