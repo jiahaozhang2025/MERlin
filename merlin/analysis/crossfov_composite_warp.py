@@ -92,6 +92,11 @@ class CrossFOVCompositeWarp(warp.FiducialPolynomialWarp3D):
         if self._pw is None:
             self._pw = self.dataSet.load_analysis_task(
                 self.parameters['polywarp_task'])
+            # the margins and the neighbour fill below read xshift/yshift as
+            # a pure translation; a rotated table would be filled wrongly
+            if self._pw.parameters.get('rotation_correction', False):
+                raise ValueError('CrossFOVCompositeWarp does not support a '
+                                 'PolyWarp task with rotation_correction')
         return self._pw
 
     # ------------------------------------------------------------------
