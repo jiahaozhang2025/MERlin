@@ -84,6 +84,26 @@ fiducial QC images include the stack's angle.
 The design follows Lida Cheng's `rotation_correction`, which fits the angle on
 the 2D frame.
 
+An edge FOV can have too few tiles with beads to give an angle, or give
+per-plane angles that scatter. Its angle then falls back to 0, which leaves the
+corners off by the full turn (about 2.3 px at 0.09 deg on a 2048 px frame).
+`finalize()` replaces such an angle with the median angle of the same channel
+in the neighbouring FOVs, as it already does for an unfitted z curve
+(`rotation_neighbor_substitution`). Only the angle changes. `xshift`/`yshift`
+are the displacement of the frame centre, so they stay valid under a new
+angle about that centre.
+
+*Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
+searches its first plane wide, about zero, so that it can overrule a 2D frame
+that is badly wrong. Every later plane is searched only close to the running
+best. On a dense, self-similar bead field, the wide search can lock onto a
+ghost peak hundreds of pixels from the true one, with a marginally higher
+score. No later plane then corrects it. With the option on, a first-plane
+answer far from the 2D answer must be confirmed by a wide search one walk step
+deeper. If it is not confirmed, the walk restarts from the 2D answer. The
+check starts from the first plane on purpose: two deeper planes can agree on
+the same ghost.
+
 **`CrossFOVCompositeWarp`** (from Lida Cheng). When the stage drifts between
 rounds, part of a FOV's field in a late round was imaged by the neighbouring FOV
 instead. Per-FOV registration can only mark that strip invalid, so its molecules
