@@ -100,7 +100,7 @@ best. On a dense, self-similar bead field, the wide search can lock onto a
 ghost peak hundreds of pixels from the true one, with a marginally higher
 score. No later plane then corrects it. With the option on, a first-plane
 answer far from the 2D answer must be confirmed by a wide search one walk step
-deeper. If it is not confirmed, the walk restarts from the 2D answer. The
+deeper. If it is not confirmed, the 2D answer is kept and the walk stops. The
 check starts from the first plane on purpose: two deeper planes can agree on
 the same ghost.
 

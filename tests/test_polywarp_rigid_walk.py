@@ -201,6 +201,9 @@ class RigidWalkConfirmTests(unittest.TestCase):
         self.assertNear(self.on[1], TRUE[1])
         r = self.records[1]
         self.assertEqual(r['branch'], 'rejected')
+        # the 2D answer itself is kept; the walk does not go on
+        self.assertEqual(self.on[1], (r['y_2d'], r['x_2d']))
+        self.assertEqual(r['plane'], -1)
         self.assertEqual(r['confirm_plane'], 4)
         self.assertNear((r['y_confirm'], r['x_confirm']), TRUE[1])
 
@@ -268,6 +271,8 @@ class RigidWalkTableTests(unittest.TestCase):
         walkFlags = flags[flags.reasons.str.contains('rigid walk')]
         self.assertEqual(sorted(walkFlags.dataChannel), [1, 2])
         self.assertIn('NOT confirmed', walkFlags[
+            walkFlags.dataChannel == 1].reasons.iloc[0])
+        self.assertIn('2D answer kept', walkFlags[
             walkFlags.dataChannel == 1].reasons.iloc[0])
         self.assertIn('rigid walk REJECTED', log)
         self.assertIn('rigid walk CONFIRMED', log)

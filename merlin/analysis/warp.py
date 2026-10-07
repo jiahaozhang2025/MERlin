@@ -694,8 +694,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     a self-similar bead field that wide search can also lock onto a ghost
     peak that no later plane corrects. With the option on, a first-plane
     answer far from the 2D answer must be confirmed by a wide search on the
-    next walk plane; otherwise the walk restarts from the 2D answer. The
-    branch taken per channel is written to the rigid_walk table.
+    next walk plane; otherwise the 2D answer is kept. The branch taken per
+    channel is written to the rigid_walk table.
 
     Setting z_polynomial_order and xy_polynomial_order to 1 recovers a linear
     ramp in z; setting them to 0 recovers a rigid offset per round with a
@@ -896,9 +896,12 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # first-plane answer more than rigid_walk_bound from the 2D answer is
         # accepted only if a wide search on the next walk plane
         # (rigid_plane_step deeper) lands within rigid_walk_bound of it.
-        # Otherwise the walk starts again from the 2D answer, searching every
-        # plane, the first included, only +-rigid_walk_bound about the
-        # running best. Agreement of two DEEPER planes is not used: on
+        # Otherwise the 2D answer is kept and the walk stops. Restarting the
+        # walk from the 2D answer instead (plane 0 searched tightly about it)
+        # was tried on 20260824 and is worse: that plane's local peak can sit
+        # 1.5-3.4 px from the 2D answer, and z samples measured at the offset
+        # it gives fail the gate (fov59 nuclear 4/15 good; 15/15 at the 2D
+        # answer). Agreement of two DEEPER planes is not used: on
         # 20260824 fov18 planes 4 and 8 agree on a ghost while plane 0 and the
         # 2D frame are right, so the check starts from plane 0 and its snr
         # test. False keeps the earlier behaviour exactly.
@@ -1475,12 +1478,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                     record):
                                 record['branch'] = 'confirmed'
                             else:
-                                # a ghost: restart from the 2D answer, this
-                                # plane searched tightly about it
+                                # a ghost: keep the 2D answer, stop walking
                                 record['branch'] = 'rejected'
-                                cy, cx, csnr, _ = \
-                                    self._bounded_correlation_peak(
-                                        f, m, dy, dx, bound=walkBound)
+                                break
                 else:
                     cy, cx, csnr, _ = self._bounded_correlation_peak(
                         f, m, best[0], best[1],
@@ -2518,8 +2518,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 else:
                     reason = ('rigid walk: plane 0 peak (%.1f, %.1f) %.1f px '
                               'from the 2D answer (%.1f, %.1f) NOT confirmed '
-                              'by plane %d (%.1f, %.1f); walk restarted from '
-                              'the 2D answer')
+                              'by plane %d (%.1f, %.1f); 2D answer kept')
                 values = ((record['y_2d'], record['x_2d'], record['y_first'],
                            record['x_first'], distance)
                           if record['branch'] == 'confirmed' else

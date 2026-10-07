@@ -213,7 +213,7 @@ major change was made.
     later step of that search.
   - `rigid_walk_confirm` (default false): A first step far from the 2D answer
     counts only if a wide search on the next walk plane agrees with it;
-    otherwise the walk restarts from the 2D answer. This stops a ghost peak
+    otherwise the 2D answer is kept. This stops a ghost peak
     from overruling the 2D frame. The branch taken per channel goes to
     `rigid_walk_<fov>.csv`, and far first steps get a `fit_quality_flags` row.
   - `rigid_only_channels`: Channels that keep the rigid offset (a constant xy in
