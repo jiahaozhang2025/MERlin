@@ -212,14 +212,20 @@ major change was made.
   - `rigid_search_bound`, `rigid_walk_bound`: Bound the first step and each
     later step of that search.
   - `rigid_walk_confirm` (default false): A first step far from the 2D answer
-    counts only if a wide search on the next walk plane agrees with it;
-    otherwise the 2D answer is kept. This stops a ghost peak
+    counts only if a wide search on the next walk plane agrees with it, passes
+    the same snr test and is not a zero-shift (fixed-pattern) lock; otherwise
+    the 2D answer is kept. This stops a ghost peak
     from overruling the 2D frame. The branch taken per channel goes to
     `rigid_walk_<fov>.csv`, and far first steps get a `fit_quality_flags` row.
   - `rigid_only_channels`: Channels that keep the rigid offset (a constant xy in
     the transformation table) and skip the depth fit.
   - `z_min_score`, `z_reject_at_search_limit`, `z_min_good_samples`: Drop weak
     z samples and skip the z fit when too few remain.
+  - `z_xy_refine` (default false): After the first z and xy fits, re-measures
+    z with each sample shifted by the xy fit at its depth (not the one rigid
+    offset), refits z, re-measures xy and, with `rotation_correction`, the
+    angle. For stacks whose xy moves with depth. `z_fit_status` and
+    `rotation_status` record the first pass alongside.
   - `z_neighbor_substitution` (with `z_neighbor_rings_um`,
     `z_neighbor_min_donors`, `z_neighbor_min_samples`): Gives an unfitted stack
     the median curve of the same round in neighbouring FOVs.
@@ -236,9 +242,11 @@ major change was made.
   - `rotation_neighbor_substitution` (default true; acts only with
     `rotation_correction`): `finalize()` gives a stack whose angle fell back to
     0, or whose per-plane angles scatter, the median angle of the same channel
-    over neighbouring FOVs (same rings as the z substitution). The per-channel
-    verdict is in `rotation_status_<fov>.csv`; the report is
-    `rotation_neighbor_substitutions.csv`.
+    over neighbouring FOVs with a trusted angle and a fitted z (same rings as
+    the z substitution), and corrects its centre displacement for the new
+    angle. The per-channel verdict is in `rotation_status_<fov>.csv`; the
+    report is `rotation_neighbor_substitutions.csv`. Fiducial QC images keep
+    the fragment's angle.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
