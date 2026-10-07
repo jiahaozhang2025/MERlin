@@ -55,7 +55,10 @@ misidentification rate and all of `Segment`.
   cannot overrule a correct 2D answer.
 - `rotation_correction` + `rotation_neighbor_substitution`: Edge FOVs whose
   angle cannot be measured borrow the neighbours' median angle in `finalize()`
-  (`merlin -t <task> --check-done`).
+  (`merlin -t <task> --check-done`), which then re-measures their xy on the
+  fiducial images: run it where the raw data is readable, with the cores that
+  `stack_num_threads` x `per_z_slice_num_threads` ask for. Check
+  `rotation_neighbor_substitutions.csv` for `xy_method` `formula_fallback`.
 - `z_xy_refine`: Turn it on when `z_fit_status` shows stacks with few good z
   samples although their xy fits are clean and the beads are bright, typically
   because the stack's xy moves by a few pixels with depth. z is then sampled
