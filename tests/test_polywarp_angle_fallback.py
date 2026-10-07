@@ -3,8 +3,11 @@ median angle of the same data channel over the neighbouring fovs.
 
 A stack's angle is untrusted when it fell back to 0 (too few planes gave an
 angle) or when its per-plane angles scatter by more than
-rotation_max_spread_degrees. On 20260824 that is mostly edge fovs (fov0 round
-17: 4 planes, angle 0, about 2.3 px off at the corners).
+rotation_max_spread_degrees, typically on an edge fov. Donors must have a
+trusted angle AND a z fitted by their own fragment. The substituted stack's
+centre displacement is corrected for the new angle: its xy was measured on
+planes turned back by its own first-pass angle, so it is the displacement at
+the overlap centroid.
 
 Nine fovs on a 3 x 3 grid at a 280 um pitch. The measurement methods are
 stubbed with known angles and drifts; the stack grouping, angle gate, tables,
@@ -38,6 +41,7 @@ RIGID = {0: (0.0, 0.0), 1: (25.0, -31.0), 2: (25.0, -31.0),
 NO_ANGLE = (4, 'r1')
 SCATTER = (0, 'r2')
 Z_UNFITTED = (8, 'r2')
+CENTRE = np.array([(SIZE - 1) / 2.0, (SIZE - 1) / 2.0])
 
 
 def true_angle(fov, stack):
@@ -102,13 +106,13 @@ class _DataSet:
         return self.saved[resultName, resultIndex].copy()
 
 
-def stub(task):
+def stub(task, zUnfitted=(Z_UNFITTED,)):
     def rigid(fov):
         return [RIGID[c] for c in CHANNELS]
 
     def measure_z(fov, dataChannel, rigidY, rigidX):
         z = Z[7:-7:4]
-        score = 0.1 if (fov, STACK[dataChannel]) == Z_UNFITTED else 0.9
+        score = 0.1 if (fov, STACK[dataChannel]) in zUnfitted else 0.9
         return z, 0.2 + 0.01 * z, np.full(len(z), score), 3.0
 
     def measure_xy(fov, dataChannel, rigidY, rigidX, zCoefficients):
@@ -135,7 +139,7 @@ def stub(task):
     task._measure_rotation = measure_rotation
 
 
-def run(rotation=True, substitute=None):
+def run(rotation=True, substitute=None, zUnfitted=(Z_UNFITTED,)):
     dataSet = _DataSet()
     parameters = {'rotation_correction': rotation, 'rigid_only_channels': [4],
                   'write_fiducial_images': False,
@@ -143,7 +147,7 @@ def run(rotation=True, substitute=None):
     if substitute is not None:
         parameters['rotation_neighbor_substitution'] = substitute
     task = FiducialPolynomialWarp3D(dataSet, parameters, 'PolyWarp')
-    stub(task)
+    stub(task, zUnfitted)
     with contextlib.redirect_stdout(io.StringIO()):
         for fov in FOVS:
             task._run_analysis(fov)
@@ -235,17 +239,90 @@ class AngleFallbackTests(unittest.TestCase):
             np.testing.assert_array_equal(offsets[i], old[i])
 
     def test_rewritten_tables_keep_other_values_byte_identical(self):
-        # only the rotation_radians of the touched channels may change: the
-        # tables are read back with round-trip parsing before rewriting
-        for name in ('transformation_table', 'polynomial_coefficients'):
+        # only the angle and the centre displacement of the touched channels
+        # may change: the tables are read back with round-trip parsing before
+        # rewriting
+        for name, changed in (
+                ('transformation_table',
+                 ['rotation_radians', 'xshift', 'yshift']),
+                ('polynomial_coefficients',
+                 ['rotation_radians', 'x_c0', 'y_c0'])):
             before = pd.read_csv(io.StringIO(self.before[name, 4]),
                                  dtype=str)
             after = pd.read_csv(io.StringIO(self.after[name, 4]), dtype=str)
             touched = after.dataChannel.isin(['1', '2'])
             pd.testing.assert_frame_equal(before[~touched], after[~touched])
             pd.testing.assert_frame_equal(
-                before[touched].drop(columns='rotation_radians'),
-                after[touched].drop(columns='rotation_radians'))
+                before[touched].drop(columns=changed),
+                after[touched].drop(columns=changed))
+
+    def fragment_table(self, fov):
+        return pd.read_csv(io.StringIO(self.before['transformation_table',
+                                                   fov]))
+
+    def test_fallback_shift_corrected_about_the_overlap_centroid(self):
+        # fov 4's r1 stack: angle fell back to 0, so its xy was measured on
+        # unrotated planes and is the displacement at the overlap centroid,
+        # c + s / 2 for a rigid shift s. With the substituted angle the
+        # transform must reproduce that displacement there exactly, and
+        # turn about it.
+        theta = self.angle_of(4, 1)
+        self.assertNotEqual(theta, 0.0)
+        sy, sx = RIGID[1]
+        centroid = CENTRE + 0.5 * np.array([sx, sy])
+        before = self.fragment_table(4)
+        for zIndex in (0, 17, 40):
+            row = before[(before.dataChannel == 1)
+                         & (before.zIndex == zIndex)].iloc[0]
+            self.assertEqual(row.rotation_radians, 0.0)
+            measured = centroid + [row.xshift, row.yshift]
+            t = self.task.get_transformation(4, 1, zIndex)
+            np.testing.assert_allclose(t([centroid])[0], measured,
+                                       atol=1e-9)
+            # and it is a turn by theta about that point
+            p = centroid + [100.0, -60.0]
+            c, s = np.cos(theta), np.sin(theta)
+            expected = measured + [c * 100.0 + s * 60.0,
+                                   s * 100.0 - c * 60.0]
+            np.testing.assert_allclose(t([p])[0], expected, atol=1e-9)
+        # the size of the correction: |theta| x |s| / 2
+        report = self.task.dataSet.load_dataframe_from_csv(
+            'rotation_neighbor_substitutions').set_index(
+                ['fov', 'dataChannel'])
+        rec = report.loc[(4, 1)]
+        dx, dy = rec.xshift_correction_px, rec.yshift_correction_px
+        self.assertAlmostEqual(np.hypot(dx, dy),
+                               2 * np.sin(abs(theta) / 2)
+                               * 0.5 * np.hypot(sx, sy), places=12)
+        self.assertEqual(rec.xy_frame_deg, 0.0)
+        after = self.task.get_transformation_table(4)
+        np.testing.assert_allclose(
+            after[after.dataChannel == 1].xshift.to_numpy()
+            - before[before.dataChannel == 1].xshift.to_numpy(), dx,
+            atol=1e-12)
+
+    def test_scattered_shift_corrected_by_the_angle_change_only(self):
+        # fov 0's r2 stack was measured on planes turned back by its own
+        # first-pass angle; the correction uses only the change from it
+        status = self.task.get_rotation_status(0).set_index('dataChannel')
+        frame = status.loc[3, 'first_pass_radians']
+        self.assertAlmostEqual(frame, true_angle(0, 'r2'), places=12)
+        newTheta = self.angle_of(0, 3)
+        expected = self.task._centroid_shift_correction(*RIGID[3], frame,
+                                                        newTheta)
+        report = self.task.dataSet.load_dataframe_from_csv(
+            'rotation_neighbor_substitutions').set_index(
+                ['fov', 'dataChannel'])
+        rec = report.loc[(0, 3)]
+        self.assertAlmostEqual(rec.yshift_correction_px, -expected[0],
+                               places=12)
+        self.assertAlmostEqual(rec.xshift_correction_px, -expected[1],
+                               places=12)
+        delta = newTheta - frame
+        self.assertAlmostEqual(np.hypot(*expected),
+                               2 * np.sin(abs(delta) / 2)
+                               * 0.5 * np.hypot(*RIGID[3]), places=12)
+        self.assertLess(np.hypot(*expected), 0.01)
 
     def test_transform_turns_about_the_centre(self):
         # the substituted angle turns the frame about its centre and keeps
@@ -309,6 +386,32 @@ class AngleFallbackTests(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             self.task.finalize()
         self.assertEqual(snapshot(self.task.dataSet), self.after)
+
+
+class AngleDonorsNeedZFitTests(unittest.TestCase):
+    """A stack whose angle is trusted but whose z did not fit is no donor."""
+
+    def test_unfitted_z_is_no_donor(self):
+        task = run(zUnfitted=(Z_UNFITTED, (1, 'r2')))
+        status = task.get_rotation_status(1).set_index('dataChannel')
+        self.assertEqual(status.loc[3, 'source'], 'fit')
+        self.assertFalse(task.get_z_fit_status(1).set_index('dataChannel')
+                         .loc[3, 'fitted'])
+        with contextlib.redirect_stdout(io.StringIO()):
+            task.finalize()
+        report = task.dataSet.load_dataframe_from_csv(
+            'rotation_neighbor_substitutions').set_index(
+                ['fov', 'dataChannel'])
+        # fov 0's 400 um ring now holds only fovs 3 and 4, so the 580 um
+        # ring is used, without fov 1
+        donors = [f for f in neighbours(0, 580.0) if f != 1]
+        self.assertEqual(report.loc[(0, 3), 'donors'],
+                         ','.join(str(f) for f in sorted(donors)))
+        self.assertEqual(report.loc[(0, 3), 'ring_um'], 580.0)
+        table = task.get_transformation_table(0)
+        self.assertAlmostEqual(
+            float(table[table.dataChannel == 3].rotation_radians.iloc[0]),
+            np.median([true_angle(f, 'r2') for f in donors]), places=12)
 
 
 class AngleFallbackOffTests(unittest.TestCase):

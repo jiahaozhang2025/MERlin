@@ -89,9 +89,20 @@ per-plane angles that scatter. Its angle then falls back to 0, which leaves the
 corners off by the full turn (about 2.3 px at 0.09 deg on a 2048 px frame).
 `finalize()` replaces such an angle with the median angle of the same channel
 in the neighbouring FOVs, as it already does for an unfitted z curve
-(`rotation_neighbor_substitution`). Only the angle changes. `xshift`/`yshift`
-are the displacement of the frame centre, so they stay valid under a new
-angle about that centre.
+(`rotation_neighbor_substitution`). Only neighbours whose angle is trusted and
+whose z was fitted count: an angle measured at the wrong depths is not
+evidence, even when its per-plane values agree. The stack's shift needs a
+correction too. Its xy was correlated on planes turned back by its own
+first-pass angle, or on unrotated planes when that fell back to 0. A
+translation correlation of two frames that still differ by a small turn
+measures the displacement at the centroid of their overlap, not at the frame
+centre, and with a rigid shift `s` that centroid lies `s/2` from the centre. So
+`finalize()` changes the stored centre displacement by the exact
+rotation-about-the-centroid term, about the angle (in radians) times `|s|/2`:
+for an angle that fell back to 0, 0.1 deg and a 400 px shift that is 0.35 px.
+The substituted transform then reproduces the measured shift at the overlap
+centroid and turns about it. The fiducial QC images that the fragment wrote
+keep the fragment's angle; `finalize()` does not redraw them.
 
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame
@@ -102,7 +113,27 @@ score. No later plane then corrects it. With the option on, a first-plane
 answer far from the 2D answer must be confirmed by a wide search one walk step
 deeper. If it is not confirmed, the 2D answer is kept and the walk stops. The
 check starts from the first plane on purpose: two deeper planes can agree on
-the same ghost.
+the same ghost. The confirming peak must pass the same snr test as the first
+plane, and a peak at zero shift does not count when the 2D answer is far from
+zero: two frames from the same camera share its fixed pattern, which
+correlates at exactly zero shift whatever the sample did.
+
+*Sampling z at each depth's own xy (`z_xy_refine`, off by default).* The z
+offset of each sampled plane is found by correlating the moving planes,
+shifted by one xy, against the fixed plane. That xy is the rigid offset, which
+describes the bead stack only near the depth where it was measured. In some
+stacks the xy moves by a few pixels with depth, as a step or a ramp. The deeper
+z samples then compare bead textures a few pixels apart, which do not
+correlate, so they fail the score gate and the z fit is lost or rests on a few
+shallow samples. The xy pass does not have this problem: it searches a window
+around the rigid offset at every depth and finds the drift. No single rigid
+offset can fix this, because none is right at every depth; taking it from a
+deeper plane only moves the problem to the shallow samples. With the option
+on, the z samples are measured a second time, each shifted by the fitted xy at
+its own depth, and z is refitted and xy measured again on the new z curve.
+The refined samples are used unless fewer of them pass the gate. With
+`rotation_correction` the angle is measured again as well, since an angle
+measured at the wrong depths falls back or scatters for the same reason.
 
 **`CrossFOVCompositeWarp`** (from Lida Cheng). When the stage drifts between
 rounds, part of a FOV's field in a late round was imaged by the neighbouring FOV

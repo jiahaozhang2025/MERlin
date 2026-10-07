@@ -56,6 +56,10 @@ misidentification rate and all of `Segment`.
 - `rotation_correction` + `rotation_neighbor_substitution`: Edge FOVs whose
   angle cannot be measured borrow the neighbours' median angle in `finalize()`
   (`merlin -t <task> --check-done`).
+- `z_xy_refine`: Turn it on when `z_fit_status` shows stacks with few good z
+  samples although their xy fits are clean and the beads are bright, typically
+  because the stack's xy moves by a few pixels with depth. z is then sampled
+  at each depth's own xy; `n_good_first` keeps the first pass's count.
 - `max_z_fit_residual`, `max_xy_fit_residual`, `min_xy_planes_kept`: A wrong
   rigid offset shows up as a large residual of the fit on top of it; such fits
   are listed in `transformations/fit_quality_flags_<fov>.csv`.

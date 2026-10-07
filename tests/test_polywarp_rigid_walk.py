@@ -2,25 +2,29 @@
 
 The rigid walk searches its FIRST plane wide (+-rigid_search_bound about
 zero) so it can overrule a bad 2D frame, then every later plane only
-+-rigid_walk_bound about the running best. On 20260824 fov14 plane 0 of the
-bead stack has a secondary peak, hundreds of px from the true one, whose snr
-is marginally higher; it beats rigid_snr_ratio x the 2D snr, so the walk
-starts there and nothing corrects it. rigid_walk_confirm accepts a first-plane
-answer far from the 2D answer only if a wide search on the next walk plane
-agrees with it.
++-rigid_walk_bound about the running best. On a dense, self-similar bead
+field the first plane can hold a secondary peak, hundreds of px from the true
+one, whose snr is marginally higher; it beats rigid_snr_ratio x the 2D snr,
+so the walk starts there and nothing corrects it. rigid_walk_confirm accepts
+a first-plane answer far from the 2D answer only if a wide search on the next
+walk plane agrees with it, passes the same snr test and is not a zero-shift
+(camera fixed-pattern) lock.
 
 Synthetic stacks, the task's real measurement code (nothing stubbed):
 
 channel 0  reference
 channel 1  GHOST: plane 0 holds the true texture (weight 0.45) and the same
            texture at a ghost offset (weight 0.55); every other plane and the
-           2D frame are clean at the true offset (fov14's signature)
+           2D frame are clean at the true offset
 channel 2  BAD 2D: the 2D frame is 50 px off; every plane is right, so the
-           walk must still overrule the 2D answer (0609 fov52's case)
+           walk must still overrule the 2D answer
 channel 3  normal
 channel 4  DEEP GHOST: planes 0 and the 2D frame are right, planes 4 and 8
-           agree on a ghost (20260824 fov18): agreement of two deeper planes
-           is not evidence, so the check starts from plane 0
+           agree on a ghost: agreement of two deeper planes is not evidence,
+           so the check starts from plane 0
+channel 5  ZERO LOCK: the 2D frame is right and far from zero; planes 0 and 4
+           are dominated by a component that correlates at exactly zero
+           shift, as a camera's fixed pattern does, so both lock at (0, 0)
 
 Run with `python -m unittest tests/test_polywarp_rigid_walk.py`.
 """
@@ -38,7 +42,7 @@ SIZE = 256
 NPLANES = 16
 Z = np.arange(NPLANES) * 0.5
 TRUE = {0: (0.0, 0.0), 1: (20.3, -14.6), 2: (-12.4, 25.8), 3: (8.6, 9.1),
-        4: (-17.2, -6.3)}
+        4: (-17.2, -6.3), 5: (-45.3, 38.2)}
 GHOST = (-30.0, 40.0)             # channel 1, plane 0
 DEEP_GHOST = (55.0, -40.0)        # channel 4, planes 4 and 8
 BAD_2D = (40.0, -30.0)            # channel 2: added to the 2D frame's offset
@@ -72,6 +76,8 @@ def moving_plane(dataChannel, k):
         return 0.45 * at(FIXED[0], TRUE[1]) + 0.55 * at(FIXED[0], GHOST)
     if dataChannel == 4 and k in (4, 8):
         return at(FIXED[k], DEEP_GHOST)
+    if dataChannel == 5 and k in (0, 4):
+        return 0.3 * at(FIXED[k], TRUE[5]) + 0.7 * FIXED[k]
     return at(FIXED[k], TRUE[dataChannel])
 
 
@@ -229,12 +235,57 @@ class RigidWalkConfirmTests(unittest.TestCase):
             self.assertNear(self.on[dataChannel], TRUE[dataChannel])
         self.assertEqual(self.records[3]['branch'], 'agree')
 
+    def test_zero_lock_rejected(self):
+        r = self.records[5]
+        self.assertNear((r['y_first'], r['x_first']), (0.0, 0.0))
+        self.assertGreater(r['snr_first'], 1.5 * r['snr_2d'])
+        self.assertNear((r['y_confirm'], r['x_confirm']), (0.0, 0.0))
+        self.assertEqual(r['branch'], 'rejected')
+        self.assertEqual(self.on[5], (r['y_2d'], r['x_2d']))
+        self.assertNear(self.on[5], TRUE[5])
+        self.assertNear(self.off[5], (0.0, 0.0))     # the old behaviour
+
     def test_missing_confirm_plane_rejects(self):
         task = task_for(True)
         record = {}
         self.assertFalse(task._confirm_first_walk_plane(
-            0, 2, NPLANES, *TRUE[2], record))
+            0, 2, NPLANES, *TRUE[2], record, (0.0, 0.0, 1.0)))
         self.assertEqual(record, {})
+
+    def test_confirm_plane_outside_the_walk_rejects(self):
+        # rigid_plane_search 12: plane 12 is not part of the walk
+        task = task_for(True)
+        record = {}
+        self.assertFalse(task._confirm_first_walk_plane(
+            0, 2, 12, *TRUE[2], record, (0.0, 0.0, 1.0)))
+        self.assertEqual(record, {})
+        self.assertTrue(task._confirm_first_walk_plane(
+            0, 2, 8, *TRUE[2], record, (0.0, 0.0, 1.0)))
+        self.assertEqual(record['confirm_plane'], 8)
+
+    def test_confirm_needs_the_snr_test(self):
+        # the same confirming peak, judged against a weak and an impossibly
+        # strong 2D frame
+        task = task_for(True)
+        record = {}
+        self.assertTrue(task._confirm_first_walk_plane(
+            0, 2, 4, *TRUE[2], record, (0.0, 0.0, 1.0)))
+        snr = record['snr_confirm']
+        self.assertFalse(task._confirm_first_walk_plane(
+            0, 2, 4, *TRUE[2], record, (0.0, 0.0, 1.001 * snr / 1.5)))
+        self.assertTrue(task._confirm_first_walk_plane(
+            0, 2, 4, *TRUE[2], record, (0.0, 0.0, 0.999 * snr / 1.5)))
+
+    def test_zero_shift_confirms_only_near_zero_2d(self):
+        # channel 0 against itself peaks at exactly (0, 0)
+        task = task_for(True)
+        record = {}
+        self.assertFalse(task._confirm_first_walk_plane(
+            0, 0, 4, 0.4, -0.3, record, (40.0, -30.0, 1.0)))
+        self.assertNear((record['y_confirm'], record['x_confirm']), (0, 0),
+                        0.01)
+        self.assertTrue(task._confirm_first_walk_plane(
+            0, 0, 4, 0.4, -0.3, record, (9.0, -8.0, 1.0)))
 
     def test_option_must_be_boolean(self):
         with self.assertRaises(ValueError):
@@ -259,6 +310,7 @@ class RigidWalkTableTests(unittest.TestCase):
         self.assertEqual(walk.loc[1, 'branch'], 'rejected')
         self.assertEqual(walk.loc[2, 'branch'], 'confirmed')
         self.assertEqual(set(walk.loc[[3, 4], 'branch']), {'agree'})
+        self.assertEqual(walk.loc[5, 'branch'], 'rejected')
         # the reference's 2D frame correlates with itself: no walk
         self.assertEqual(walk.loc[0, 'branch'], '2d')
         coeff = task.get_polynomial_coefficients(0).set_index('dataChannel')
@@ -269,7 +321,7 @@ class RigidWalkTableTests(unittest.TestCase):
         flags = task.dataSet.load_dataframe_from_csv('fit_quality_flags',
                                                      resultIndex=0)
         walkFlags = flags[flags.reasons.str.contains('rigid walk')]
-        self.assertEqual(sorted(walkFlags.dataChannel), [1, 2])
+        self.assertEqual(sorted(walkFlags.dataChannel), [1, 2, 5])
         self.assertIn('NOT confirmed', walkFlags[
             walkFlags.dataChannel == 1].reasons.iloc[0])
         self.assertIn('2D answer kept', walkFlags[
