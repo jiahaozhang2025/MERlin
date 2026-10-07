@@ -1,12 +1,14 @@
 """FiducialPolynomialWarp3D: the centre displacement of a stack whose angle
-finalize() substitutes.
+finalize() substitutes, on an evenly filled bead field.
 
 A stack whose own angle fell back to 0 had its xy measured on UNROTATED
 planes. A translation correlation of two frames that differ by a small turn
-measures the displacement at the centroid of their overlap, not at the frame
-centre: with a rigid shift s the two differ by (R(theta) - I) s / 2, about
-|theta| |s| / 2. finalize() therefore corrects the shift when it gives such a
-stack its neighbours' angle.
+measures the displacement at the (bead-weighted) centroid of their overlap,
+not at the frame centre: on an evenly filled field and with a rigid shift s
+the two differ by (R(theta) - I) s / 2, about |theta| |s| / 2. finalize()
+therefore measures the stack's xy again on planes turned back by the angle it
+gives the stack. test_polywarp_angle_remeasure covers beads in only part of
+the frame, where the overlap-centroid formula fails.
 
 Four fovs on a 2 x 2 grid, each with a reference and a moving bead stack. The
 moving round is the reference turned by THETA about the frame centre and
@@ -199,6 +201,10 @@ class AngleShiftTests(unittest.TestCase):
                                    atol=0.15)
 
     def test_substituted_transform_matches_truth(self):
+        report = self.task.dataSet.load_dataframe_from_csv(
+            'rotation_neighbor_substitutions').set_index(
+                ['fov', 'dataChannel'])
+        self.assertEqual(report.loc[(TARGET, 1), 'xy_method'], 'remeasured')
         for zIndex in (2, 6, 9):
             matrix = self.task.get_transformation(TARGET, 1, zIndex).params
             self.assertLess(error_at(matrix, POINTS).max(), 0.15, zIndex)

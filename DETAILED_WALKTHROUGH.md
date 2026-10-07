@@ -91,18 +91,29 @@ corners off by the full turn (about 2.3 px at 0.09 deg on a 2048 px frame).
 in the neighbouring FOVs, as it already does for an unfitted z curve
 (`rotation_neighbor_substitution`). Only neighbours whose angle is trusted and
 whose z was fitted count: an angle measured at the wrong depths is not
-evidence, even when its per-plane values agree. The stack's shift needs a
-correction too. Its xy was correlated on planes turned back by its own
-first-pass angle, or on unrotated planes when that fell back to 0. A
-translation correlation of two frames that still differ by a small turn
-measures the displacement at the centroid of their overlap, not at the frame
-centre, and with a rigid shift `s` that centroid lies `s/2` from the centre. So
-`finalize()` changes the stored centre displacement by the exact
-rotation-about-the-centroid term, about the angle (in radians) times `|s|/2`:
-for an angle that fell back to 0, 0.1 deg and a 400 px shift that is 0.35 px.
-The substituted transform then reproduces the measured shift at the overlap
-centroid and turns about it. The fiducial QC images that the fragment wrote
-keep the fragment's angle; `finalize()` does not redraw them.
+evidence, even when its per-plane values agree. The stack's shift has to
+change too. Its xy was correlated on planes turned back by its own first-pass
+angle, or on unrotated planes when that fell back to 0. A translation
+correlation of two frames that still differ by a small turn measures the
+displacement at the bead-weighted centroid of their overlap, not at the frame
+centre. So `finalize()` measures the stack's xy again, on fiducial planes
+turned back by the substituted angle, with the fragment's own xy pass, z curve
+and rigid offset, and refits it. The frames then differ by a translation only,
+and the correlation gives the displacement of the centre wherever the beads
+are. This reads the stack's xy sample planes again, so `finalize()` needs the
+raw images and takes a few seconds per substituted stack.
+
+A closed-form correction was tried first: with a rigid shift `s` the overlap's
+geometric centroid lies `s/2` from the centre, so the centre displacement
+could be corrected by the rotation about that point, about the angle (in
+radians) times `|s|/2`. That is right only when the beads fill the overlap
+evenly. The stacks whose angle needs substituting are mostly those with beads
+in only part of the frame, and there the bead-weighted centroid can sit
+hundreds of pixels from the geometric one: at 0.1 deg, 600 px away leaves the
+centre about 1 px off. The formula is kept only as a fallback for a stack
+whose re-measurement returns too few samples, and the report flags it. The
+fiducial QC images that the fragment wrote keep the fragment's angle;
+`finalize()` does not redraw them.
 
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame

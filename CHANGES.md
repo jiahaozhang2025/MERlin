@@ -243,10 +243,15 @@ major change was made.
     `rotation_correction`): `finalize()` gives a stack whose angle fell back to
     0, or whose per-plane angles scatter, the median angle of the same channel
     over neighbouring FOVs with a trusted angle and a fitted z (same rings as
-    the z substitution), and corrects its centre displacement for the new
-    angle. The per-channel verdict is in `rotation_status_<fov>.csv`; the
-    report is `rotation_neighbor_substitutions.csv`. Fiducial QC images keep
-    the fragment's angle.
+    the z substitution), and re-measures its xy on fiducial planes turned back
+    by the new angle (the fragment's xy pass, z curve and rigid offset). Only
+    when that returns too few samples is the shift corrected by an
+    overlap-centroid formula instead, which assumes evenly spread beads; the
+    report flags those (`xy_method` `formula_fallback`). The per-channel
+    verdict is in `rotation_status_<fov>.csv`; the report is
+    `rotation_neighbor_substitutions.csv`, the re-measured samples
+    `rotation_neighbor_xy_samples.csv`. Fiducial QC images keep the fragment's
+    angle.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:

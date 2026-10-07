@@ -690,11 +690,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     (rotation_neighbor_substitution, default on; it acts only with
     rotation_correction on). Edge fovs need this: too few tiles hold beads.
     The xy of such a stack was measured on planes turned back by its own
-    first-pass angle (unrotated if that fell back to 0), so it is the
-    displacement at the centroid of the correlated overlap rather than at
-    the frame centre; finalize() corrects the centre displacement for the
-    new angle (_centroid_shift_correction). Fiducial QC images written by
-    the fragment keep the fragment's angle.
+    first-pass angle (unrotated if that fell back to 0). A translation
+    correlation of frames that still differ by a turn measures the
+    displacement at the bead-weighted centroid of the overlap, not at the
+    frame centre, so finalize() measures the stack's xy again on planes
+    turned back by the new angle (same xy pass, z curve and rigid offset as
+    the fragment) and refits it. Only if too few samples come back does it
+    fall back to a formula correction, flagged in the report. Fiducial QC
+    images written by the fragment keep the fragment's angle.
 
     RIGID WALK CONFIRMATION (rigid_walk_confirm, default off). The walk's
     first plane is searched wide, so that it can overrule a bad 2D frame. On
@@ -1826,11 +1829,13 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         rotation_correction also the stack's angle about the frame centre,
         through the same _row_transform the table uses. The rigid offset is
         measured on the unrotated 2D frame (or early planes), so with an
-        angle it is the displacement at the centroid of the correlated
-        overlap, about half the offset away from the frame centre, not of
-        the centre itself: these per-channel transforms are off at the
-        centre by about |angle| x |rigid offset| / 2. They serve the QC
-        images and consumers that want one offset per channel; the
+        angle it is the displacement at p_w, the bead-weighted centroid of
+        the correlated overlap, not at the frame centre c: these per-channel
+        transforms are off at the centre by about |angle| x |p_w - c|. That
+        is |angle| x |rigid offset| / 2 only for an evenly textured overlap,
+        whose centroid lies half the offset from the centre; where the beads
+        fill only part of the frame p_w can sit much further out. They serve
+        the QC images and consumers that want one offset per channel; the
         transformation table, whose xy is measured on turned-back planes,
         holds the centre displacement. Channels without an angle (reference
         stack, rigid_only_channels, rotation off) get the plain translation,
@@ -1966,8 +1971,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         repair comes from z_fit_status / rotation_status, which record the
         fragment's verdict and are never rewritten except for the source
         label, and the donors are by definition stacks that fitted (or whose
-        angle is trusted), whose values this never touches. Running it twice
-        writes the same numbers.
+        angle is trusted), whose values this never touches. A repaired
+        stack's source becomes 'neighbor', so a second run finds nothing
+        left to repair and writes nothing.
+
+        The angle substitution reads fiducial planes: it measures the xy of
+        every stack it gives a new angle again (_remeasure_xy_at_angle). It
+        does all of that before it writes anything, so a run that stops on
+        the way leaves the angles as the fragments wrote them.
         """
         if self.parameters['z_neighbor_substitution']:
             self._substitute_z_curves()
@@ -2016,7 +2027,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                    measuredTheta: float, newTheta: float):
         """(dy, dx) to add to a stack's measured shifts (the y / x
         polynomials, in the moving frame) when its angle changes from the one
-        its xy was measured with to newTheta.
+        its xy was measured with to newTheta. finalize() uses it only as a
+        fallback, when re-measuring the xy on planes turned back by newTheta
+        returns too few samples (_remeasure_xy_at_angle).
 
         The xy samples were correlated on planes turned back by
         measuredTheta (0 when the stack's own angle fell back to 0). The
@@ -2025,14 +2038,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         the remaining turn delta = theta - measuredTheta displaces each
         reference point p by t' + (R(delta) - I)(p - c), with t' the
         displacement of c in that frame. A bounded translation correlation
-        over a uniformly textured overlap measures that displacement at the
-        overlap's centroid p_o, i.e. t' + (R(delta) - I)(p_o - c), not t'.
-        With theta = newTheta, the shift of the centre is therefore the
+        measures that displacement at the texture-weighted centroid p_w of
+        the overlap, t' + (R(delta) - I)(p_w - c), not t'. This assumes p_w
+        is the geometric centroid p_o of the overlap, which holds only for
+        an evenly textured overlap: the shift of the centre is then the
         measured one plus (R(delta) - I)(p_o - c), turned back into the
         moving frame by R(measuredTheta). p_o comes from the rigid offset
-        expressed in the measurement frame (_overlap_centroid_offset). The
-        corrected transform then reproduces the measured translation exactly
-        at p_o and turns about it. 0 when newTheta == measuredTheta."""
+        expressed in the measurement frame (_overlap_centroid_offset). Where
+        the beads fill only part of the frame, which is typical of the edge
+        fovs whose angle needs substituting, the result is off by
+        |delta| x |p_w - p_o|, about a pixel for 0.1 deg and a bead centroid
+        600 px from p_o. 0 when newTheta == measuredTheta."""
         delta = float(newTheta) - float(measuredTheta)
         if delta == 0.0:
             return 0.0, 0.0
@@ -2046,7 +2062,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
     def _substitute_angles(self) -> None:
         """Give every stack whose angle cannot be trusted the median angle of
-        the same data channel over its neighbouring fovs.
+        the same data channel over its neighbouring fovs, and measure its xy
+        again for that angle.
 
         An angle is untrusted when the fragment fell back to 0 (too few
         planes gave one, or it exceeded rotation_max_degrees) or when its
@@ -2058,20 +2075,36 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         evidence, even if its per-plane values happen to agree. They are
         chosen with the z substitution's rings (_neighbor_donors).
 
-        The angle changes, and so does the centre displacement, by the
-        exact term of _centroid_shift_correction. The stack's xy was
+        The centre displacement changes with the angle. The stack's xy was
         measured on planes turned back by its own first-pass angle
-        (rotation_status first_pass_radians; 0 when that fell back to 0),
-        so its shifts are the displacement at the overlap centroid, which
-        is the centre displacement only for that angle. For a fallback
-        stack the correction is about |angle| x |rigid offset| / 2; for a
-        scattered angle it is the same with the (small) difference between
-        the substituted and the measured angle. xshift/yshift remain the
-        displacement of the frame centre. offsets_<fov>.npy is rebuilt for
-        the touched channels (rigid offset + new angle; the rigid offset
-        itself is a measurement record and is not corrected). The fiducial
-        QC images, if any were written, keep the fragment's angle: they are
-        written by the fragment and finalize() does not redraw them.
+        (rotation_status first_pass_radians; 0 when that fell back to 0). A
+        translation correlation of frames that still differ by a turn
+        measures the displacement at the bead-weighted centroid of their
+        overlap, so the fragment's shifts are the centre displacement only
+        for that angle. The stack's xy is therefore measured again on
+        fiducial planes turned back by the new angle, with the fragment's
+        own xy pass, its z curve and its rigid offset re-expressed in that
+        frame (_remeasure_xy_at_angle), and the refit replaces the y / x
+        polynomials and xshift/yshift of every member channel of the stack.
+        This needs no assumption about where the beads are. Only when the
+        re-measurement returns too few samples are the fragment's shifts
+        corrected by the formula of _centroid_shift_correction instead,
+        which assumes an evenly textured overlap; such a stack is flagged
+        (xy_method 'formula_fallback' in the report, and a printed warning).
+
+        xshift/yshift remain the displacement of the frame centre.
+        offsets_<fov>.npy is rebuilt for the touched channels (rigid offset
+        + new angle; the rigid offset itself is a measurement record and is
+        not corrected). The fiducial QC images, if any were written, keep the
+        fragment's angle: they are written by the fragment and finalize()
+        does not redraw them.
+
+        Every stack is measured before any table is written. The report,
+        rotation_neighbor_substitutions, gives per channel the method, the
+        xy sample counts and fit residual, how far the centre displacement
+        moved, and what the formula would have moved it by; with
+        write_qc_table, rotation_neighbor_xy_samples holds the re-measured
+        samples (moving frame).
         """
         fovs = list(self.dataSet.get_fovs())
         try:
@@ -2111,8 +2144,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 continue
             angle = float(np.median([trusted[f, dataChannel] for f in donors]))
             records.append(dict(
-                fov=fov, dataChannel=dataChannel, n_donors=len(donors),
-                ring_um=usedRing,
+                fov=fov, dataChannel=dataChannel,
+                owner_channel=int(target.owner_channel),
+                n_donors=len(donors), ring_um=usedRing,
                 donors=','.join(str(f) for f in sorted(donors)),
                 measured_deg=float(np.degrees(target.measured_radians)),
                 substituted_deg=float(np.degrees(angle)),
@@ -2129,14 +2163,30 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         byFov = OrderedDict()
         for rec in records:
             byFov.setdefault(rec['fov'], []).append(rec)
+
+        # 1. measure every substituted stack again; nothing is written yet
+        prepared = OrderedDict()
+        sampleTables = []
         for fov, recs in byFov.items():
-            angleOf = {rec['dataChannel']: rec['rotation_radians']
-                       for rec in recs}
             coeff = self._exact_table('polynomial_coefficients', fov)
+            jobs = list(OrderedDict.fromkeys(
+                (rec['owner_channel'], rec['rotation_radians'])
+                for rec in recs))
+            measured = self._remeasure_fov_xy(
+                fov, jobs, coeff, self._exact_table('z_fit_status', fov))
+            prepared[fov] = (coeff, measured)
+            for (owner, angle), result in measured.items():
+                sampleTables.append(self._remeasure_sample_table(
+                    fov, owner, angle, result))
+
+        # 2. rewrite the tables
+        for fov, recs in byFov.items():
+            coeff, measured = prepared[fov]
             table = self._exact_table('transformation_table', fov)
             st = self._exact_table('rotation_status', fov)
             for rec in recs:
                 dataChannel, angle = rec['dataChannel'], rec['rotation_radians']
+                result = measured[rec['owner_channel'], angle]
                 inCoeff = coeff.dataChannel == dataChannel
                 inTable = table.dataChannel == dataChannel
                 inStatus = st.dataChannel == dataChannel
@@ -2144,28 +2194,78 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 table.loc[inTable, 'rotation_radians'] = angle
                 st.loc[inStatus, 'rotation_radians'] = angle
                 st.loc[inStatus, 'source'] = 'neighbor'
-                # the centre displacement under the new angle (see the
-                # docstring); the shifts are stored negated in the table
+                zPos = table.loc[inTable, 'zPos'].to_numpy(float)
+                oldX = table.loc[inTable, 'xshift'].to_numpy(float)
+                oldY = table.loc[inTable, 'yshift'].to_numpy(float)
+                # what the overlap-centroid formula would add to the shifts
+                # (the table stores them negated); applied only as a fallback
                 row = coeff[inCoeff].iloc[0]
                 dY, dX = self._centroid_shift_correction(
                     row['rigid_y'], row['rigid_x'],
                     st.loc[inStatus, 'first_pass_radians'].iloc[0], angle)
-                if dY != 0.0 or dX != 0.0:
-                    coeff.loc[inCoeff, 'y_c0'] += dY
-                    coeff.loc[inCoeff, 'x_c0'] += dX
-                    table.loc[inTable, 'yshift'] -= dY
-                    table.loc[inTable, 'xshift'] -= dX
-                rec['xshift_correction_px'] = 0.0 - dX
-                rec['yshift_correction_px'] = 0.0 - dY
+                if result['ok']:
+                    method = 'remeasured'
+                    for name in ('y', 'x'):
+                        values = result['%s_coefficients' % name]
+                        for order, value in enumerate(values[::-1]):
+                            coeff.loc[inCoeff, '%s_c%d' % (name, order)] = \
+                                value
+                    table.loc[inTable, 'yshift'] = -np.polyval(
+                        result['y_coefficients'], zPos)
+                    table.loc[inTable, 'xshift'] = -np.polyval(
+                        result['x_coefficients'], zPos)
+                    if result['residual_px'] > float(
+                            self.parameters['max_xy_fit_residual']):
+                        # as the fragment's own fit-quality guard: the stack
+                        # is probably beadless or its rigid offset wrong
+                        print('  *** fov %d channel %d: xy re-measured at the '
+                              'substituted angle, but its fit residual %.3f '
+                              'px > max_xy_fit_residual %.3f ***'
+                              % (fov, dataChannel, result['residual_px'],
+                                 self.parameters['max_xy_fit_residual']),
+                              flush=True)
+                else:
+                    method = 'formula_fallback'
+                    if dY != 0.0 or dX != 0.0:
+                        coeff.loc[inCoeff, 'y_c0'] += dY
+                        coeff.loc[inCoeff, 'x_c0'] += dX
+                        table.loc[inTable, 'yshift'] -= dY
+                        table.loc[inTable, 'xshift'] -= dX
+                    print('  *** fov %d channel %d: xy NOT re-measured at the '
+                          'substituted angle %.4f deg (%s); the shift was '
+                          'corrected by the overlap-centroid formula, which '
+                          'assumes evenly spread beads. ***'
+                          % (fov, dataChannel, np.degrees(angle),
+                             result['reason']), flush=True)
+                changeX = table.loc[inTable, 'xshift'].to_numpy(float) - oldX
+                changeY = table.loc[inTable, 'yshift'].to_numpy(float) - oldY
+                middle = len(zPos) // 2
+                rec.update(
+                    xy_method=method, xy_samples=result['n_samples'],
+                    xy_kept=result['n_kept'],
+                    xy_residual_px=result['residual_px'],
+                    xshift_change_px=float(changeX[middle]) if len(zPos)
+                    else np.nan,
+                    yshift_change_px=float(changeY[middle]) if len(zPos)
+                    else np.nan,
+                    max_shift_change_px=float(np.max(np.hypot(
+                        changeX, changeY))) if len(zPos) else np.nan,
+                    formula_xshift_px=0.0 - dX, formula_yshift_px=0.0 - dY,
+                    xy_failure=result['reason'])
             for frame, name in ((coeff, 'polynomial_coefficients'),
                                 (table, 'transformation_table'),
                                 (st, 'rotation_status')):
                 self.dataSet.save_dataframe_to_csv(
                     frame, name, self.get_analysis_name(), resultIndex=fov,
                     subdirectory='transformations', index=False)
-            self._rewrite_rigid_transformations(fov, coeff, dataChannels,
-                                                set(angleOf))
+            self._rewrite_rigid_transformations(
+                fov, coeff, dataChannels, {rec['dataChannel'] for rec in recs})
 
+        if self.parameters['write_qc_table'] and sampleTables:
+            self.dataSet.save_dataframe_to_csv(
+                pd.concat(sampleTables, ignore_index=True),
+                'rotation_neighbor_xy_samples', self.get_analysis_name(),
+                subdirectory='transformations', index=False)
         report = pd.DataFrame([{k: v for k, v in rec.items()
                                 if k != 'rotation_radians'}
                                for rec in records])
@@ -2173,10 +2273,140 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             report, 'rotation_neighbor_substitutions',
             self.get_analysis_name(), subdirectory='transformations',
             index=False)
-        print('%s: substituted %d angles in %d fovs from their neighbours'
-              % (self.get_analysis_name(), len(records), len(byFov)),
-              flush=True)
+        fallbacks = int((report.xy_method == 'formula_fallback').sum())
+        print('%s: substituted %d angles in %d fovs from their neighbours; '
+              'xy re-measured for %d, formula fallback for %d'
+              % (self.get_analysis_name(), len(records), len(byFov),
+                 len(records) - fallbacks, fallbacks), flush=True)
         print(report.to_string(index=False), flush=True)
+
+    def _remeasure_fov_xy(self, fov, jobs, coeff, zStatus):
+        """_remeasure_xy_at_angle for each (owner channel, angle) in jobs, all
+        stacks of one fov, with the fragment's rigid offset (coefficient
+        table) and z curve: the fitted one, or zero coefficients when the
+        fragment did not fit z (z_fit_status 'fitted' false), which is what
+        its own xy pass used even if finalize() has since substituted the
+        curve. Threads over stacks with stack_num_threads; the plane and FFT
+        caches are cleared before and after, since the fixed-plane FFT cache
+        is keyed by plane index only. Returns {(owner, angle): result}."""
+        byChannel = coeff.set_index('dataChannel')
+        fitted = zStatus.set_index('dataChannel')['fitted']
+        zOrder = int(self.parameters['z_polynomial_order'])
+        groups = OrderedDict()
+        for owner, angle in jobs:
+            groups.setdefault(int(owner), []).append(angle)
+
+        def run(item):
+            owner, angles = item
+            row = byChannel.loc[owner]
+            if bool(fitted.loc[owner]):
+                zCoefficients = np.array(
+                    [float(row['z_c%d' % k]) for k in range(zOrder, -1, -1)])
+            else:
+                zCoefficients = np.zeros(zOrder + 1)
+            # one owner's angles in turn: the measurement rotation is keyed
+            # by (fov, channel)
+            return [((owner, angle), self._remeasure_xy_at_angle(
+                fov, owner, angle, float(row['rigid_y']),
+                float(row['rigid_x']), zCoefficients)) for angle in angles]
+
+        self._planeCache.clear()
+        self._fftCache.clear()
+        try:
+            items = list(groups.items())
+            threads = max(1, int(self.parameters['stack_num_threads']))
+            if threads > 1 and len(items) > 1:
+                with ThreadPoolExecutor(
+                        max_workers=min(threads, len(items))) as pool:
+                    results = list(pool.map(run, items))
+            else:
+                results = [run(item) for item in items]
+        finally:
+            self._planeCache.clear()
+            self._fftCache.clear()
+        return OrderedDict(pair for group in results for pair in group)
+
+    def _remeasure_xy_at_angle(self, fov, dataChannel, angle, rigidY,
+                               rigidX, zCoefficients):
+        """The fragment's xy pass for one stack, on fiducial planes turned
+        back by angle: the rigid offset (as measured, unrotated) is
+        re-expressed in that frame, _measure_xy_offsets correlates the
+        moving planes taken at z + dz(z), and the shifts are turned back
+        into the moving frame and fitted with the robust polynomial of order
+        xy_polynomial_order, as _run_analysis does with its own angle. The
+        result is the displacement of the frame centre for that angle
+        wherever the beads are.
+
+        Returns a dict with the samples (z, y, x, snr, on_edge; y / x in the
+        moving frame), n_samples, n_kept (samples kept by both robust fits),
+        residual_px (the larger median |residual| of the y / x fits, over
+        all samples, as the fragment reports it) and, when 'ok', the y / x
+        coefficients in np.polyval order. 'ok' is False, with a 'reason',
+        when fewer than xy_polynomial_order + 2 samples are finite or the
+        fits keep fewer than that or than min_xy_planes_kept of the
+        samples."""
+        xyOrder = int(self.parameters['xy_polynomial_order'])
+        angle = float(angle)
+        frameX, frameY = self._rotate_vector((float(rigidX), float(rigidY)),
+                                             -angle)
+        self._measurementRotation[(fov, dataChannel)] = angle
+        try:
+            z, y, x, snr, edge = self._measure_xy_offsets(
+                fov, dataChannel, frameY, frameX, zCoefficients)
+        finally:
+            self._measurementRotation.pop((fov, dataChannel), None)
+        z, y, x = (np.asarray(v, dtype=float) for v in (z, y, x))
+        if angle != 0.0:
+            x, y = self._rotate_vector((x, y), angle)
+        result = {'z': z, 'y': y, 'x': x, 'snr': np.asarray(snr, float),
+                  'on_edge': np.asarray(edge, bool), 'n_samples': len(z),
+                  'n_kept': 0, 'residual_px': np.nan, 'ok': False,
+                  'reason': ''}
+        need = xyOrder + 2
+        usable = int((np.isfinite(y) & np.isfinite(x)).sum())
+        if usable < need:
+            result['reason'] = ('only %d of %d xy samples usable'
+                                % (usable, len(z)))
+            return result
+        yCoefficients, yKept = self._robust_polyfit(z, y, xyOrder)
+        xCoefficients, xKept = self._robust_polyfit(z, x, xyOrder)
+        kept = int(min(yKept.sum(), xKept.sum()))
+        result.update(
+            y_coefficients=yCoefficients, x_coefficients=xCoefficients,
+            y_kept=yKept, x_kept=xKept, n_kept=kept,
+            residual_px=float(max(
+                np.nanmedian(np.abs(y - np.polyval(yCoefficients, z))),
+                np.nanmedian(np.abs(x - np.polyval(xCoefficients, z))))))
+        minKept = max(need, float(self.parameters['min_xy_planes_kept'])
+                      * len(z))
+        if kept < minKept:
+            result['reason'] = ('only %d of %d xy samples kept by the fit'
+                                % (kept, len(z)))
+            return result
+        result['ok'] = True
+        return result
+
+    @staticmethod
+    def _remeasure_sample_table(fov, dataChannel, angle, result):
+        """The samples behind one _remeasure_xy_at_angle result, as rows of
+        rotation_neighbor_xy_samples."""
+        z = result['z']
+        fittedY = fittedX = np.full(len(z), np.nan)
+        keptY = keptX = np.zeros(len(z), bool)
+        if 'y_coefficients' in result:
+            fittedY = np.polyval(result['y_coefficients'], z)
+            fittedX = np.polyval(result['x_coefficients'], z)
+            keptY, keptX = result['y_kept'], result['x_kept']
+        return pd.DataFrame({
+            'fov': fov, 'dataChannel': dataChannel,
+            'rotation_radians': angle, 'zPos': z,
+            'measured_y': result['y'], 'measured_x': result['x'],
+            'fitted_y': fittedY, 'fitted_x': fittedX,
+            'snr': result['snr'], 'on_edge': result['on_edge'],
+            'kept_y': keptY, 'kept_x': keptX, 'ok': result['ok']},
+            columns=['fov', 'dataChannel', 'rotation_radians', 'zPos',
+                     'measured_y', 'measured_x', 'fitted_y', 'fitted_x',
+                     'snr', 'on_edge', 'kept_y', 'kept_x', 'ok'])
 
     def _exact_table(self, name, fov):
         """A saved per-fov table read back with round-trip float parsing,
