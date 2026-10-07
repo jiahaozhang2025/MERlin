@@ -16,7 +16,8 @@ major change was made.
 - `softmax_temperature`: Controls optional softmax top-1 probabilities for
   machine-learning and confidence-based workflows.
 - `adaptive_crop`: Defaults to excluding each FOV's unaligned warp margins so
-  invalid image regions do not contaminate barcode extraction.
+  invalid image regions do not contaminate barcode extraction; the margins come
+  from the warp's corner displacements, so rotated transforms are covered.
 
 ### Registration (`merlin/analysis/warp.py`)
 
@@ -219,6 +220,14 @@ major change was made.
     the median curve of the same round in neighbouring FOVs.
   - `max_z_fit_residual`, `max_xy_fit_residual`, `min_xy_planes_kept`: Flag
     suspect fits in `fit_quality_flags_<fov>.csv`.
+  - `rotation_correction` (default false; with `rotation_tiles`,
+    `rotation_tile_min_snr`, `rotation_min_tiles`, `rotation_min_planes`,
+    `rotation_max_degrees`, `rotation_max_spread_degrees`): One in-plane angle
+    per round, measured on bead-stack tiles; the table gains
+    `rotation_radians` and `rotation_center_x/y` (xshift/yshift = displacement
+    of the frame centre). `offsets_<fov>.npy` and fiducial QC images include
+    the angle; `rigid_only_channels` get angle 0 and a `fit_quality_flags` row.
+    Design after Lida Cheng's `rotation_correction`.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
@@ -267,7 +276,7 @@ major change was made.
 - Option names are lowercase (e.g. `write_decoded_FOVs` -> `write_decoded_fovs`,
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
-  synthetic spots, PolyWarp rigid-only channels.
+  synthetic spots, PolyWarp rigid-only channels, PolyWarp rotation.
 - `-i`: Accepts a fragment range (`0-25`) or list (`3,8,11`), run in one process.
 - snakemake: Imported only when running a whole analysis with snakemake; an
   optional extra.

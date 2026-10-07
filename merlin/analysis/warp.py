@@ -650,6 +650,39 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
       4. Apply: resample the raw image at z + dz(z) and translate it by
          (dx(z), dy(z)).
 
+    OPTIONAL IN-PLANE ROTATION (rotation_correction, default off). The sample
+    can turn slightly between rounds, and a translation cannot absorb that:
+    the frame centre is aligned and the corners stay off by theta * r. With
+    the option on, every non-reference stack gets one angle, constant in
+    depth, measured from the bead stack itself rather than from the 2D
+    frame:
+
+      a. z offsets as in step 2, on the unrotated planes;
+      b. at each z-sampled plane, the moving plane (at its measured depth,
+         shifted by the rigid offset) and the fixed plane are cut into
+         rotation_tiles x rotation_tiles tiles; each tile's bounded
+         correlation gives a displacement, and the tiles' displacements are
+         fitted with a translation plus a small rotation about the frame
+         centre. The stack's angle is the median over planes;
+      c. the moving planes are then pre-rotated by that angle about the
+         frame centre and step 2 is run again on them, so the z
+         correlation sees aligned textures (a rotated field lowers the z
+         ZNCC and broadens the xy peak);
+      d. b is repeated once on the pre-rotated planes and the residual
+         angle is added. The tile fit underestimates small sub-pixel
+         displacements, so the first pass is a few percent short and the
+         second recovers most of the remainder;
+      e. step 3 runs on the pre-rotated planes, and its shifts are turned
+         back into the moving frame.
+
+    Applied as one resampling, input = c + R(theta) (p - c) + t(z) with c
+    the frame centre. The table keeps xshift/yshift as the displacement OF
+    THE CENTRE, t(z), so a consumer that ignores the new rotation_radians,
+    rotation_center_x and rotation_center_y columns is still right at the
+    centre, and exactly as before when the angle is 0. The reference stack
+    and rigid_only_channels get angle 0. With the option off nothing is
+    computed or written differently.
+
     Setting z_polynomial_order and xy_polynomial_order to 1 recovers a linear
     ramp in z; setting them to 0 recovers a rigid offset per round with a
     constant z shift.
@@ -869,6 +902,42 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         if 'per_z_slice_num_threads' not in self.parameters:
             self.parameters['per_z_slice_num_threads'] = 1
 
+        # ---- optional in-plane rotation (see the class docstring) ----
+        # Off by default: tables and images are then unchanged.
+        if 'rotation_correction' not in self.parameters:
+            self.parameters['rotation_correction'] = False
+        if not isinstance(self.parameters['rotation_correction'],
+                          (bool, np.bool_)):
+            raise ValueError('rotation_correction must be true or false')
+        # Tiles per side for the angle. 6 (341 px tiles on a 2048 frame)
+        # recovers a known 0.05-0.2 deg rotation of synthetic 2048 px bead
+        # frames to within 3%; 4 to within 5%. Parabolic peak refinement
+        # pulls sub-pixel displacements towards whole pixels, so an angle
+        # that moves the corners by well under a pixel is underestimated.
+        if 'rotation_tiles' not in self.parameters:
+            self.parameters['rotation_tiles'] = 6
+        # A tile counts only if its peak is inside the bounded window and its
+        # snr (as _bounded_correlation_peak defines it) reaches this.
+        if 'rotation_tile_min_snr' not in self.parameters:
+            self.parameters['rotation_tile_min_snr'] = 8.0
+        # A plane gives an angle only with at least this many usable tiles.
+        if 'rotation_min_tiles' not in self.parameters:
+            self.parameters['rotation_min_tiles'] = 8
+        # The stack's angle needs this many planes, and must stay within
+        # rotation_max_degrees; otherwise it is 0 (translation only, the
+        # behaviour without the option) and the stack is flagged.
+        if 'rotation_min_planes' not in self.parameters:
+            self.parameters['rotation_min_planes'] = 5
+        if 'rotation_max_degrees' not in self.parameters:
+            self.parameters['rotation_max_degrees'] = 1.0
+        # Flag (do not reject) a stack whose per-plane angles scatter by more
+        # than this robust sd: the constant-angle model is then doubtful.
+        if 'rotation_max_spread_degrees' not in self.parameters:
+            self.parameters['rotation_max_spread_degrees'] = 0.02
+        # (fov, dataChannel) -> angle the moving planes are pre-rotated by
+        # while they are measured; empty unless rotation_correction is on.
+        self._measurementRotation = {}
+
         self._planeCache = {}
         self._planeCacheLock = threading.Lock()
         # rfft2 of the FIXED plane, which is channel 0 and therefore identical
@@ -932,7 +1001,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         get_fiducial3D_stack: a 399 plane stack is 3.3 GB as uint16 and twice
         that once filtered, and only a handful of planes are live at once.
         """
-        key = (dataChannel, fov, planeIndex)
+        theta = self._measurementRotation.get((fov, dataChannel), 0.0)
+        key = (dataChannel, fov, planeIndex, theta)
         cached = self._planeCache.get(key)
         if cached is not None:
             return cached
@@ -941,7 +1011,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         frameIndices = dataOrganization.get_fiducial3D_stack_frame_indices(
             dataChannel)
         planeIndex = int(np.clip(planeIndex, 0, len(frameIndices) - 1))
-        key = (dataChannel, fov, planeIndex)
+        key = (dataChannel, fov, planeIndex, theta)
         cached = self._planeCache.get(key)
         if cached is not None:
             return cached
@@ -950,6 +1020,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             dataOrganization.get_fiducial3D_filename(dataChannel, fov),
             frameIndices[planeIndex])
         filtered = self._filter(rawPlane).astype(np.float32)
+        if theta != 0.0:
+            filtered = self._rotate_about_centre(filtered, theta)
         # Filtering happens outside the lock, so two threads may occasionally
         # compute the same plane; that is wasted work, not a wrong answer. The
         # lock only covers the eviction check, which is the part that is not
@@ -988,6 +1060,136 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             np.float32([[1, 0, dx], [0, 1, dy]]),
             (image.shape[1], image.shape[0]),
             flags=cv2.INTER_LINEAR, borderValue=0)
+
+    @staticmethod
+    def _rotate_about_centre(image: np.ndarray, theta: float) -> np.ndarray:
+        """out(q) = image(c + R(theta) (q - c)), c the frame centre, zero
+        fill: a moving plane put back into the reference orientation."""
+        height, width = image.shape
+        cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+        c, s = np.cos(theta), np.sin(theta)
+        matrix = np.float32([[c, -s, cx - c * cx + s * cy],
+                             [s, c, cy - s * cx - c * cy]])
+        return cv2.warpAffine(
+            np.ascontiguousarray(image, dtype=np.float32), matrix,
+            (width, height), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderValue=0)
+
+    @staticmethod
+    def _rotate_vector(vector, theta: float):
+        """R(theta) applied to an (x, y) pair (or to coefficient arrays)."""
+        x, y = vector
+        c, s = np.cos(theta), np.sin(theta)
+        return c * x - s * y, s * x + c * y
+
+    def _tile_motion(self, fixedImage: np.ndarray, movingImage: np.ndarray):
+        """Translation of the frame centre and small angle that best explain
+        the displacements of a grid of tiles. movingImage must already be
+        shifted close to fixedImage (the rigid offset): each tile is a
+        bounded correlation within xy_search_bound.
+
+        Returns (theta, tx, ty, tiles used, rms tile residual px), theta and
+        (tx, ty) in the displacement sense (input = c + R(p - c) + t, here
+        relative to the pre-shift), or None if too few tiles are usable.
+        """
+        n = int(self.parameters['rotation_tiles'])
+        minSnr = float(self.parameters['rotation_tile_min_snr'])
+        minTiles = int(self.parameters['rotation_min_tiles'])
+        height, width = fixedImage.shape
+        cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
+        rows = np.linspace(0, height, n + 1).astype(int)
+        cols = np.linspace(0, width, n + 1).astype(int)
+        vx, vy, dx, dy = [], [], [], []
+        for i in range(n):
+            for j in range(n):
+                f = fixedImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                m = movingImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                if not f.any() or not m.any():
+                    continue
+                sy, sx, snr, onEdge = self._bounded_correlation_peak(
+                    f, m, 0.0, 0.0)
+                if onEdge or not np.isfinite(snr) or snr < minSnr:
+                    continue
+                vx.append(0.5 * (cols[j] + cols[j + 1] - 1) - cx)
+                vy.append(0.5 * (rows[i] + rows[i + 1] - 1) - cy)
+                dx.append(-sx)          # displacement = minus the shift
+                dy.append(-sy)
+        if len(vx) < minTiles:
+            return None
+        vx, vy, dx, dy = map(np.asarray, (vx, vy, dx, dy))
+        k = len(vx)
+        # d = t + theta * (-v_y, v_x), small angle; one 3-sigma robust trim
+        design = np.zeros((2 * k, 3))
+        design[:k, 0] = 1.0
+        design[k:, 1] = 1.0
+        design[:k, 2] = -vy
+        design[k:, 2] = vx
+        target = np.r_[dx, dy]
+        keep = np.ones(k, bool)
+        for _ in range(2):
+            rowsKept = np.r_[keep, keep]
+            p, *_ = np.linalg.lstsq(design[rowsKept], target[rowsKept],
+                                    rcond=None)
+            residual = target - design @ p
+            tileResidual = np.hypot(residual[:k], residual[k:])
+            scale = 1.4826 * np.median(tileResidual) + 1e-6
+            good = tileResidual < 3.0 * scale
+            if good.sum() < minTiles:
+                break
+            keep = good
+        rowsKept = np.r_[keep, keep]
+        p, *_ = np.linalg.lstsq(design[rowsKept], target[rowsKept],
+                                rcond=None)
+        residual = (target - design @ p)[rowsKept]
+        rms = float(np.sqrt(2.0 * np.mean(residual ** 2)))
+        return float(p[2]), float(p[0]), float(p[1]), int(keep.sum()), rms
+
+    def _measure_rotation(self, fov: int, dataChannel: int,
+                          rigidY: float, rigidX: float,
+                          sampleZ: np.ndarray, sampleOffset: np.ndarray):
+        """Per-plane angle at the given depths, each moving plane taken at
+        z + its z offset and shifted by the rigid offset. The moving planes
+        are whatever _fiducial_plane returns: unrotated, or turned back by
+        the stack's measurement rotation once that is set, in which case
+        this is the residual angle. Returns (z, theta rad, tiles used, rms
+        px) per plane, theta NaN where too few tiles were usable."""
+        zPositions = np.asarray(
+            self.dataSet.get_data_organization()
+            .get_fiducial3D_stack_frame_zPos(dataChannel), dtype=float)
+
+        def measure_one(item):
+            zPosition, zOffset = item
+            planeIndex = int(np.argmin(np.abs(zPositions - zPosition)))
+            fixedImage = self._fiducial_plane(0, fov, planeIndex)
+            movingImage = self._shift_image(self._fiducial_plane_at_z(
+                dataChannel, fov, zPositions[planeIndex] + zOffset),
+                rigidY, rigidX)
+            motion = self._tile_motion(fixedImage, movingImage)
+            if motion is None:
+                return zPositions[planeIndex], np.nan, 0, np.nan
+            theta, _, _, used, rms = motion
+            return zPositions[planeIndex], theta, used, rms
+
+        results = self._map_over_planes(
+            measure_one, list(zip(sampleZ, sampleOffset)))
+        if not results:
+            return (np.array([]),) * 4
+        return tuple(np.array(c, dtype=float) for c in zip(*results))
+
+    def _stack_angle(self, planeTheta: np.ndarray):
+        """(angle rad, robust sd rad, reason) for one stack: the median of
+        the per-plane angles, or 0 with a reason when it cannot be trusted."""
+        finite = planeTheta[np.isfinite(planeTheta)]
+        if len(finite) < int(self.parameters['rotation_min_planes']):
+            return 0.0, np.nan, ('only %d planes gave an angle'
+                                 % len(finite))
+        angle = float(np.median(finite))
+        spread = float(1.4826 * np.median(np.abs(finite - angle)))
+        if abs(np.degrees(angle)) > float(
+                self.parameters['rotation_max_degrees']):
+            return 0.0, spread, ('angle %.3f deg beyond rotation_max_degrees'
+                                 % np.degrees(angle))
+        return angle, spread, None
 
     def _zncc(self, first: np.ndarray, second: np.ndarray) -> float:
         """Normalised cross-correlation over the jointly non-zero pixels."""
@@ -1136,6 +1338,13 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         320. Only the depth fit is skipped: the z coefficients are zero and
         the y/x polynomials are the constant rigid offset, so the
         transformation table carries the rigid xy at every plane.
+
+        With rotation_correction a rigid-only channel gets angle 0: the angle
+        is measured on the depth pass, which these channels skip. A
+        fit_quality_flags row records that it was not measured. A stack that
+        turns between rounds should therefore be depth-fitted rather than
+        listed here (it needs a 3D fiducial on channel 0's plane grid, since
+        the measurements compare plane i with plane i).
 
         Accepts channel names or indices. Empty by default.
         """
@@ -1298,6 +1507,52 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         return (np.array(measuredZ), np.array(measuredY), np.array(measuredX),
                 np.array(measuredSnr), np.array(measuredEdge, dtype=bool))
 
+    @staticmethod
+    def _row_transform(row):
+        """The output->input map of one transformation-table row.
+
+        input = c + R(theta) (p - c) + t, t = (xshift, yshift); a table
+        without rotation columns, or with theta 0, gives exactly the plain
+        translation used before rotation_correction existed.
+        """
+        theta = float(row['rotation_radians']) \
+            if 'rotation_radians' in row else 0.0
+        if not np.isfinite(theta) or theta == 0.0:
+            return transform.SimilarityTransform(
+                translation=[row['xshift'], row['yshift']])
+        cx = float(row['rotation_center_x'])
+        cy = float(row['rotation_center_y'])
+        c, s = np.cos(theta), np.sin(theta)
+        return transform.AffineTransform(matrix=np.array([
+            [c, -s, cx - c * cx + s * cy + float(row['xshift'])],
+            [s, c, cy - s * cx - c * cy + float(row['yshift'])],
+            [0.0, 0.0, 1.0]]))
+
+    def _rigid_transformations(self, coefficients, dataChannels):
+        """One depth-independent transform per channel, for offsets_<fov>.npy
+        and the fiducial QC images: the rigid offset, as a
+        SimilarityTransform translation (the negated measured shift), and with
+        rotation_correction also the stack's angle about the frame centre,
+        through the same _row_transform the table uses. The rigid offset is
+        measured on the unrotated 2D frame (or early planes), so it is the
+        displacement of roughly the frame centre, which is what the table's
+        xshift/yshift are. Channels without an angle (reference stack,
+        rigid_only_channels, rotation off) get the plain translation, exactly
+        as before rotation_correction existed."""
+        rotation = bool(self.parameters['rotation_correction'])
+        if rotation:
+            height, width = self.dataSet.get_image_dimensions()
+        transformations = []
+        for dataChannel in dataChannels:
+            entry = coefficients[dataChannel]
+            row = {'xshift': -entry['rigid_x'], 'yshift': -entry['rigid_y']}
+            if rotation:
+                row.update(rotation_radians=entry.get('theta', 0.0),
+                           rotation_center_x=(width - 1) / 2.0,
+                           rotation_center_y=(height - 1) / 2.0)
+            transformations.append(self._row_transform(row))
+        return transformations
+
     # ==================================================================
     # storage
     # ==================================================================
@@ -1309,12 +1564,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
         # Rigid transforms, in the same format the other warp tasks use, so
         # anything that only wants a per-channel offset still works.
-        rigidTransformations = [
-            transform.SimilarityTransform(
-                translation=[-coefficients[c]['rigid_x'],
-                             -coefficients[c]['rigid_y']])
-            for c in dataChannels]
-        self._save_transformations(rigidTransformations, fov)
+        self._save_transformations(
+            self._rigid_transformations(coefficients, dataChannels), fov)
 
         coefficientRows = []
         for dataChannel in dataChannels:
@@ -1322,6 +1573,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             row = {'dataChannel': dataChannel,
                    'rigid_y': entry['rigid_y'],
                    'rigid_x': entry['rigid_x']}
+            if self.parameters['rotation_correction']:
+                row['rotation_radians'] = entry.get('theta', 0.0)
             for name in ('z', 'y', 'x'):
                 for order, value in enumerate(entry[name][::-1]):
                     row['%s_c%d' % (name, order)] = value
@@ -1332,21 +1585,29 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             subdirectory='transformations', index=False)
 
         tableRows = []
+        if self.parameters['rotation_correction']:
+            height, width = self.dataSet.get_image_dimensions()
         for dataChannel in dataChannels:
             entry = coefficients[dataChannel]
             zOffset = np.polyval(entry['z'], zPositions)
             shiftY = np.polyval(entry['y'], zPositions)
             shiftX = np.polyval(entry['x'], zPositions)
-            tableRows.append(pd.DataFrame({
+            planeTable = pd.DataFrame({
                 'dataChannel': dataChannel,
                 'zIndex': np.arange(len(zPositions)),
                 'zPos': zPositions,
                 'zPos_new': zPositions + zOffset,
                 'z_offset': zOffset,
                 # stored as transform.SimilarityTransform translation
-                # parameters, i.e. the negated measured shift
+                # parameters, i.e. the negated measured shift; with
+                # rotation_correction, the displacement of the frame centre
                 'xshift': -shiftX,
-                'yshift': -shiftY}))
+                'yshift': -shiftY})
+            if self.parameters['rotation_correction']:
+                planeTable['rotation_radians'] = entry.get('theta', 0.0)
+                planeTable['rotation_center_x'] = (width - 1) / 2.0
+                planeTable['rotation_center_y'] = (height - 1) / 2.0
+            tableRows.append(planeTable)
         self.dataSet.save_dataframe_to_csv(
             pd.concat(tableRows, ignore_index=True), 'transformation_table',
             self.get_analysis_name(), resultIndex=fov,
@@ -1535,14 +1796,12 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         is the closest thing to a single representative offset for the round.
         With neither, the transformations for every (channel, plane) pair.
         Decode's adaptive crop consumes that last form and takes the extreme
-        translation over the whole list, which is exactly the union of the
-        invalid margins over depth.
+        corner displacement over the whole list, which is exactly the union
+        of the invalid margins over depth (and over the turned corners when
+        rotation_correction is on).
         """
         table = self.get_transformation_table(fov)
-
-        def _transform(row):
-            return transform.SimilarityTransform(
-                translation=[row['xshift'], row['yshift']])
+        _transform = self._row_transform
 
         if dataChannel is not None:
             channelTable = table[table['dataChannel'] == dataChannel]
@@ -1568,7 +1827,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             chromaticCorrector: aberration.ChromaticCorrector = None
     ) -> np.ndarray:
         """Get the specified image, resampled to the corrected depth and
-        translated by the fitted xy offset."""
+        moved by the fitted xy offset (and angle, with rotation_correction)."""
         table = self.get_transformation_table(fov)
         row = table[(table['dataChannel'] == dataChannel)
                     & (table['zIndex'] == zIndex)]
@@ -1611,8 +1870,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             inputImage = chromaticCorrector.transform_image(
                 inputImage, imageColor).astype(inputImage.dtype)
 
-        transformation = transform.SimilarityTransform(
-            translation=[row['xshift'], row['yshift']])
+        transformation = self._row_transform(row)
         warpedImage = transform.warp(inputImage, transformation,
                                      preserve_range=True)
 
@@ -1635,7 +1893,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
         The base implementation warps with one transformation per channel,
         which cannot express a per-plane offset, so aligned images go through
-        get_aligned_image instead.
+        get_aligned_image instead (depth, per-plane xy and, with
+        rotation_correction, the angle). The fiducial images use
+        transformationList, the per-channel rigid transforms of
+        _rigid_transformations: rigid offset plus, with rotation_correction,
+        the stack's angle.
         """
         dataChannels = self.dataSet.get_data_organization().get_data_channels()
 
@@ -1705,12 +1967,48 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             stackMembers.setdefault(key, []).append(
                 (dataChannel, rigidY, rigidX))
 
+        referenceStack = (dataOrganization.get_fiducial3D_filename(0, fov)
+                          if self.parameters['rotation_correction'] else None)
+
         def solve_stack(item):
             key, members = item
             dataChannel, rigidY, rigidX = members[0]
             zSampleZ, zSampleOffset, zSampleScore, zCeiling = \
                 self._measure_z_offsets(fov, dataChannel, rigidY, rigidX)
             zGate = self._z_sample_gate(zSampleOffset, zSampleScore, zCeiling)
+            theta, thetaSpread, rotationReason = 0.0, np.nan, None
+            thetaRecords = None
+            # theta = pre-rotation used while measuring; thetaApplied = the
+            # angle written to the table (theta + the residual of step d)
+            thetaApplied = 0.0
+            if self.parameters['rotation_correction'] \
+                    and key != referenceStack:
+                # angle from the unrotated planes, each at its own measured
+                # depth if the gate kept it, else at the plane itself
+                planeOffset = np.where(zGate, zSampleOffset, 0.0)
+                tZ, tTheta, tTiles, tRms = self._measure_rotation(
+                    fov, dataChannel, rigidY, rigidX, zSampleZ, planeOffset)
+                theta, thetaSpread, rotationReason = self._stack_angle(tTheta)
+                thetaRecords = (tZ, tTheta, tTiles, tRms)
+                thetaApplied = theta
+                if theta != 0.0:
+                    # measure z and xy again on planes turned back by theta;
+                    # the rigid shift is re-expressed in that frame
+                    self._measurementRotation[(fov, dataChannel)] = theta
+                    rigidX, rigidY = self._rotate_vector((rigidX, rigidY),
+                                                         -theta)
+                    zSampleZ, zSampleOffset, zSampleScore, zCeiling = \
+                        self._measure_z_offsets(fov, dataChannel,
+                                                rigidY, rigidX)
+                    zGate = self._z_sample_gate(zSampleOffset, zSampleScore,
+                                                zCeiling)
+                    # residual angle on the turned-back planes (step d)
+                    _, rTheta, _, _ = self._measure_rotation(
+                        fov, dataChannel, rigidY, rigidX, zSampleZ,
+                        np.where(zGate, zSampleOffset, 0.0))
+                    residual, _, residualReason = self._stack_angle(rTheta)
+                    if residualReason is None:
+                        thetaApplied = theta + residual
             nGood = int(zGate.sum())
             zFitted = nGood >= int(self.parameters['z_min_good_samples'] or 0)
             if zFitted:
@@ -1731,6 +2029,12 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             xySampleZ, xySampleY, xySampleX, xySnr, xyEdge = \
                 self._measure_xy_offsets(fov, dataChannel, rigidY, rigidX,
                                          zCoefficients)
+            if theta != 0.0:
+                # shifts measured on the turned-back planes -> shift of the
+                # frame centre in the moving frame: s = R(theta) s'
+                xySampleX, xySampleY = self._rotate_vector(
+                    (xySampleX, xySampleY), theta)
+                self._measurementRotation.pop((fov, dataChannel), None)
             yCoefficients, yKept = self._robust_polyfit(
                 xySampleZ, xySampleY, xyOrder)
             xCoefficients, xKept = self._robust_polyfit(
@@ -1738,6 +2042,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
             entry = {'z': zCoefficients, 'y': yCoefficients,
                      'x': xCoefficients}
+            if self.parameters['rotation_correction']:
+                if abs(np.degrees(thetaApplied)) > float(
+                        self.parameters['rotation_max_degrees']):
+                    rotationReason = ('refined angle %.3f deg beyond '
+                                      'rotation_max_degrees'
+                                      % np.degrees(thetaApplied))
+                    thetaApplied = theta
+                entry['theta'] = thetaApplied
             status = {'fov': fov, 'dataChannel': dataChannel,
                       'n_samples': int(len(zGate)), 'n_good': nGood,
                       'n_gated_out': int(len(zGate) - nGood),
@@ -1763,6 +2075,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     'zPos': xySampleZ, 'measured': xySampleX,
                     'fitted': np.polyval(xCoefficients, xySampleZ),
                     'score': xySnr, 'kept': xKept, 'on_edge': xyEdge}))
+                if thetaRecords is not None:
+                    # per-plane angle (deg); score = tiles used, on_edge =
+                    # too few usable tiles on that plane
+                    tZ, tTheta, tTiles, tRms = thetaRecords
+                    measurements.append(pd.DataFrame({
+                        'dataChannel': dataChannel, 'stage': 'theta_deg',
+                        'zPos': tZ, 'measured': np.degrees(tTheta),
+                        'fitted': np.degrees(thetaApplied), 'score': tTiles,
+                        'kept': np.isfinite(tTheta),
+                        'on_edge': ~np.isfinite(tTheta)}))
 
             residualY = xySampleY - np.polyval(yCoefficients, xySampleZ)
             residualX = xySampleX - np.polyval(xCoefficients, xySampleZ)
@@ -1787,6 +2109,18 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                   self.parameters['max_xy_fit_residual']))
             if keptFraction < self.parameters['min_xy_planes_kept']:
                 reasons.append('only %.0f%% of xy planes kept' % (100 * keptFraction))
+            if rotationReason is not None:
+                reasons.append('rotation not applied: ' + rotationReason)
+            if np.isfinite(thetaSpread) and np.degrees(thetaSpread) > float(
+                    self.parameters['rotation_max_spread_degrees']):
+                reasons.append('per-plane angles scatter %.3f deg'
+                               % np.degrees(thetaSpread))
+            if thetaRecords is not None:
+                line += ', angle %.4f deg (first pass %.4f, sd %.4f, %d/%d planes)' % (
+                    np.degrees(thetaApplied), np.degrees(theta),
+                    np.degrees(thetaSpread),
+                    int(np.isfinite(thetaRecords[1]).sum()),
+                    len(thetaRecords[1]))
             flag = None
             if reasons:
                 line += '\n  *** REGISTRATION SUSPECT, fov %d channel %d: %s. ' \
@@ -1828,6 +2162,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             print(line, flush=True)
             if flag is not None:
                 qcFlags.append(flag)
+        if self.parameters['rotation_correction']:
+            # a rigid-only channel has no depth pass to measure an angle on;
+            # say so rather than let a zero angle read as "measured, none"
+            for dataChannel, _, _ in rigidOnlyMembers:
+                qcFlags.append({
+                    'fov': fov, 'dataChannel': dataChannel,
+                    'z_residual_um': np.nan, 'y_residual_px': np.nan,
+                    'x_residual_px': np.nan, 'fraction_kept': np.nan,
+                    'reasons': 'rigid_only channel: in-plane rotation not '
+                               'measured (angle 0)'})
         # Written whether or not anything tripped, so its ABSENCE never has to
         # be read as "the guard did not run".
         self.dataSet.save_dataframe_to_csv(
@@ -1883,7 +2227,4 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         self._fftCache.clear()
 
         self._process_transformations(
-            [transform.SimilarityTransform(
-                translation=[-coefficients[c]['rigid_x'],
-                             -coefficients[c]['rigid_y']])
-             for c in dataChannels], fov)
+            self._rigid_transformations(coefficients, dataChannels), fov)

@@ -34,19 +34,27 @@ def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
 
     transform.warp maps output->input, so output (r, c) samples input
     (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many on
-    the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM.
+    the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM. For a transform with
+    a rotation (PolyWarp rotation_correction) the displacement differs from
+    corner to corner; an affine map takes its extremes over the frame at the
+    four corners, so the extremes over all corners and all transforms bound
+    every invalid strip. For a pure translation every corner moves by
+    (tx, ty) and this is exactly the translation-only margin.
     """
     h, w = dataSet.get_image_dimensions()
     top = bottom = left = right = 0
     if adaptive:
         warpTask = dataSet.load_analysis_task(warpTaskName)
         tforms = warpTask.get_transformation(fov)
-        tx = np.array([t.params[0, 2] for t in tforms])
-        ty = np.array([t.params[1, 2] for t in tforms])
-        left = int(np.ceil(max(0.0, float((-tx).max()))))
-        right = int(np.ceil(max(0.0, float(tx.max()))))
-        top = int(np.ceil(max(0.0, float((-ty).max()))))
-        bottom = int(np.ceil(max(0.0, float(ty.max()))))
+        corners = np.array([[0, 0, 1], [w - 1, 0, 1],
+                            [0, h - 1, 1], [w - 1, h - 1, 1]], dtype=float)
+        matrices = np.asarray([t.params for t in tforms], dtype=float)
+        displacement = np.einsum('nij,kj->nki', matrices - np.eye(3), corners)
+        dxs, dys = displacement[:, :, 0], displacement[:, :, 1]
+        left = int(np.ceil(max(0.0, float((-dxs).max()))))
+        right = int(np.ceil(max(0.0, float(dxs.max()))))
+        top = int(np.ceil(max(0.0, float((-dys).max()))))
+        bottom = int(np.ceil(max(0.0, float(dys.max()))))
     top, bottom = max(top, cropWidth), max(bottom, cropWidth)
     left, right = max(left, cropWidth), max(right, cropWidth)
     return (top, h - bottom, left, w - right)

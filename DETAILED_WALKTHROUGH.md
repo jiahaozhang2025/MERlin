@@ -47,6 +47,43 @@ is refined through the stack, and fits with large residuals are flagged. When a
 stack has too few usable bead samples, it borrows the curve of the same round
 from neighbouring FOVs instead of fitting noise.
 
+*In-plane rotation (`rotation_correction`, off by default).* The sample can
+also turn slightly between rounds. A translation then aligns the middle of the
+frame and leaves the corners off by the angle times the distance from the
+centre, which a per-plane xy offset cannot remove. With the option on, each
+round's angle is measured from the bead stack itself: the moving and fixed
+planes are cut into tiles, each tile is correlated within the usual bounded
+window, and the tile displacements are fitted with a shift plus a rotation
+about the frame centre; the median over the sampled planes is the round's
+angle. The bead stack is then turned back by that angle and the z and xy
+passes are repeated, so the correlations compare aligned textures. The angle
+is applied together with the depth-dependent shift in a single resampling.
+
+The angle is not taken from the 2D coverglass frame. When the two were
+compared, the frame's angle disagreed with the bead-stack angle in late
+rounds: single FOVs were off by up to about 0.03 deg (about 0.7 px at the
+corner of a 2048 px frame), and the round medians were biased by about
+0.01 deg. The bead-stack angle agreed with an independent bead-matching
+measurement to within 0.005 deg. The 2D frame is also imaged at one depth
+only, while the 3D stack samples the whole slab.
+
+In the transformation table, `xshift`/`yshift` remain the displacement of the
+frame centre, and the angle and its centre go in their own columns. A reader
+that ignores the new columns is therefore still right at the centre and off
+only by the turn towards the corners. If the table held the shift applied
+before the rotation instead, that reader would also be off at the centre, by
+about the angle (in radians) times the shift: about 0.1 px for a 140 px shift
+at 0.035 deg, and 0.7-0.8 px for a 410 px shift at 0.09-0.1 deg.
+
+A `rigid_only_channels` channel has no depth pass, so it gets angle 0, and
+`fit_quality_flags` records that its angle was not measured. If such a stack
+turns with the rounds, give it the depth fit instead (it needs a 3D fiducial on
+the reference grid). The rigid transforms in `offsets_<fov>.npy` and the
+fiducial QC images include the stack's angle.
+
+The design follows Lida Cheng's `rotation_correction`, which fits the angle on
+the 2D frame.
+
 **`CrossFOVCompositeWarp`** (from Lida Cheng). When the stage drifts between
 rounds, part of a FOV's field in a late round was imaged by the neighbouring FOV
 instead. Per-FOV registration can only mark that strip invalid, so its molecules
