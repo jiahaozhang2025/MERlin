@@ -743,6 +743,37 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     pixels at most, which shifts the z peak by far less than its
     precision.
 
+    ONE ANGLE PER ROUND FROM A SEPARATE TASK (rotation_task, default unset;
+    needs rotation_correction on). The sample turns between rounds as one
+    rigid body, so every fov of a round sees the same angle. With
+    rotation_task naming a FiducialRoundRotation task, no angle is measured
+    here: that task measures each fov's angle on one shallow bead plane and
+    takes the median over fovs as the round's angle (see its docstring).
+    Per fov, every moving stack of a round is then handled as follows:
+
+      t1. its fiducial planes and its 2D fiducial frame are turned back by
+          the round angle about the frame centre, from the start;
+      t2. the rigid offset (2D frame, walk, rigid_walk_confirm) is measured
+          on those turned-back frames;
+      t3. steps 2-3 (and z_xy_refine, if on) run on the turned-back planes,
+          exactly as without rotation; no per-stack angle is measured or
+          refined;
+      t4. the rigid offset and the xy shifts are turned back into the
+          moving frame before they are stored, so rigid_y/rigid_x and
+          xshift/yshift keep their meaning (xshift/yshift = displacement of
+          the frame centre).
+
+    rotation_radians is the round angle; rotation_status has source
+    'round', and its measured_radians, trusted and reason echo the rotation
+    task's verdict on this fov's own first-plane angle (trusted false = that
+    task flagged this fov), for information only: the round angle is
+    applied regardless. finalize() substitutes no angle in this mode
+    (rotation_neighbor_substitution has no effect); the z substitution is
+    unchanged. rigid_only_channels get the round angle too, with their
+    rigid offset measured on turned-back frames. The reference stack gets
+    angle 0. The rigid_walk table holds the walk as measured, i.e. on the
+    turned-back frames.
+
     Setting z_polynomial_order and xy_polynomial_order to 1 recovers a linear
     ramp in z; setting them to 0 recovers a rigid offset per round with a
     constant z shift.
@@ -1047,6 +1078,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # count as the z substitution. Acts only with rotation_correction on.
         if 'rotation_neighbor_substitution' not in self.parameters:
             self.parameters['rotation_neighbor_substitution'] = True
+        # Name of a FiducialRoundRotation task whose round angle every stack
+        # of a round gets instead of a per-stack angle (see the class
+        # docstring). None (the default) keeps the per-stack angle.
+        if 'rotation_task' not in self.parameters:
+            self.parameters['rotation_task'] = None
+        if self.parameters['rotation_task'] \
+                and not self.parameters['rotation_correction']:
+            raise ValueError('rotation_task needs rotation_correction true')
         # (fov, dataChannel) -> angle the moving planes are pre-rotated by
         # while they are measured; empty unless rotation_correction is on.
         self._measurementRotation = {}
@@ -1084,6 +1123,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         return 60
 
     def get_dependencies(self):
+        if self.parameters['rotation_task']:
+            return [self.parameters['rotation_task']]
         return []
 
     # ==================================================================
@@ -1552,9 +1593,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 resolved.add(int(entry))
         return resolved
 
-    def _measure_rigid_offsets(self, fov: int):
+    def _measure_rigid_offsets(self, fov: int, dataChannels=None):
         """Rigid xy per data channel, from the 2D fiducial frame or, if
         rigid_plane_search is on, from whichever early plane correlates best.
+
+        dataChannels: the channels to measure, in order (default: every data
+        channel). A channel with a measurement rotation set (rotation_task)
+        is measured on frames turned back by it: its walk planes through
+        _fiducial_plane, its 2D frame here.
 
         The search is BOUNDED at rigid_search_bound about zero. An unbounded
         peak search on a dense self-similar bead field regularly locks onto a
@@ -1577,10 +1623,15 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         fixed2D = self._filter(self.dataSet.get_fiducial_image(0, fov))
         offsets = []
         records = []
-        for dataChannel in self.dataSet.get_data_organization()\
-                .get_data_channels():
+        if dataChannels is None:
+            dataChannels = self.dataSet.get_data_organization()\
+                .get_data_channels()
+        for dataChannel in dataChannels:
             moving2D = self._filter(
                 self.dataSet.get_fiducial_image(dataChannel, fov))
+            turn = self._measurementRotation.get((fov, dataChannel), 0.0)
+            if turn != 0.0:
+                moving2D = self._rotate_about_centre(moving2D, turn)
             dy, dx, snr, _ = self._bounded_correlation_peak(
                 fixed2D, moving2D, 0.0, 0.0, bound=bound)
             best = (dy, dx, snr, -1)
@@ -1837,8 +1888,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         fill only part of the frame p_w can sit much further out. They serve
         the QC images and consumers that want one offset per channel; the
         transformation table, whose xy is measured on turned-back planes,
-        holds the centre displacement. Channels without an angle (reference
-        stack, rigid_only_channels, rotation off) get the plain translation,
+        holds the centre displacement. With rotation_task the rigid offset
+        was measured on frames turned back by the round angle and turned
+        into the moving frame, so it is the centre displacement itself.
+        Channels without an angle (reference stack, rigid_only_channels
+        without rotation_task, rotation off) get the plain translation,
         exactly as before rotation_correction existed."""
         rotation = bool(self.parameters['rotation_correction'])
         if rotation:
@@ -1853,6 +1907,58 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                            rotation_center_y=(height - 1) / 2.0)
             transformations.append(self._row_transform(row))
         return transformations
+
+    # ==================================================================
+    # rotation_task: one angle per round from a FiducialRoundRotation task
+    # ==================================================================
+
+    def _round_rotation_inputs(self, fov: int):
+        """The rotation task's round angle for every data channel (0 for the
+        channels on the reference stack), and its verdict on this fov's own
+        first-plane angle per data channel: {channel: (own angle rad or NaN,
+        flagged, reason)}. Raises if the task has not been finalized or a
+        round has no angle."""
+        name = self.parameters['rotation_task']
+        rotationTask = self.dataSet.load_analysis_task(name)
+        dataOrganization = self.dataSet.get_data_organization()
+        referenceStack = dataOrganization.get_fiducial3D_filename(0, fov)
+        allAngles = rotationTask.get_round_angles()
+        fovVerdicts = rotationTask.get_fov_verdicts(fov)
+        angles, verdicts = {}, {}
+        for dataChannel in dataOrganization.get_data_channels():
+            dataChannel = int(dataChannel)
+            if dataOrganization.get_fiducial3D_filename(
+                    dataChannel, fov) == referenceStack:
+                angles[dataChannel] = 0.0
+                continue
+            angle = allAngles.get(dataChannel, np.nan)
+            if not np.isfinite(angle):
+                raise ValueError(
+                    '%s: rotation task %s has no round angle for data channel '
+                    '%d (no trusted fov in its round; see its round_rotation '
+                    'table)' % (self.get_analysis_name(), name, dataChannel))
+            angles[dataChannel] = float(angle)
+            verdicts[dataChannel] = fovVerdicts.get(
+                dataChannel, (np.nan, True,
+                              'no first-plane measurement for this fov'))
+        return angles, verdicts
+
+    @staticmethod
+    def _round_status_fields(dataChannel: int, verdicts) -> dict:
+        """rotation_status fields of a stack under rotation_task: the
+        rotation task's verdict on this fov's own first-plane angle."""
+        own, flagged, reason = verdicts[dataChannel]
+        return {'measured_radians': own,
+                'n_planes': int(np.isfinite(own)), 'n_sampled': 1,
+                'trusted': not flagged, 'reason': reason, 'source': 'round'}
+
+    def _to_moving_frame(self, shiftY: float, shiftX: float, angle: float):
+        """A shift measured on planes turned back by angle, re-expressed in
+        the moving frame: s = R(angle) s'. Unchanged when angle is 0."""
+        if angle == 0.0:
+            return shiftY, shiftX
+        x, y = self._rotate_vector((shiftX, shiftY), angle)
+        return float(y), float(x)
 
     # ==================================================================
     # storage
@@ -1938,8 +2044,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     def get_rotation_status(self, fov: int) -> pd.DataFrame:
         """Per data channel: the angle in the tables, the fragment's own
         measurement, whether it is trusted, and its source ('fit',
-        'untrusted', 'neighbor', 'reference', 'rigid_only'). Written only with
-        rotation_correction on."""
+        'untrusted', 'neighbor', 'reference', 'rigid_only', or with
+        rotation_task 'round'). Written only with rotation_correction on.
+        With rotation_task, measured_radians / trusted / reason are the
+        rotation task's verdict on this fov's own first-plane angle."""
         return self.dataSet.load_dataframe_from_csv(
             'rotation_status', self, resultIndex=fov,
             subdirectory='transformations')
@@ -1979,11 +2087,15 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         every stack it gives a new angle again (_remeasure_xy_at_angle). It
         does all of that before it writes anything, so a run that stops on
         the way leaves the angles as the fragments wrote them.
+
+        With rotation_task every stack already has its round's angle, so no
+        angle is substituted; the z substitution runs as usual.
         """
         if self.parameters['z_neighbor_substitution']:
             self._substitute_z_curves()
         if self.parameters['rotation_correction'] \
-                and self.parameters['rotation_neighbor_substitution']:
+                and self.parameters['rotation_neighbor_substitution'] \
+                and not self.parameters['rotation_task']:
             self._substitute_angles()
 
     def _neighbor_donors(self, fov, dataChannel, usable, fovXY):
@@ -2726,6 +2838,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         zOrder = self.parameters['z_polynomial_order']
         xyOrder = self.parameters['xy_polynomial_order']
 
+        # rotation_task: every moving channel's frames are turned back by its
+        # round's angle BEFORE anything is measured (steps t1-t2 of the class
+        # docstring); None without the option
+        roundAngles, roundVerdicts = None, None
+        if self.parameters['rotation_task']:
+            roundAngles, roundVerdicts = self._round_rotation_inputs(fov)
+            for dataChannel, angle in roundAngles.items():
+                if angle != 0.0:
+                    self._measurementRotation[(fov, dataChannel)] = angle
+
         rigidOffsets = self._measure_rigid_offsets(fov)
         walkRecords = self._rigidWalkRecords.pop(fov, None)
 
@@ -2761,7 +2883,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             # theta = pre-rotation used while measuring; thetaApplied = the
             # angle written to the table (theta + the residual of step d)
             thetaApplied = 0.0
-            if self.parameters['rotation_correction'] \
+            if roundAngles is not None:
+                # rotation_task: the planes are already turned back by the
+                # round angle (0 for the reference stack); nothing to measure
+                theta = thetaApplied = roundAngles[dataChannel]
+            elif self.parameters['rotation_correction'] \
                     and key != referenceStack:
                 # angle from the unrotated planes, each at its own measured
                 # depth if the gate kept it, else at the plane itself
@@ -2856,6 +2982,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                         zGate, zSampleZ, zSampleOffset)
                     if self._zXyRefineAngle \
                             and self.parameters['rotation_correction'] \
+                            and roundAngles is None \
                             and key != referenceStack:
                         refined = self._refine_angle(
                             fov, dataChannel, rigidY, rigidX, theta,
@@ -2883,8 +3010,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             entry = {'z': zCoefficients, 'y': yCoefficients,
                      'x': xCoefficients}
             if self.parameters['rotation_correction']:
-                if abs(np.degrees(thetaApplied)) > float(
-                        self.parameters['rotation_max_degrees']):
+                if roundAngles is None and abs(np.degrees(thetaApplied)) \
+                        > float(self.parameters['rotation_max_degrees']):
                     rotationReason = ('refined angle %.3f deg beyond '
                                       'rotation_max_degrees'
                                       % np.degrees(thetaApplied))
@@ -2973,6 +3100,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     np.degrees(thetaSpread),
                     int(np.isfinite(thetaRecords[1]).sum()),
                     len(thetaRecords[1]))
+            elif roundAngles is not None and key != referenceStack:
+                line += ', round angle %.4f deg' % np.degrees(thetaApplied)
             if refineStatus is not None:
                 line += (', z_xy_refine: %d -> %d good z samples, max xy '
                          'shift %.2f px%s' % (
@@ -3029,6 +3158,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     'trusted': not angleReasons,
                     'reason': '; '.join(angleReasons),
                     'source': rotationSource}
+                if roundAngles is not None and key != referenceStack:
+                    # rotation_task: the round angle (set above), and the
+                    # rotation task's verdict on this fov's own angle
+                    rotationStatus.update(self._round_status_fields(
+                        dataChannel, roundVerdicts))
                 if unrefinedAngle is not None:
                     # z_xy_refine: the angle and verdict the first pass alone
                     # would have written, for comparison
@@ -3042,6 +3176,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                             np.isfinite(uSpread) and np.degrees(uSpread)
                             > float(self.parameters[
                                 'rotation_max_spread_degrees'])))
+                    if roundAngles is not None:
+                        # no angle is refined: the same verdict as above
+                        rotationStatus['unrefined_trusted'] = \
+                            rotationStatus['trusted']
             return (key, entry, stackMeasurements, line, flag, status,
                     rotationStatus)
 
@@ -3053,6 +3191,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 solvedStacks = list(pool.map(solve_stack, items))
         else:
             solvedStacks = [solve_stack(i) for i in items]
+        if roundAngles is not None:
+            # every plane this fov needs has been measured
+            for dataChannel in roundAngles:
+                self._measurementRotation.pop((fov, dataChannel), None)
 
         # Reassemble in the ORIGINAL channel order, so the output is identical
         # whatever order the threads happened to finish in.
@@ -3070,7 +3212,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             print(line, flush=True)
             if flag is not None:
                 qcFlags.append(flag)
-        if self.parameters['rotation_correction']:
+        if self.parameters['rotation_correction'] and roundAngles is None:
             # a rigid-only channel has no depth pass to measure an angle on;
             # say so rather than let a zero angle read as "measured, none"
             for dataChannel, _, _ in rigidOnlyMembers:
@@ -3130,6 +3272,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         for key, members in stackMembers.items():
             owner = members[0][0]
             for dataChannel, rigidY, rigidX in members:
+                if roundAngles is not None:
+                    # measured on turned-back frames -> moving frame (t4)
+                    rigidY, rigidX = self._to_moving_frame(
+                        rigidY, rigidX, roundAngles[dataChannel])
                 coefficients[dataChannel] = dict(
                     entryOf[key], rigid_y=rigidY, rigid_x=rigidX)
                 # Channels sharing a fiducial stack share its fit, so they
@@ -3143,11 +3289,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             # get_aligned_image apply. A rigid-only channel's polynomial is
             # therefore the constant rigid offset, not zero: all-zero
             # coefficients left these channels unregistered in the table.
+            if roundAngles is not None:
+                rigidY, rigidX = self._to_moving_frame(
+                    rigidY, rigidX, roundAngles[dataChannel])
             coefficients[dataChannel] = {
                 'z': np.zeros(zOrder + 1),
                 'y': np.r_[np.zeros(xyOrder), rigidY],
                 'x': np.r_[np.zeros(xyOrder), rigidX],
                 'rigid_y': rigidY, 'rigid_x': rigidX}
+            if roundAngles is not None:
+                coefficients[dataChannel]['theta'] = roundAngles[dataChannel]
             print('fov %d channel %d: rigid only (%.2f, %.2f), no 3D warp '
                   'fitted' % (fov, dataChannel, rigidY, rigidX), flush=True)
             statusRows.append(dict(
@@ -3191,6 +3342,24 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                              dataChannel=dataChannel,
                                              owner_channel=owner))
             for dataChannel, _, _ in rigidOnlyMembers:
+                if roundAngles is not None:
+                    # rotation_task: the round angle, as for every stack
+                    angle = roundAngles[dataChannel]
+                    rotationRows.append(dict(
+                        fov=fov, dataChannel=dataChannel,
+                        owner_channel=dataChannel, rotation_radians=angle,
+                        measured_radians=0.0, first_pass_radians=angle,
+                        spread_radians=np.nan, n_planes=0, n_sampled=0,
+                        trusted=True, reason='', source='reference'))
+                    if dataOrganization.get_fiducial3D_filename(
+                            dataChannel, fov) != referenceStack:
+                        rotationRows[-1].update(self._round_status_fields(
+                            dataChannel, roundVerdicts))
+                    if self.parameters['z_xy_refine']:
+                        rotationRows[-1].update(
+                            unrefined_radians=angle,
+                            unrefined_trusted=rotationRows[-1]['trusted'])
+                    continue
                 rotationRows.append(dict(
                     fov=fov, dataChannel=dataChannel,
                     owner_channel=dataChannel, rotation_radians=0.0,
@@ -3219,3 +3388,699 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
         self._process_transformations(
             self._rigid_transformations(coefficients, dataChannels), fov)
+
+
+class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
+
+    """
+    One in-plane rotation angle per imaging round, shared by every fov, for
+    FiducialPolynomialWarp3D's rotation_task.
+
+    Between rounds the whole sample can turn slightly about the optical
+    axis. That is one rigid rotation of the whole slab, so every fov of a
+    round turns by the same angle, while the translation differs from fov to
+    fov (the stage does not return to exactly the same position). This task
+    therefore measures the angle in every fov, on one shallow plane of the
+    3D bead stack, and takes the median over the fovs as the round's angle.
+    FiducialPolynomialWarp3D then applies that one angle to every fov and
+    measures only translation and depth.
+
+    Channels are grouped by fiducial bead stack, as FiducialPolynomialWarp3D
+    groups them: the channels of one imaging round share a stack, and a
+    separately acquired stack (a nuclear stack with its own beads, say) is a
+    group of its own. A group is named by its first data channel
+    (owner_channel). Channel 0's stack is the reference and has angle 0.
+
+    PER FOV (one fragment), for every non-reference stack:
+
+      1. coarse shift: FiducialPolynomialWarp3D's rigid offset on unrotated
+         frames -- the 2D fiducial frame, refined by the walk into the bead
+         stack (rigid_plane_search, rigid_plane_step, rigid_snr_ratio,
+         rigid_search_bound, rigid_walk_bound), with rigid_walk_confirm's
+         false-peak guard if set.
+      2. depth match: plane measure_plane of the reference bead stack is
+         compared with the moving stack's planes within +-z_search_range of
+         the same index, each shifted by the coarse shift. The highest
+         normalised correlation, refined with a parabola, gives the moving
+         depth. The angle is not known yet, so this correlation is weakened
+         towards the frame edges by the turn itself; it chooses the depth
+         and is recorded (depth_score), but is not what the gate tests.
+      3. tile fit: the moving plane at that depth (interpolated between the
+         two nearest planes) is shifted by the coarse shift; it and the
+         reference plane are cut into rotation_tiles x rotation_tiles tiles,
+         and each tile pair is correlated with its peak searched within
+         xy_search_bound px of zero. A tile is dropped if either side is
+         empty, if its peak lies on the edge of the search window or if its
+         snr is below rotation_tile_min_snr. The remaining tile
+         displacements are fitted by weighted least squares, weight = tile
+         snr, with a translation plus a rotation about the frame centre
+         (rigid: no scale). Tiles more than 3 robust sd from the fit are
+         dropped and the fit repeated (twice at most).
+      4. residual pass (refine_passes, default 1): the moving plane is
+         resampled with the fitted rotation and translation, step 3 is
+         repeated on it, and the residual angle and translation are added.
+         Parabolic refinement of a correlation peak pulls a sub-pixel
+         displacement towards the nearest whole pixel, so the first fit
+         comes out a few percent short of the true angle; on the resampled
+         plane the displacements are close to zero, where that bias
+         vanishes. FiducialPolynomialWarp3D's per-stack angle does the same
+         (its steps b and d). 0 skips this pass.
+      5. diagnostic only: on the first pass's tiles a similarity fit
+         (translation, rotation and one isotropic scale) is made as well;
+         its scale (scale_ppm) is recorded and never applied. (On
+         synthetic frames it reads about 5% low; the residual pass's tiles,
+         where the rotation is gone, read lower still.)
+      6. alignment check: the moving plane at the matched depth, resampled
+         with the final rotation and translation, is correlated with the
+         reference plane (aligned_score).
+
+    A fov's angle is trusted when FiducialPolynomialWarp3D's z sample gate
+    passes -- aligned_score at least z_min_score, and the depth not on the
+    +-z_search_range limit (z_reject_at_search_limit) -- every pass keeps at
+    least rotation_min_tiles tiles, and |angle| is within
+    rotation_max_degrees; otherwise `reason` says why.
+
+    ACROSS FOVS, in finalize() (`merlin -t <task> --check-done`, once every
+    fragment is done), per stack group:
+
+      - round angle = median of the trusted fov angles;
+      - robust sd = 1.4826 x the median absolute deviation from it;
+        standard error of the median = 1.2533 x robust sd / sqrt(n);
+      - a fov is FLAGGED when its angle is untrusted, or deviates from the
+        round angle by more than max(deviation_min_degrees,
+        deviation_robust_sd x robust sd). A flag is a report only: the fov
+        still gets the round angle downstream.
+
+    A round with no trusted fov has no angle (NaN), and
+    FiducialPolynomialWarp3D refuses to run on it rather than assume 0.
+    finalize() aggregates whatever fragments have written their table and
+    reports how many fovs were missing.
+
+    OUTPUTS, under transformations/:
+
+      first_plane_rotation_<fov>.csv  per fragment, one row per stack group
+      rigid_walk_<fov>.csv            per fragment, with rigid_walk_confirm
+      round_rotation.csv              finalize(): one row per stack group
+      fov_rotation.csv                finalize(): one row per fov and group,
+                                      with the deviation and the flag
+
+    Conventions are FiducialPolynomialWarp3D's: the content at reference
+    position p sits in the moving frame at c + R(theta) (p - c) + t, c the
+    frame centre, theta in radians; xshift/yshift is t, the displacement of
+    the frame centre, as in its transformation table. scale_ppm > 0 means
+    the moving frame's content lies further from the centre than the
+    reference's.
+
+    The measurement code (filtering, cached planes, bounded correlation,
+    rigid walk, z gate) is FiducialPolynomialWarp3D's own, run by an
+    internal instance of it built from this task's parameters. The shared
+    parameters have the same names, meanings and defaults; give them the
+    same values as the registration task that uses this one.
+    """
+
+    outputGroup = 'Prepare'
+
+    # Passed to the internal FiducialPolynomialWarp3D; their defaults are
+    # whatever that class defaults to.
+    _MEASUREMENT_PARAMETERS = (
+        'highpass_sigma', 'median_filter', 'edge_width_to_remove',
+        'zero_below_percentile', 'rigid_plane_search', 'rigid_plane_step',
+        'rigid_snr_ratio', 'rigid_search_bound', 'rigid_walk_bound',
+        'rigid_walk_confirm', 'z_search_range', 'z_min_score',
+        'z_reject_at_search_limit', 'xy_search_bound',
+        'minimum_overlap_pixels', 'rotation_tiles', 'rotation_tile_min_snr',
+        'rotation_min_tiles', 'plane_cache_size', 'per_z_slice_num_threads')
+
+    _FRAGMENT_COLUMNS = [
+        'fov', 'owner_channel', 'members', 'stack_label', 'plane_index',
+        'plane_z_um', 'coarse_y', 'coarse_x', 'depth_offset_um',
+        'depth_score', 'aligned_score', 'depth_ok', 'first_pass_radians',
+        'first_pass_tiles_used', 'first_pass_residual_px', 'n_tiles',
+        'n_tiles_usable', 'n_tiles_used', 'residual_px', 'angle_radians',
+        'angle_deg', 'xshift', 'yshift', 'scale_ppm', 'trusted', 'reason']
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+
+        defaults = FiducialPolynomialWarp3D(dataSet).parameters
+        for name in self._MEASUREMENT_PARAMETERS:
+            if name not in self.parameters:
+                self.parameters[name] = defaults[name]
+        # Index of the reference bead-stack plane the angle is measured on.
+        # None = z_search_range + 1, the shallowest plane whose depth search
+        # stays inside the stack and the first plane FiducialPolynomialWarp3D
+        # samples z (and, with rotation_correction, its angle) on.
+        if 'measure_plane' not in self.parameters:
+            self.parameters['measure_plane'] = None
+        # Residual passes of the tile fit (step 4); 0 = the first fit only.
+        if 'refine_passes' not in self.parameters:
+            self.parameters['refine_passes'] = 1
+        # A fov's angle beyond this is not trusted.
+        if 'rotation_max_degrees' not in self.parameters:
+            self.parameters['rotation_max_degrees'] = 1.0
+        # finalize(): flag a fov whose angle is more than
+        # max(deviation_min_degrees, deviation_robust_sd x robust sd) from
+        # its round's angle.
+        if 'deviation_min_degrees' not in self.parameters:
+            self.parameters['deviation_min_degrees'] = 0.01
+        if 'deviation_robust_sd' not in self.parameters:
+            self.parameters['deviation_robust_sd'] = 4.0
+        # Threads over the stacks of a fov.
+        if 'stack_num_threads' not in self.parameters:
+            self.parameters['stack_num_threads'] = 1
+
+        plane = self.parameters['measure_plane']
+        if plane is not None and (not isinstance(plane, (int, np.integer))
+                                  or isinstance(plane, bool) or plane < 0):
+            raise ValueError('measure_plane must be null or a plane index')
+        passes = self.parameters['refine_passes']
+        if not isinstance(passes, (int, np.integer)) \
+                or isinstance(passes, bool) or passes < 0:
+            raise ValueError('refine_passes must be an integer >= 0')
+
+        self._measurer = FiducialPolynomialWarp3D(
+            dataSet, {name: self.parameters[name]
+                      for name in self._MEASUREMENT_PARAMETERS},
+            self.analysisName)
+
+    def fragment_count(self):
+        return len(self.dataSet.get_fovs())
+
+    def get_estimated_memory(self):
+        return 8192
+
+    def get_estimated_time(self):
+        return 15
+
+    def get_dependencies(self):
+        return []
+
+    # ==================================================================
+    # per fov
+    # ==================================================================
+
+    def _measure_plane(self) -> int:
+        plane = self.parameters['measure_plane']
+        if plane is None:
+            return int(self.parameters['z_search_range']) + 1
+        return int(plane)
+
+    def _stack_groups(self, fov: int):
+        """{fiducial stack: [data channels]} in data channel order, as
+        FiducialPolynomialWarp3D groups them."""
+        dataOrganization = self.dataSet.get_data_organization()
+        groups = OrderedDict()
+        for dataChannel in dataOrganization.get_data_channels():
+            dataChannel = int(dataChannel)
+            groups.setdefault(dataOrganization.get_fiducial3D_filename(
+                dataChannel, fov), []).append(dataChannel)
+        return groups
+
+    def _stack_label(self, dataChannel: int) -> str:
+        """Image type and imaging round of a channel's bead stack, for the
+        tables; empty if the data organization does not say."""
+        data = getattr(self.dataSet.get_data_organization(), 'data', None)
+        try:
+            return '%s round %s' % (
+                data.loc[dataChannel, 'fiducial3DImageType'],
+                data.loc[dataChannel, 'fiducial3DImagingRound'])
+        except (AttributeError, KeyError, TypeError):
+            return ''
+
+    @staticmethod
+    def _resample_rigid(image: np.ndarray, theta: float, tx: float,
+                        ty: float) -> np.ndarray:
+        """out(p) = image(c + R(theta) (p - c) + t), c the frame centre,
+        zero fill: a moving plane put into the reference frame by a rigid
+        transform."""
+        height, width = image.shape
+        cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+        c, s = np.cos(theta), np.sin(theta)
+        matrix = np.float32([[c, -s, cx - c * cx + s * cy + tx],
+                             [s, c, cy - s * cx - c * cy + ty]])
+        return cv2.warpAffine(
+            np.ascontiguousarray(image, dtype=np.float32), matrix,
+            (width, height), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderValue=0)
+
+    def _tile_fit(self, fixedImage: np.ndarray, movingImage: np.ndarray):
+        """Rigid fit (translation + small rotation about the frame centre)
+        to the tile displacements of movingImage against fixedImage, weighted
+        by tile snr, with robust trimming; plus a similarity fit (one more
+        parameter, an isotropic scale) on the kept tiles, as a diagnostic.
+
+        Returns a dict: ok, reason, n_tiles, n_measured (both sides of the
+        tile non-empty), n_usable (peak inside the window, snr high enough),
+        n_used (kept by the trimming), theta, tx, ty (displacement sense:
+        the content at reference p sits in movingImage at
+        c + R(theta) (p - c) + t), rms_px (snr-weighted rms tile residual of
+        the rigid fit) and scale_ppm (of the similarity fit)."""
+        measurer = self._measurer
+        n = int(self.parameters['rotation_tiles'])
+        minSnr = float(self.parameters['rotation_tile_min_snr'])
+        minTiles = int(self.parameters['rotation_min_tiles'])
+        height, width = fixedImage.shape
+        cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
+        rows = np.linspace(0, height, n + 1).astype(int)
+        cols = np.linspace(0, width, n + 1).astype(int)
+        vx, vy, dx, dy, weight = [], [], [], [], []
+        measured = 0
+        for i in range(n):
+            for j in range(n):
+                f = fixedImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                m = movingImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                if not f.any() or not m.any():
+                    continue
+                measured += 1
+                sy, sx, snr, onEdge = measurer._bounded_correlation_peak(
+                    f, m, 0.0, 0.0)
+                if onEdge or not np.isfinite(snr) or snr < minSnr:
+                    continue
+                vx.append(0.5 * (cols[j] + cols[j + 1] - 1) - cx)
+                vy.append(0.5 * (rows[i] + rows[i + 1] - 1) - cy)
+                dx.append(-sx)          # displacement = minus the shift
+                dy.append(-sy)
+                weight.append(snr)
+        result = {'ok': False, 'reason': '', 'n_tiles': n * n,
+                  'n_measured': measured, 'n_usable': len(vx), 'n_used': 0,
+                  'theta': np.nan, 'tx': np.nan, 'ty': np.nan,
+                  'rms_px': np.nan, 'scale_ppm': np.nan}
+        if len(vx) < minTiles:
+            result['reason'] = ('only %d of %d tiles usable (min %d)'
+                                % (len(vx), n * n, minTiles))
+            return result
+        vx, vy, dx, dy, weight = map(np.asarray, (vx, vy, dx, dy, weight))
+        k = len(vx)
+        # d = t + theta * (-v_y, v_x): rows 0..k-1 are x, k..2k-1 are y
+        design = np.zeros((2 * k, 3))
+        design[:k, 0] = 1.0
+        design[k:, 1] = 1.0
+        design[:k, 2] = -vy
+        design[k:, 2] = vx
+        target = np.r_[dx, dy]
+        rootWeight = np.sqrt(np.r_[weight, weight])
+
+        def solve(matrix, keep):
+            rowsKept = np.r_[keep, keep]
+            solution, *_ = np.linalg.lstsq(
+                matrix[rowsKept] * rootWeight[rowsKept, None],
+                target[rowsKept] * rootWeight[rowsKept], rcond=None)
+            residual = target - matrix @ solution
+            return solution, np.hypot(residual[:k], residual[k:])
+
+        keep = np.ones(k, bool)
+        for _ in range(2):
+            _, tileResidual = solve(design, keep)
+            scale = 1.4826 * np.median(tileResidual) + 1e-6
+            good = tileResidual < 3.0 * scale
+            if good.sum() < minTiles:
+                break
+            keep = good
+        solution, tileResidual = solve(design, keep)
+        rms = float(np.sqrt(np.sum(weight[keep] * tileResidual[keep] ** 2)
+                            / np.sum(weight[keep])))
+        # diagnostic: d = t + theta * (-v_y, v_x) + kappa * (v_x, v_y),
+        # scale = 1 + kappa
+        similarity = np.zeros((2 * k, 4))
+        similarity[:, :3] = design
+        similarity[:k, 3] = vx
+        similarity[k:, 3] = vy
+        similaritySolution, _ = solve(similarity, keep)
+        result.update(ok=True, theta=float(solution[2]),
+                      tx=float(solution[0]), ty=float(solution[1]),
+                      n_used=int(keep.sum()), rms_px=rms,
+                      scale_ppm=float(similaritySolution[3] * 1e6))
+        return result
+
+    def _measure_stack(self, fov: int, members, coarseY: float,
+                       coarseX: float) -> dict:
+        """Steps 2-5 of the class docstring for one stack; returns its row
+        of first_plane_rotation."""
+        measurer = self._measurer
+        owner = members[0]
+        zPositions = np.asarray(
+            self.dataSet.get_data_organization()
+            .get_fiducial3D_stack_frame_zPos(owner), dtype=float)
+        planeCount = len(zPositions)
+        searchRange = int(self.parameters['z_search_range'])
+        plane = self._measure_plane()
+        if plane - searchRange < 0 or plane + searchRange > planeCount - 1:
+            raise ValueError(
+                'measure_plane %d with z_search_range %d needs planes %d-%d; '
+                'the bead stack of channel %d has %d'
+                % (plane, searchRange, plane - searchRange,
+                   plane + searchRange, owner, planeCount))
+        spacing = float(np.median(np.diff(zPositions))) if planeCount > 1 \
+            else 1.0
+        row = dict.fromkeys(self._FRAGMENT_COLUMNS, np.nan)
+        row.update(fov=fov, owner_channel=owner,
+                   members=';'.join(str(c) for c in members),
+                   stack_label=self._stack_label(owner), plane_index=plane,
+                   plane_z_um=float(zPositions[plane]),
+                   coarse_y=float(coarseY), coarse_x=float(coarseX),
+                   trusted=False, reason='')
+        reasons = []
+
+        # 2. depth match
+        fixedImage = measurer._fiducial_plane(0, fov, plane)
+
+        def score(delta):
+            return measurer._zncc(fixedImage, measurer._shift_image(
+                measurer._fiducial_plane(owner, fov, plane + delta),
+                coarseY, coarseX))
+
+        scores = np.asarray(measurer._map_over_planes(
+            score, list(range(-searchRange, searchRange + 1))), dtype=float)
+        scores = np.where(np.isfinite(scores), scores, -1.0)
+        best = int(np.argmax(scores))
+        sub = 0.0
+        if 0 < best < len(scores) - 1:
+            sub = measurer._parabolic_vertex(
+                scores[best - 1], scores[best], scores[best + 1])
+        depthOffset = (best - searchRange + sub) * spacing
+        row.update(depth_offset_um=float(depthOffset),
+                   depth_score=float(scores[best]))
+
+        # 3. tile fit on the plane at the matched depth, coarse-shifted
+        movingImage = measurer._fiducial_plane_at_z(
+            owner, fov, zPositions[plane] + depthOffset)
+        fit = self._tile_fit(fixedImage, measurer._shift_image(
+            movingImage, coarseY, coarseX))
+        row.update(first_pass_radians=fit['theta'],
+                   first_pass_tiles_used=fit['n_used'],
+                   first_pass_residual_px=fit['rms_px'],
+                   scale_ppm=fit['scale_ppm'])
+        final, alignedScore = fit, np.nan
+        if not fit['ok']:
+            reasons.append('first pass: ' + fit['reason'])
+        else:
+            # the shifted plane holds moving(q - coarse): t - coarse is the
+            # displacement of the centre in the moving plane itself
+            theta = fit['theta']
+            tx, ty = fit['tx'] - coarseX, fit['ty'] - coarseY
+            # 4. residual passes on the plane resampled by the fit so far
+            for _ in range(int(self.parameters['refine_passes'])):
+                residualFit = self._tile_fit(
+                    fixedImage, self._resample_rigid(movingImage, theta,
+                                                     tx, ty))
+                if not residualFit['ok']:
+                    reasons.append('residual pass: '
+                                   + residualFit['reason'])
+                    final = residualFit
+                    break
+                # content at p sits at c + R(theta) R(r) (p - c)
+                #                       + R(theta) t_r + t
+                rx, ry = measurer._rotate_vector(
+                    (residualFit['tx'], residualFit['ty']), theta)
+                final = residualFit
+                theta += residualFit['theta']
+                tx, ty = tx + rx, ty + ry
+            row.update(angle_radians=theta, angle_deg=float(np.degrees(theta)),
+                       xshift=float(tx), yshift=float(ty))
+            # 6. how well the final rigid fit aligns the two planes
+            alignedScore = measurer._zncc(
+                fixedImage, self._resample_rigid(movingImage, theta, tx, ty))
+            if abs(np.degrees(theta)) > float(
+                    self.parameters['rotation_max_degrees']):
+                reasons.append('angle %.3f deg beyond rotation_max_degrees'
+                               % np.degrees(theta))
+        row.update(n_tiles=final['n_tiles'], n_tiles_usable=final['n_usable'],
+                   n_tiles_used=final['n_used'], residual_px=final['rms_px'])
+        # FiducialPolynomialWarp3D's z sample gate, on the aligned planes
+        depthOk = bool(measurer._z_sample_gate(
+            np.array([depthOffset]), np.array([alignedScore]),
+            searchRange * spacing)[0])
+        row.update(aligned_score=float(alignedScore), depth_ok=depthOk)
+        if not depthOk and fit['ok']:
+            reasons.append('z gate failed (aligned score %.2f, depth offset '
+                           '%+.2f um)' % (alignedScore, depthOffset))
+        row.update(trusted=not reasons, reason='; '.join(reasons))
+        return row
+
+    def _run_analysis(self, fragmentIndex: int):
+        fov = list(self.dataSet.get_fovs())[fragmentIndex]
+        measurer = self._measurer
+        referenceStack = self.dataSet.get_data_organization()\
+            .get_fiducial3D_filename(0, fov)
+        items = [(key, members) for key, members
+                 in self._stack_groups(fov).items() if key != referenceStack]
+        owners = [members[0] for _, members in items]
+        try:
+            # 1. coarse shift of every non-reference stack (unrotated frames)
+            coarse = dict(zip(owners, measurer._measure_rigid_offsets(
+                fov, dataChannels=owners)))
+            walkRecords = measurer._rigidWalkRecords.pop(fov, None)
+
+            def solve(item):
+                _, members = item
+                return self._measure_stack(fov, members, *coarse[members[0]])
+
+            threads = max(1, int(self.parameters['stack_num_threads']))
+            if threads > 1 and len(items) > 1:
+                with ThreadPoolExecutor(
+                        max_workers=min(threads, len(items))) as pool:
+                    rows = list(pool.map(solve, items))
+            else:
+                rows = [solve(item) for item in items]
+        finally:
+            measurer._planeCache.clear()
+            measurer._fftCache.clear()
+
+        for row in rows:
+            print('fov %d stack %d (%s): angle %.4f deg (first pass %.4f), '
+                  'depth %+.2f um (score %.2f, aligned %.2f), %d/%d tiles, '
+                  'residual %.3f px, scale %+.0f ppm%s'
+                  % (fov, row['owner_channel'], row['stack_label'],
+                     np.degrees(row['angle_radians']),
+                     np.degrees(row['first_pass_radians']),
+                     row['depth_offset_um'], row['depth_score'],
+                     row['aligned_score'],
+                     row['n_tiles_used'], row['n_tiles'], row['residual_px'],
+                     row['scale_ppm'],
+                     '' if row['trusted']
+                     else '  *** NOT TRUSTED: %s ***' % row['reason']),
+                  flush=True)
+        self.dataSet.save_dataframe_to_csv(
+            pd.DataFrame(rows, columns=self._FRAGMENT_COLUMNS),
+            'first_plane_rotation', self.get_analysis_name(),
+            resultIndex=fov, subdirectory='transformations', index=False)
+        if walkRecords is not None:
+            self.dataSet.save_dataframe_to_csv(
+                pd.DataFrame(walkRecords, columns=[
+                    'fov', 'dataChannel', 'branch', 'rigid_y', 'rigid_x',
+                    'snr', 'plane', 'y_2d', 'x_2d', 'snr_2d', 'y_first',
+                    'x_first', 'snr_first', 'confirm_plane', 'y_confirm',
+                    'x_confirm', 'snr_confirm']),
+                'rigid_walk', self.get_analysis_name(), resultIndex=fov,
+                subdirectory='transformations', index=False)
+
+    # ==================================================================
+    # across fovs
+    # ==================================================================
+
+    @staticmethod
+    def _text(value) -> str:
+        """A text cell read back from csv: NaN (an empty string) -> ''."""
+        if value is None or (isinstance(value, float) and np.isnan(value)):
+            return ''
+        return str(value)
+
+    @staticmethod
+    def _is_true(value) -> bool:
+        return str(value) == 'True'
+
+    def finalize(self) -> None:
+        """The round angle of every stack group and the per-fov flags (see
+        the class docstring). Idempotent: it only reads the fragments'
+        tables and rewrites round_rotation and fov_rotation from them."""
+        fovs = list(self.dataSet.get_fovs())
+        tables, missing = [], []
+        for fov in fovs:
+            try:
+                tables.append(self.get_first_plane_rotation(fov))
+            except FileNotFoundError:
+                missing.append(fov)
+        if not tables:
+            print('%s: no first_plane_rotation tables, nothing to aggregate'
+                  % self.get_analysis_name(), flush=True)
+            return
+        if missing:
+            print('%s: WARNING %d of %d fovs have no first_plane_rotation '
+                  'table and are left out: %s'
+                  % (self.get_analysis_name(), len(missing), len(fovs),
+                     ' '.join(str(f) for f in missing)), flush=True)
+        measured = pd.concat(tables, ignore_index=True)
+        minDeviation = np.radians(float(
+            self.parameters['deviation_min_degrees']))
+        sdFactor = float(self.parameters['deviation_robust_sd'])
+
+        firstFov = int(measured.fov.iloc[0])
+        referenceStack = self.dataSet.get_data_organization()\
+            .get_fiducial3D_filename(0, firstFov)
+        referenceMembers = self._stack_groups(firstFov)[referenceStack]
+        roundRows = [dict(
+            owner_channel=referenceMembers[0],
+            members=';'.join(str(c) for c in referenceMembers),
+            stack_label=self._stack_label(referenceMembers[0]),
+            source='reference', angle_radians=0.0, angle_deg=0.0, n_fovs=0,
+            n_measured=0, n_untrusted=0, n_flagged=0, robust_sd_deg=np.nan,
+            se_deg=np.nan, deviation_threshold_deg=np.nan,
+            plane_index=np.nan, plane_z_um=np.nan, median_residual_px=np.nan,
+            median_scale_ppm=np.nan, n_fovs_missing=len(missing))]
+        fovRows = []
+        for owner, group in measured.groupby('owner_channel', sort=True):
+            group = group.sort_values('fov')
+            trusted = np.array([self._is_true(v) for v in group.trusted])
+            angles = group.angle_radians.to_numpy(float)[trusted]
+            count = len(angles)
+            if count:
+                roundAngle = float(np.median(angles))
+                robustSd = float(1.4826 * np.median(
+                    np.abs(angles - roundAngle)))
+                standardError = 1.2533 * robustSd / np.sqrt(count)
+                threshold = max(minDeviation, sdFactor * robustSd)
+            else:
+                roundAngle = robustSd = standardError = np.nan
+                threshold = minDeviation
+            memberSets = sorted(set(group.members.astype(str)))
+            if len(memberSets) > 1:
+                print('%s: WARNING stack %d has different members in '
+                      'different fovs: %s' % (self.get_analysis_name(), owner,
+                                              memberSets), flush=True)
+            flagged = 0
+            for row, isTrusted in zip(group.itertuples(), trusted):
+                deviation = float(row.angle_radians) - roundAngle
+                deviating = bool(isTrusted and np.isfinite(deviation)
+                                 and abs(deviation) > threshold)
+                if not isTrusted:
+                    reason = 'untrusted: %s' % self._text(row.reason)
+                elif deviating:
+                    reason = ('deviates %+.4f deg from the round angle '
+                              '(threshold %.4f deg)'
+                              % (np.degrees(deviation),
+                                 np.degrees(threshold)))
+                else:
+                    reason = ''
+                flagged += int(bool(reason))
+                fovRows.append(dict(
+                    fov=int(row.fov), owner_channel=int(owner),
+                    members=str(row.members),
+                    stack_label=self._text(row.stack_label),
+                    angle_radians=float(row.angle_radians),
+                    angle_deg=float(np.degrees(row.angle_radians)),
+                    trusted=bool(isTrusted),
+                    round_angle_radians=roundAngle,
+                    deviation_deg=float(np.degrees(deviation)),
+                    deviation_threshold_deg=float(np.degrees(threshold)),
+                    deviating=deviating, flagged=bool(reason),
+                    flag_reason=reason,
+                    residual_px=float(row.residual_px),
+                    n_tiles_used=row.n_tiles_used,
+                    scale_ppm=float(row.scale_ppm),
+                    depth_offset_um=float(row.depth_offset_um)))
+            roundRows.append(dict(
+                owner_channel=int(owner), members=memberSets[0],
+                stack_label=self._text(group['stack_label'].iloc[0]),
+                source='measured',
+                angle_radians=roundAngle,
+                angle_deg=float(np.degrees(roundAngle)), n_fovs=count,
+                n_measured=len(group), n_untrusted=int((~trusted).sum()),
+                n_flagged=flagged, robust_sd_deg=float(np.degrees(robustSd)),
+                se_deg=float(np.degrees(standardError)),
+                deviation_threshold_deg=float(np.degrees(threshold)),
+                plane_index=int(group.plane_index.iloc[0]),
+                plane_z_um=float(group.plane_z_um.iloc[0]),
+                median_residual_px=float(np.median(
+                    group.residual_px.to_numpy(float)[trusted]))
+                if count else np.nan,
+                median_scale_ppm=float(np.median(
+                    group.scale_ppm.to_numpy(float)[trusted]))
+                if count else np.nan,
+                n_fovs_missing=len(missing)))
+
+        roundTable = pd.DataFrame(roundRows)
+        fovTable = pd.DataFrame(fovRows)
+        self.dataSet.save_dataframe_to_csv(
+            roundTable, 'round_rotation', self.get_analysis_name(),
+            subdirectory='transformations', index=False)
+        self.dataSet.save_dataframe_to_csv(
+            fovTable, 'fov_rotation', self.get_analysis_name(),
+            subdirectory='transformations', index=False)
+        print('%s: round angles from %d fovs' % (
+            self.get_analysis_name(), len(tables)), flush=True)
+        print(roundTable[['owner_channel', 'stack_label', 'source', 'angle_deg',
+                          'n_fovs', 'n_measured', 'robust_sd_deg', 'se_deg',
+                          'n_flagged']].to_string(index=False), flush=True)
+        flaggedRows = fovTable[fovTable.flagged]
+        if len(flaggedRows):
+            print('flagged (fov, stack: reason):', flush=True)
+            for row in flaggedRows.itertuples():
+                print('  fov %d stack %d: %s' % (row.fov, row.owner_channel,
+                                                 row.flag_reason), flush=True)
+
+    # ==================================================================
+    # getters
+    # ==================================================================
+
+    def _load(self, name: str, fov: int = None) -> pd.DataFrame:
+        try:
+            return self.dataSet.load_dataframe_from_csv(
+                name, self, resultIndex=fov, subdirectory='transformations',
+                float_precision='round_trip')
+        except FileNotFoundError:
+            if fov is not None:
+                raise
+            raise FileNotFoundError(
+                '%s: no %s table yet; run `merlin -t %s --check-done` once '
+                'every fragment is done' % (self.get_analysis_name(), name,
+                                            self.get_analysis_name()))
+
+    def get_first_plane_rotation(self, fov: int) -> pd.DataFrame:
+        """One fragment's measurements, one row per non-reference stack."""
+        return self._load('first_plane_rotation', fov)
+
+    def get_round_rotation(self) -> pd.DataFrame:
+        """finalize()'s round table, one row per stack group."""
+        return self._load('round_rotation')
+
+    def get_fov_rotation(self) -> pd.DataFrame:
+        """finalize()'s per-fov table, with the deviation flags."""
+        return self._load('fov_rotation')
+
+    def get_round_angles(self) -> dict:
+        """{data channel: its round's angle in radians}, for every channel
+        of every group (0 on the reference stack, NaN for a round without a
+        trusted fov)."""
+        angles = {}
+        for row in self.get_round_rotation().itertuples():
+            for member in str(row.members).split(';'):
+                angles[int(member)] = float(row.angle_radians)
+        return angles
+
+    def get_round_angle(self, dataChannel: int) -> float:
+        """The angle, in radians, of dataChannel's round. Raises if its
+        round has no angle."""
+        angles = self.get_round_angles()
+        if int(dataChannel) not in angles:
+            raise KeyError('%s: data channel %d is in no stack group'
+                           % (self.get_analysis_name(), dataChannel))
+        angle = angles[int(dataChannel)]
+        if not np.isfinite(angle):
+            raise ValueError('%s: the round of data channel %d has no '
+                             'trusted fov, so no angle'
+                             % (self.get_analysis_name(), dataChannel))
+        return angle
+
+    def get_fov_verdicts(self, fov: int) -> dict:
+        """{data channel: (this fov's own angle in radians, NaN if
+        untrusted; flagged; flag reason)} for the non-reference stacks of
+        one fov."""
+        table = self.get_fov_rotation()
+        verdicts = {}
+        for row in table[table.fov == fov].itertuples():
+            own = float(row.angle_radians) if self._is_true(row.trusted) \
+                else np.nan
+            for member in str(row.members).split(';'):
+                verdicts[int(member)] = (own, self._is_true(row.flagged),
+                                         self._text(row.flag_reason))
+        return verdicts

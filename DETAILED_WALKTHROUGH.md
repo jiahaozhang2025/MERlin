@@ -115,6 +115,30 @@ whose re-measurement returns too few samples, and the report flags it. The
 fiducial QC images that the fragment wrote keep the fragment's angle;
 `finalize()` does not redraw them.
 
+*One angle per round (`FiducialRoundRotation` with `rotation_task`, off by
+default).* The turn between rounds is a rigid rotation of the whole sample, so
+every FOV of a round turns by the same angle, while the translation differs
+from FOV to FOV because the stage does not return to exactly the same place.
+Measuring a separate angle for every stack through the whole depth gives
+angles that scatter more than that, mostly at the edges of the sample. Where
+they deviate, the deviation comes from the deeper planes; on the shallowest
+bead plane those FOVs agree with the rest. So the angle is measured once per
+FOV and stack on one shallow plane of the 3D bead stack (not the 2D frame), and
+the median over FOVs is the round's angle. The plane is the first one the z
+samples use, and it is compared at the depth that correlates best. The
+coarse shift comes from the usual rigid offset. Tile displacements are fitted
+with a shift and a rotation (no scale), weighted by tile snr and robustly
+trimmed. One residual pass on the plane turned back by the first estimate
+removes the few-percent underestimate of a single tile fit. The registration
+task then turns every moving stack back by its round's angle before it
+measures anything, and from there it measures only the rigid offset, the z
+drift and the xy drift, on the turned-back planes, per FOV as usual. No
+per-stack angle is measured, so there is nothing to borrow from neighbours.
+FOVs whose own angle is untrusted, or deviates from the round angle by more
+than a few robust standard deviations, are flagged in the round task's tables
+and in `rotation_status`, but still get the round angle. A scale is fitted
+alongside the angle as a diagnostic and never applied.
+
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame
 that is badly wrong. Every later plane is searched only close to the running

@@ -252,10 +252,24 @@ major change was made.
     `rotation_neighbor_substitutions.csv`, the re-measured samples
     `rotation_neighbor_xy_samples.csv`. Fiducial QC images keep the fragment's
     angle.
+  - `rotation_task` (default unset; needs `rotation_correction`): Names a
+    `FiducialRoundRotation` task. Every stack of a round then gets that task's
+    one round angle: its frames are turned back by it before the rigid offset,
+    z and xy are measured, no per-stack angle is measured or refined, and
+    `finalize()` substitutes no angle (z substitution unchanged).
+    `rotation_status` source `round`; `rigid_only_channels` get the angle too.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
     Concurrency and memory.
+- `FiducialRoundRotation` (new task): One in-plane angle per round, shared by
+  all FOVs, for `rotation_task`. Per FOV and fiducial stack, a rigid angle on
+  one shallow bead plane (`measure_plane`): coarse shift, depth match,
+  snr-weighted tile fit, `refine_passes` residual passes; a scale is recorded
+  as a diagnostic only. `finalize()` takes the median over trusted FOVs and
+  flags FOVs that are untrusted or deviate (`deviation_min_degrees`,
+  `deviation_robust_sd`): `round_rotation.csv`, `fov_rotation.csv`,
+  `first_plane_rotation_<fov>.csv`.
 
 ### Segmentation (`merlin/analysis/segment.py`, `merlin/util/spatialfeature.py`)
 
@@ -300,7 +314,8 @@ major change was made.
 - Option names are lowercase (e.g. `write_decoded_FOVs` -> `write_decoded_fovs`,
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
-  synthetic spots, PolyWarp rigid-only channels, PolyWarp rotation.
+  synthetic spots, PolyWarp rigid-only channels, PolyWarp rotation, round
+  rotation (`FiducialRoundRotation` + `rotation_task`).
 - `-i`: Accepts a fragment range (`0-25`) or list (`3,8,11`), run in one process.
 - snakemake: Imported only when running a whole analysis with snakemake; an
   optional extra.
