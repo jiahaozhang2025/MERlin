@@ -51,10 +51,10 @@ from neighbouring FOVs instead of fitting noise.
 `rotation_task`, off by default).* The sample can also turn slightly about the
 optical axis between rounds. A translation then aligns the middle of the frame
 and leaves the corners off by the angle times the distance from the centre,
-which a per-plane xy offset cannot remove. The turn comes from the stage: the
-whole sample turns as one rigid body, so every FOV of a round turns by the same
-angle, while the translation differs from FOV to FOV because the stage does not
-return to exactly the same place. The angle is therefore measured once per
+which a per-plane xy offset cannot remove. The design takes the turn to come
+from the stage: the whole sample turns as one rigid body, so every FOV of a
+round turns by the same angle, while the translation differs from FOV to FOV
+because the stage does not return to exactly the same place. The angle is therefore measured once per
 round, not per stack.
 
 The round task measures, in every FOV and for every fiducial stack, a rigid
@@ -104,9 +104,10 @@ neighbours' median in `finalize()`, measuring that stack's xy again. Those
 per-stack angles scattered more than the turn of a rigid sample allows, mostly
 at the edges of the sample, and where they deviated, the deviation came from
 the deeper planes; on the shallowest bead plane those FOVs agreed with the
-rest. It was removed: the stage's turn is one rigid rotation per round, and a
-FOV's bead field changing with depth is deformation, not a turn of its own. The
-round angle is now the only way an angle is estimated (the removed option is
+rest. It was removed: the stage's turn is taken to be one rigid rotation per
+round, and a FOV's bead field that changes with depth is treated as deformation
+of the gel, not as a turn of its own. The round angle is now the only way an
+angle is estimated (the removed option is
 `rotation_correction` without `rotation_task`; CHANGES.md says how old task
 files are read).
 
