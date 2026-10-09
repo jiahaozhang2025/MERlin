@@ -47,25 +47,45 @@ is refined through the stack, and fits with large residuals are flagged. When a
 stack has too few usable bead samples, it borrows the curve of the same round
 from neighbouring FOVs instead of fitting noise.
 
-*In-plane rotation (`rotation_correction`, off by default).* The sample can
-also turn slightly between rounds. A translation then aligns the middle of the
-frame and leaves the corners off by the angle times the distance from the
-centre, which a per-plane xy offset cannot remove. With the option on, each
-round's angle is measured from the bead stack itself: the moving and fixed
-planes are cut into tiles, each tile is correlated within the usual bounded
-window, and the tile displacements are fitted with a shift plus a rotation
-about the frame centre; the median over the sampled planes is the round's
-angle. The bead stack is then turned back by that angle and the z and xy
-passes are repeated, so the correlations compare aligned textures. The angle
-is applied together with the depth-dependent shift in a single resampling.
+*In-plane rotation, one angle per round (`FiducialRoundRotation` with
+`rotation_task`, off by default).* The sample can also turn slightly about the
+optical axis between rounds. A translation then aligns the middle of the frame
+and leaves the corners off by the angle times the distance from the centre,
+which a per-plane xy offset cannot remove. The turn comes from the stage: the
+whole sample turns as one rigid body, so every FOV of a round turns by the same
+angle, while the translation differs from FOV to FOV because the stage does not
+return to exactly the same place. The angle is therefore measured once per
+round, not per stack.
 
-The angle is not taken from the 2D coverglass frame. When the two were
-compared, the frame's angle disagreed with the bead-stack angle in late
-rounds: single FOVs were off by up to about 0.03 deg (about 0.7 px at the
-corner of a 2048 px frame), and the round medians were biased by about
-0.01 deg. The bead-stack angle agreed with an independent bead-matching
-measurement to within 0.005 deg. The 2D frame is also imaged at one depth
-only, while the 3D stack samples the whole slab.
+The round task measures, in every FOV and for every fiducial stack, a rigid
+angle on one shallow plane of the 3D bead stack: the first plane the z samples
+use, compared at the depth that correlates best. The coarse shift comes from
+the usual rigid offset. The two planes are cut into tiles, each tile is
+correlated within the usual bounded window, and the tile displacements are
+fitted with a shift and a rotation about the frame centre (no scale), weighted
+by tile snr and robustly trimmed. One residual pass on the plane turned back by
+the first estimate removes the few-percent underestimate of a single tile fit.
+The median over FOVs is the round's angle. FOVs whose own angle is untrusted,
+or deviates from the round angle by more than a few robust standard deviations,
+are flagged in the round task's tables and in `rotation_status`, but still get
+the round angle. A scale is fitted alongside the angle as a diagnostic and
+never applied.
+
+The registration task then turns every moving stack back by its round's angle
+before it measures anything, and from there it measures only the rigid offset,
+the z drift and the xy drift, on the turned-back planes, per FOV as usual. The
+angle and the depth-dependent shift are applied together in a single
+resampling. Without `rotation_task` nothing is turned and the tables have no
+rotation columns. A FOV whose bead field deforms with depth (stretch or shear
+of the gel) is not described by the round angle, which is the rigid part only.
+
+The angle is taken from the bead stack, not from the 2D coverglass frame.
+When the two were compared, the frame's angle disagreed with the bead-stack
+angle in late rounds: single FOVs were off by up to about 0.03 deg (about
+0.7 px at the corner of a 2048 px frame), and the round medians were biased by
+about 0.01 deg. The 2D frame is also imaged at one depth only. Lida Cheng's
+`rotation_correction`, which fits one angle per FOV on the 2D frame, was the
+starting point.
 
 In the transformation table, `xshift`/`yshift` remain the displacement of the
 frame centre, and the angle and its centre go in their own columns. A reader
@@ -73,71 +93,22 @@ that ignores the new columns is therefore still right at the centre and off
 only by the turn towards the corners. If the table held the shift applied
 before the rotation instead, that reader would also be off at the centre, by
 about the angle (in radians) times the shift: about 0.1 px for a 140 px shift
-at 0.035 deg, and 0.7-0.8 px for a 410 px shift at 0.09-0.1 deg.
+at 0.035 deg, and 0.7-0.8 px for a 410 px shift at 0.09-0.1 deg. The rigid
+transforms in `offsets_<fov>.npy` and the fiducial QC images include the
+angle. A `rigid_only_channels` channel gets the round angle too, with its
+rigid offset measured on turned-back frames.
 
-A `rigid_only_channels` channel has no depth pass, so it gets angle 0, and
-`fit_quality_flags` records that its angle was not measured. If such a stack
-turns with the rounds, give it the depth fit instead (it needs a 3D fiducial on
-the reference grid). The rigid transforms in `offsets_<fov>.npy` and the
-fiducial QC images include the stack's angle.
-
-The design follows Lida Cheng's `rotation_correction`, which fits the angle on
-the 2D frame.
-
-An edge FOV can have too few tiles with beads to give an angle, or give
-per-plane angles that scatter. Its angle then falls back to 0, which leaves the
-corners off by the full turn (about 2.3 px at 0.09 deg on a 2048 px frame).
-`finalize()` replaces such an angle with the median angle of the same channel
-in the neighbouring FOVs, as it already does for an unfitted z curve
-(`rotation_neighbor_substitution`). Only neighbours whose angle is trusted and
-whose z was fitted count: an angle measured at the wrong depths is not
-evidence, even when its per-plane values agree. The stack's shift has to
-change too. Its xy was correlated on planes turned back by its own first-pass
-angle, or on unrotated planes when that fell back to 0. A translation
-correlation of two frames that still differ by a small turn measures the
-displacement at the bead-weighted centroid of their overlap, not at the frame
-centre. So `finalize()` measures the stack's xy again, on fiducial planes
-turned back by the substituted angle, with the fragment's own xy pass, z curve
-and rigid offset, and refits it. The frames then differ by a translation only,
-and the correlation gives the displacement of the centre wherever the beads
-are. This reads the stack's xy sample planes again, so `finalize()` needs the
-raw images and takes a few seconds per substituted stack.
-
-A closed-form correction was tried first: with a rigid shift `s` the overlap's
-geometric centroid lies `s/2` from the centre, so the centre displacement
-could be corrected by the rotation about that point, about the angle (in
-radians) times `|s|/2`. That is right only when the beads fill the overlap
-evenly. The stacks whose angle needs substituting are mostly those with beads
-in only part of the frame, and there the bead-weighted centroid can sit
-hundreds of pixels from the geometric one: at 0.1 deg, 600 px away leaves the
-centre about 1 px off. The formula is kept only as a fallback for a stack
-whose re-measurement returns too few samples, and the report flags it. The
-fiducial QC images that the fragment wrote keep the fragment's angle;
-`finalize()` does not redraw them.
-
-*One angle per round (`FiducialRoundRotation` with `rotation_task`, off by
-default).* The turn between rounds is a rigid rotation of the whole sample, so
-every FOV of a round turns by the same angle, while the translation differs
-from FOV to FOV because the stage does not return to exactly the same place.
-Measuring a separate angle for every stack through the whole depth gives
-angles that scatter more than that, mostly at the edges of the sample. Where
-they deviate, the deviation comes from the deeper planes; on the shallowest
-bead plane those FOVs agree with the rest. So the angle is measured once per
-FOV and stack on one shallow plane of the 3D bead stack (not the 2D frame), and
-the median over FOVs is the round's angle. The plane is the first one the z
-samples use, and it is compared at the depth that correlates best. The
-coarse shift comes from the usual rigid offset. Tile displacements are fitted
-with a shift and a rotation (no scale), weighted by tile snr and robustly
-trimmed. One residual pass on the plane turned back by the first estimate
-removes the few-percent underestimate of a single tile fit. The registration
-task then turns every moving stack back by its round's angle before it
-measures anything, and from there it measures only the rigid offset, the z
-drift and the xy drift, on the turned-back planes, per FOV as usual. No
-per-stack angle is measured, so there is nothing to borrow from neighbours.
-FOVs whose own angle is untrusted, or deviates from the round angle by more
-than a few robust standard deviations, are flagged in the round task's tables
-and in `rotation_status`, but still get the round angle. A scale is fitted
-alongside the angle as a diagnostic and never applied.
+An earlier version measured a separate angle for every stack through its whole
+depth, and replaced an edge FOV's angle that failed or scattered with its
+neighbours' median in `finalize()`, measuring that stack's xy again. Those
+per-stack angles scattered more than the turn of a rigid sample allows, mostly
+at the edges of the sample, and where they deviated, the deviation came from
+the deeper planes; on the shallowest bead plane those FOVs agreed with the
+rest. It was removed: the stage's turn is one rigid rotation per round, and a
+FOV's bead field changing with depth is deformation, not a turn of its own. The
+round angle is now the only way an angle is estimated (the removed option is
+`rotation_correction` without `rotation_task`; CHANGES.md says how old task
+files are read).
 
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame
@@ -166,9 +137,7 @@ offset can fix this, because none is right at every depth; taking it from a
 deeper plane only moves the problem to the shallow samples. With the option
 on, the z samples are measured a second time, each shifted by the fitted xy at
 its own depth, and z is refitted and xy measured again on the new z curve.
-The refined samples are used unless fewer of them pass the gate. With
-`rotation_correction` the angle is measured again as well, since an angle
-measured at the wrong depths falls back or scatters for the same reason.
+The refined samples are used unless fewer of them pass the gate.
 
 **`CrossFOVCompositeWarp`** (from Lida Cheng). When the stage drifts between
 rounds, part of a FOV's field in a late round was imaged by the neighbouring FOV

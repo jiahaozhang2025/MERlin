@@ -125,9 +125,13 @@ class _Org:
 
 
 class _DataSet:
-    def __init__(self, stacks, twoD, size=SIZE):
+    def __init__(self, stacks, twoD, size=SIZE, tasks=None):
         self.stacks, self.twoD, self.size = stacks, twoD, size
         self.saved = {}
+        self.tasks = dict(tasks or {})
+
+    def load_analysis_task(self, name):
+        return self.tasks[name]
 
     def get_data_organization(self):
         return _Org()
@@ -177,12 +181,12 @@ PARAMETERS = {
     'write_fiducial_images': False, 'write_aligned_images': False}
 
 
-def run(refine, stacks=STACKS, twoD=TWO_D, size=SIZE, **extra):
+def run(refine, stacks=STACKS, twoD=TWO_D, size=SIZE, tasks=None, **extra):
     parameters = dict(PARAMETERS, **extra)
     if refine is not None:
         parameters['z_xy_refine'] = refine
-    task = FiducialPolynomialWarp3D(_DataSet(stacks, twoD, size), parameters,
-                                    'PolyWarp')
+    task = FiducialPolynomialWarp3D(_DataSet(stacks, twoD, size, tasks),
+                                    parameters, 'PolyWarp')
     with contextlib.redirect_stdout(io.StringIO()) as out:
         task._run_analysis(0)
     task.log = out.getvalue()
@@ -329,7 +333,7 @@ class ZXyRefineKeepsBetterSamplesTests(unittest.TestCase):
         np.testing.assert_array_equal(z.score, 0.95)
 
 
-# ---- with rotation_correction: the angle is measured again ----
+# ---- with rotation_task: the refinement runs on the turned-back planes ----
 
 RSIZE = 384
 THETA_DEG = 0.35
@@ -339,8 +343,20 @@ RSTACKS = {0: render(RVOLUME, False, size=RSIZE),
                      angle=np.radians(THETA_DEG))}
 RTWO_D = {0: two_d(31, False, size=RSIZE),
           1: two_d(31, True, size=RSIZE, angle=np.radians(THETA_DEG))}
-ROTATION = dict(rotation_correction=True, rotation_tiles=4,
-                rotation_min_tiles=8, rotation_min_planes=4)
+
+
+class _RoundTask:
+    """Stands in for a finalized FiducialRoundRotation task: channel 1's
+    round has the true angle."""
+
+    def get_round_angles(self):
+        return {0: 0.0, 1: float(np.radians(THETA_DEG))}
+
+    def get_fov_verdicts(self, fov):
+        return {1: (float(np.radians(THETA_DEG)), False, '')}
+
+
+ROUND = dict(tasks={'RoundRot': _RoundTask()}, rotation_task='RoundRot')
 
 
 def truth(zPos):
@@ -353,25 +369,27 @@ def truth(zPos):
                      [s, c, cy - s * cx - c * cy - sy], [0, 0, 1.0]])
 
 
-class ZXyRefineRotationTests(unittest.TestCase):
+class ZXyRefineRoundAngleTests(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        cls.off = run(False, RSTACKS, RTWO_D, RSIZE, **ROTATION)
-        cls.on = run(True, RSTACKS, RTWO_D, RSIZE, **ROTATION)
+        cls.off = run(False, RSTACKS, RTWO_D, RSIZE, **ROUND)
+        cls.on = run(True, RSTACKS, RTWO_D, RSIZE, **ROUND)
 
     def test_premise_off_unfitted(self):
         status = table(self.off, 'z_fit_status').set_index('dataChannel')
         self.assertFalse(status.loc[1, 'fitted'])
 
-    def test_refined_angle_and_z(self):
+    def test_refined_z_with_the_round_angle(self):
         status = table(self.on, 'z_fit_status').set_index('dataChannel')
         self.assertEqual(status.loc[1, 'n_good'], status.loc[1, 'n_samples'])
         rotation = table(self.on, 'rotation_status').set_index('dataChannel')
-        self.assertTrue(rotation.loc[1, 'trusted'])
-        self.assertAlmostEqual(np.degrees(rotation.loc[1, 'rotation_radians']),
-                               THETA_DEG, delta=0.02)
-        self.assertIn('unrefined_trusted', rotation.columns)
+        # the angle is the round's, not refined (to the csv round trip)
+        self.assertAlmostEqual(rotation.loc[1, 'rotation_radians'],
+                               np.radians(THETA_DEG), places=15)
+        self.assertEqual(rotation.loc[1, 'unrefined_radians'],
+                         rotation.loc[1, 'rotation_radians'])
+        self.assertEqual(rotation.loc[1, 'source'], 'round')
         t = table(self.on, 'transformation_table')
         moving = t[t.dataChannel == 1]
         inner = moving[(moving.zPos > 3.5) & (moving.zPos < Z[-1] - 2)]

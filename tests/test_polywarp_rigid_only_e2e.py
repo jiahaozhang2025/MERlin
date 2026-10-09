@@ -135,7 +135,7 @@ class _DataSet:
         self.saved[resultName, resultIndex] = np.array(analysisResult)
 
 
-def run(rigidOnly, rotation=False):
+def run(rigidOnly):
     dataSet = _DataSet()
     task = FiducialPolynomialWarp3D(dataSet, {
         'rigid_only_channels': list(rigidOnly), 'highpass_sigma': 3,
@@ -143,9 +143,7 @@ def run(rigidOnly, rotation=False):
         'write_fiducial_images': False, 'z_search_range': 4,
         'z_sample_step': 3, 'xy_sample_step': 2, 'edge_width_to_remove': 10,
         'rigid_search_bound': 60, 'rigid_plane_search': 0,
-        'z_neighbor_substitution': False,
-        'rotation_correction': rotation, 'rotation_tiles': 4,
-        'rotation_min_tiles': 6, 'rotation_min_planes': 3}, 'PolyWarp')
+        'z_neighbor_substitution': False}, 'PolyWarp')
     with contextlib.redirect_stdout(io.StringIO()):
         task._run_analysis(0)
     return task
@@ -204,20 +202,6 @@ class RigidOnlyEndToEnd(unittest.TestCase):
             pd.testing.assert_frame_equal(
                 rigid[rigid.dataChannel == dataChannel].reset_index(drop=True),
                 none[none.dataChannel == dataChannel].reset_index(drop=True))
-
-    def test_rotation_on_keeps_rigid_offset_at_angle_zero(self):
-        task = run([2, 3], rotation=True)
-        table = task.get_transformation_table(0)
-        for dataChannel in (2, 3):
-            np.testing.assert_array_equal(
-                table[table.dataChannel == dataChannel].rotation_radians, 0.0)
-            self.assertLess(self._table_error(task, dataChannel), 0.2)
-            self.assertLess(self._aligned_residual(task, dataChannel), 0.5)
-        flags = task.dataSet.load_dataframe_from_csv(
-            'fit_quality_flags', resultIndex=0)
-        flagged = set(flags[flags.reasons.str.contains(
-            'rigid_only channel')].dataChannel)
-        self.assertEqual(flagged, {2, 3})
 
 
 if __name__ == '__main__':

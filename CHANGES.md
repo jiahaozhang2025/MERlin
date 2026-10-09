@@ -223,41 +223,24 @@ major change was made.
     z samples and skip the z fit when too few remain.
   - `z_xy_refine` (default false): After the first z and xy fits, re-measures
     z with each sample shifted by the xy fit at its depth (not the one rigid
-    offset), refits z, re-measures xy and, with `rotation_correction`, the
-    angle. For stacks whose xy moves with depth. `z_fit_status` and
-    `rotation_status` record the first pass alongside.
+    offset), refits z and re-measures xy. For stacks whose xy moves with
+    depth. `z_fit_status` records the first pass alongside.
   - `z_neighbor_substitution` (with `z_neighbor_rings_um`,
     `z_neighbor_min_donors`, `z_neighbor_min_samples`): Gives an unfitted stack
     the median curve of the same round in neighbouring FOVs.
   - `max_z_fit_residual`, `max_xy_fit_residual`, `min_xy_planes_kept`: Flag
     suspect fits in `fit_quality_flags_<fov>.csv`.
-  - `rotation_correction` (default false; with `rotation_tiles`,
-    `rotation_tile_min_snr`, `rotation_min_tiles`, `rotation_min_planes`,
-    `rotation_max_degrees`, `rotation_max_spread_degrees`): One in-plane angle
-    per round, measured on bead-stack tiles; the table gains
-    `rotation_radians` and `rotation_center_x/y` (xshift/yshift = displacement
-    of the frame centre). `offsets_<fov>.npy` and fiducial QC images include
-    the angle; `rigid_only_channels` get angle 0 and a `fit_quality_flags` row.
-    Design after Lida Cheng's `rotation_correction`.
-  - `rotation_neighbor_substitution` (default true; acts only with
-    `rotation_correction`): `finalize()` gives a stack whose angle fell back to
-    0, or whose per-plane angles scatter, the median angle of the same channel
-    over neighbouring FOVs with a trusted angle and a fitted z (same rings as
-    the z substitution), and re-measures its xy on fiducial planes turned back
-    by the new angle (the fragment's xy pass, z curve and rigid offset). Only
-    when that returns too few samples is the shift corrected by an
-    overlap-centroid formula instead, which assumes evenly spread beads; the
-    report flags those (`xy_method` `formula_fallback`). The per-channel
-    verdict is in `rotation_status_<fov>.csv`; the report is
-    `rotation_neighbor_substitutions.csv`, the re-measured samples
-    `rotation_neighbor_xy_samples.csv`. Fiducial QC images keep the fragment's
-    angle.
-  - `rotation_task` (default unset; needs `rotation_correction`): Names a
-    `FiducialRoundRotation` task. Every stack of a round then gets that task's
-    one round angle: its frames are turned back by it before the rigid offset,
-    z and xy are measured, no per-stack angle is measured or refined, and
-    `finalize()` substitutes no angle (z substitution unchanged).
-    `rotation_status` source `round`; `rigid_only_channels` get the angle too.
+  - `rotation_task` (default unset): In-plane rotation, one angle per round.
+    Names a `FiducialRoundRotation` task, and every stack of a round gets that
+    task's round angle: its frames are turned back by it before the rigid
+    offset, z and xy are measured. The table gains `rotation_radians` and
+    `rotation_center_x/y` (xshift/yshift = displacement of the frame centre);
+    `offsets_<fov>.npy` and fiducial QC images include the angle;
+    `rigid_only_channels` get it too. `rotation_status_<fov>.csv` (source
+    `round`) repeats the round task's verdict on the FOV's own angle. Unset:
+    no rotation. This is the only way an angle is estimated. Lida Cheng's
+    `rotation_correction` (one angle per FOV from the 2D frame) was the
+    starting point.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
@@ -265,7 +248,8 @@ major change was made.
 - `FiducialRoundRotation` (new task): One in-plane angle per round, shared by
   all FOVs, for `rotation_task`. Per FOV and fiducial stack, a rigid angle on
   one shallow bead plane (`measure_plane`): coarse shift, depth match,
-  snr-weighted tile fit, `refine_passes` residual passes; a scale is recorded
+  snr-weighted tile fit (`rotation_tiles`, `rotation_tile_min_snr`,
+  `rotation_min_tiles`), `refine_passes` residual passes; a scale is recorded
   as a diagnostic only. `finalize()` takes the median over trusted FOVs and
   flags FOVs that are untrusted or deviate (`deviation_min_degrees`,
   `deviation_robust_sd`): `round_rotation.csv`, `fov_rotation.csv`,
@@ -314,8 +298,17 @@ major change was made.
 - Option names are lowercase (e.g. `write_decoded_FOVs` -> `write_decoded_fovs`,
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
-  synthetic spots, PolyWarp rigid-only channels, PolyWarp rotation, round
-  rotation (`FiducialRoundRotation` + `rotation_task`).
+  synthetic spots, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
+  PolyWarp round angle (`rotation_task`), round rotation
+  (`FiducialRoundRotation`).
+- Removed: PolyWarp's per-stack in-plane angle (`rotation_correction` without
+  `rotation_task`, with `rotation_tiles`, `rotation_tile_min_snr`,
+  `rotation_min_tiles`, `rotation_min_planes`, `rotation_max_degrees`,
+  `rotation_max_spread_degrees` and `rotation_neighbor_substitution`). Old task
+  files still load: these options and `rotation_correction` false are ignored,
+  and `rotation_correction` true is redundant next to `rotation_task`. A task
+  with `rotation_correction` true alone keeps its tables readable (Decode
+  applies their angle) but refuses to run.
 - `-i`: Accepts a fragment range (`0-25`) or list (`3,8,11`), run in one process.
 - snakemake: Imported only when running a whole analysis with snakemake; an
   optional extra.

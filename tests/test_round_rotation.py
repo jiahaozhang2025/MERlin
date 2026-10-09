@@ -198,15 +198,15 @@ def round_task(dataSet, **extra):
 
 
 def poly_task(dataSet, **extra):
-    parameters = dict(SHARED, rotation_correction=True,
-                      rotation_task='RoundRot', z_sample_step=1,
+    parameters = dict(SHARED, rotation_task='RoundRot', z_sample_step=1,
                       xy_sample_step=1, z_polynomial_order=1,
                       xy_polynomial_order=1, z_min_good_samples=3,
                       z_neighbor_min_samples=3, write_fiducial_images=False,
                       write_aligned_images=False, boundary_smooth=False)
     parameters.update(extra)
-    task = FiducialPolynomialWarp3D(dataSet, parameters, 'PolyWarp')
-    dataSet.tasks['PolyWarp'] = task
+    name = parameters.pop('analysis_name', 'PolyWarp')
+    task = FiducialPolynomialWarp3D(dataSet, parameters, name)
+    dataSet.tasks[name] = task
     return task
 
 
@@ -347,6 +347,12 @@ class RoundRotationTests(unittest.TestCase):
         for name in FiducialRoundRotation._MEASUREMENT_PARAMETERS:
             self.assertEqual(task.parameters[name], defaults[name], name)
         self.assertIsNone(task.parameters['measure_plane'])
+        # the tile fit's options are this task's own
+        self.assertEqual((task.parameters['rotation_tiles'],
+                          task.parameters['rotation_tile_min_snr'],
+                          task.parameters['rotation_min_tiles']), (6, 8.0, 8))
+        for name in FiducialPolynomialWarp3D._REMOVED_PARAMETERS:
+            self.assertNotIn(name, defaults)
 
     # ---- the registration with rotation_task ----
 
@@ -354,8 +360,29 @@ class RoundRotationTests(unittest.TestCase):
         self.assertEqual(self.poly.get_dependencies(), ['RoundRot'])
         self.assertEqual(FiducialPolynomialWarp3D(
             _DataSet()).get_dependencies(), [])
+        self.assertEqual(FiducialPolynomialWarp3D(
+            _DataSet(), {'rotation_task': 'X'}).get_dependencies(), ['X'])
         with self.assertRaises(ValueError):
-            FiducialPolynomialWarp3D(_DataSet(), {'rotation_task': 'X'})
+            FiducialPolynomialWarp3D(_DataSet(), {'rotation_task': 'X',
+                                                  'rotation_correction': False})
+
+    def test_old_style_parameters_give_identical_outputs(self):
+        # earlier versions needed rotation_correction true next to
+        # rotation_task; it is now redundant and changes nothing
+        old = poly_task(self.dataSet, rotation_correction=True,
+                        analysis_name='PolyWarpOld')
+        self.assertEqual(run_all(old).replace('PolyWarpOld', 'PolyWarp'),
+                         self.polyLog)
+        new = {k[1:]: v for k, v in self.dataSet.saved.items()
+               if k[0] == 'PolyWarp'}
+        saved = {k[1:]: v for k, v in self.dataSet.saved.items()
+                 if k[0] == 'PolyWarpOld'}
+        self.assertEqual(new.keys(), saved.keys())
+        for key in new:
+            if isinstance(new[key], np.ndarray):
+                np.testing.assert_array_equal(new[key], saved[key], key)
+            else:
+                self.assertEqual(new[key], saved[key], key)
 
     def test_poly_needs_finalized_round_task(self):
         dataSet = _DataSet()

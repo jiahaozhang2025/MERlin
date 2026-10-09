@@ -53,16 +53,9 @@ misidentification rate and all of `Segment`.
   self-similar, or when `rigid_search_bound` must be wide (hundreds of px). A
   far first step then has to be confirmed one step deeper, so a ghost peak
   cannot overrule a correct 2D answer.
-- `rotation_correction` + `rotation_neighbor_substitution`: Edge FOVs whose
-  angle cannot be measured borrow the neighbours' median angle in `finalize()`
-  (`merlin -t <task> --check-done`), which then re-measures their xy on the
-  fiducial images: run it where the raw data is readable, with the cores that
-  `stack_num_threads` x `per_z_slice_num_threads` ask for. Check
-  `rotation_neighbor_substitutions.csv` for `xy_method` `formula_fallback`.
-- `rotation_task`: When the sample turns as one body between rounds, use one
-  angle per round instead of one per stack. Add a `FiducialRoundRotation` task
-  before `PolyWarp`, with the same filter, `rigid_*` and `z_search_range` /
-  `z_min_score` settings, and set `rotation_correction` true and
+- `rotation_task`: When the sample turns between rounds, give every round one
+  angle. Add a `FiducialRoundRotation` task before `PolyWarp`, with the same
+  filter, `rigid_*` and `z_search_range` / `z_min_score` settings, and set
   `rotation_task` to its name in `PolyWarp`:
 
       {"task": "FiducialRoundRotation", "module": "merlin.analysis.warp",
@@ -72,7 +65,8 @@ misidentification rate and all of `Segment`.
   before `PolyWarp` (snakemake does this through the dependency).
   `round_rotation.csv` holds the round angles; `fov_rotation.csv` lists the
   FOVs whose own angle was untrusted or deviated (flagged, not corrected).
-  `rotation_neighbor_substitution` then has no effect.
+  Without `rotation_task` there is no rotation. `CrossFOVCompositeWarp` does
+  not accept a `PolyWarp` with `rotation_task`.
 - `z_xy_refine`: Turn it on when `z_fit_status` shows stacks with few good z
   samples although their xy fits are clean and the beads are bright, typically
   because the stack's xy moves by a few pixels with depth. z is then sampled
