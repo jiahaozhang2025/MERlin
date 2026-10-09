@@ -35,7 +35,7 @@ def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
     transform.warp maps output->input, so output (r, c) samples input
     (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many on
     the RIGHT, ty<0 rows on the TOP, ty>0 on the BOTTOM. For a transform with
-    a rotation (PolyWarp rotation_correction) the displacement differs from
+    a rotation (PolyWarp rotation_task) the displacement differs from
     corner to corner; an affine map takes its extremes over the frame at the
     four corners, so the extremes over all corners and all transforms bound
     every invalid strip. For a pure translation every corner moves by

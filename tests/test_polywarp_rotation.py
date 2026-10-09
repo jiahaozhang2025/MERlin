@@ -1,9 +1,15 @@
-"""FiducialPolynomialWarp3D with rotation_correction.
+"""FiducialPolynomialWarp3D: applying a round angle (rotation_task), and
+reading a task saved with the removed per-stack angle.
 
 Synthetic bead stacks: the moving round is the fixed round turned by a known
 angle about the frame centre, translated by a depth-dependent offset and
-shifted one plane in z. The task's own measurement, fit, table and
-application code run end to end; only the dataset is a stand-in.
+shifted one plane in z. The round angle is given by a stand-in for a
+finalized FiducialRoundRotation task (the true angle), so these tests check
+how a given angle is applied: planes turned back before measuring, the
+table's rotation columns, the transforms, the aligned image, Decode's crop
+and the rigid transforms. test_round_rotation covers measuring the angle.
+The task's own measurement, fit, table and application code run end to end;
+only the dataset and the round task are stand-ins.
 
 Run with `python -m unittest tests/test_polywarp_rotation.py`.
 """
@@ -18,6 +24,7 @@ from skimage import transform
 
 from merlin.analysis.warp import FiducialPolynomialWarp3D
 from merlin.analysis.decode import compute_crop_bounds
+from merlin.analysis.crossfov_composite_warp import CrossFOVCompositeWarp
 
 SHAPE = (512, 512)
 CENTRE = ((SHAPE[1] - 1) / 2.0, (SHAPE[0] - 1) / 2.0)
@@ -69,6 +76,17 @@ class _Org:
         return '650'
 
 
+class _RoundTask:
+    """Stands in for a finalized FiducialRoundRotation task: channel 1's
+    round has the true angle, and this fov's own angle agrees with it."""
+
+    def get_round_angles(self):
+        return {0: 0.0, 1: float(np.radians(THETA_DEG))}
+
+    def get_fov_verdicts(self, fov):
+        return {1: (float(np.radians(THETA_DEG)), False, '')}
+
+
 class _DataSet:
     def __init__(self):
         self.fixed = [beads(10 + i) for i in range(NPLANES)]
@@ -78,6 +96,7 @@ class _DataSet:
         self.fixed2D = beads(5)
         self.moving2D = moved(self.fixed2D, truth(0.0))
         self.saved = {}
+        self.tasks = {'RoundRot': _RoundTask()}
 
     def get_data_organization(self):
         return _Org()
@@ -117,23 +136,29 @@ class _DataSet:
         self.saved[resultName, resultIndex] = np.array(analysisResult)
 
     def load_analysis_task(self, name):
-        return self.task
+        return self.tasks[name]
+
+
+PARAMETERS = {
+    'z_search_range': 2, 'z_sample_step': 1, 'xy_sample_step': 1,
+    'z_polynomial_order': 0, 'xy_polynomial_order': 1,
+    'minimum_overlap_pixels': 1000, 'edge_width_to_remove': 5,
+    'rigid_search_bound': 50, 'z_min_good_samples': 3, 'z_min_score': 0.2,
+    'write_fiducial_images': False, 'write_aligned_images': False,
+    'boundary_smooth': False}
+
+
+def make(dataSet, **extra):
+    task = FiducialPolynomialWarp3D(dataSet, dict(PARAMETERS, **extra),
+                                    'PolyWarp')
+    dataSet.tasks['PolyWarp'] = task
+    return task
 
 
 def run(rotation, rigidOnly=()):
     dataSet = _DataSet()
-    task = FiducialPolynomialWarp3D(dataSet, {
-        'rigid_only_channels': list(rigidOnly),
-        'rotation_correction': rotation, 'z_search_range': 2,
-        'z_sample_step': 1, 'xy_sample_step': 1, 'z_polynomial_order': 0,
-        'xy_polynomial_order': 1, 'minimum_overlap_pixels': 1000,
-        'edge_width_to_remove': 5, 'rigid_search_bound': 50,
-        'z_min_good_samples': 3, 'z_min_score': 0.2,
-        'rotation_min_planes': 3, 'rotation_tiles': 4,
-        'rotation_min_tiles': 8,
-        'write_fiducial_images': False, 'write_aligned_images': False,
-        'boundary_smooth': False}, 'PolyWarp')
-    dataSet.task = task
+    task = make(dataSet, rigid_only_channels=list(rigidOnly),
+                rotation_task='RoundRot' if rotation else None)
     with contextlib.redirect_stdout(io.StringIO()):
         task._run_analysis(0)
     return task
@@ -147,25 +172,44 @@ class RotationTests(unittest.TestCase):
         cls.off = run(False)
 
     def test_off_writes_no_rotation(self):
+        self.assertNotIn('rotation_correction', self.off.parameters)
+        self.assertIsNone(self.off.parameters['rotation_task'])
+        self.assertEqual(self.off.get_dependencies(), [])
         table = self.off.get_transformation_table(0)
         self.assertFalse(any('rotation' in c for c in table.columns))
         coeff = self.off.get_polynomial_coefficients(0)
-        self.assertFalse(any(c.startswith('theta') for c in coeff.columns))
+        self.assertFalse(any('rotation' in c for c in coeff.columns))
+        self.assertNotIn(('rotation_status', 0), self.off.dataSet.saved)
         for row, t in zip(table.itertuples(), self.off.get_transformation(0)):
             np.testing.assert_array_equal(
                 t.params, transform.SimilarityTransform(
                     translation=[row.xshift, row.yshift]).params)
 
-    def test_angle_and_z_recovered(self):
+    def test_round_angle_in_the_table(self):
+        self.assertEqual(self.on.get_dependencies(), ['RoundRot'])
         table = self.on.get_transformation_table(0)
         moving = table[table.dataChannel == 1]
-        # parabolic peak refinement on 128 px tiles: within ~5% of the angle
-        np.testing.assert_allclose(np.degrees(moving.rotation_radians),
-                                   THETA_DEG, atol=0.025)
+        # the given angle (to the csv round trip of this stand-in dataset):
+        # nothing is measured or refined here
+        np.testing.assert_allclose(moving.rotation_radians,
+                                   np.radians(THETA_DEG), rtol=0, atol=1e-15)
         np.testing.assert_allclose(moving.z_offset, 1.0, atol=0.05)
         reference = table[table.dataChannel == 0]
-        np.testing.assert_allclose(reference.rotation_radians, 0.0, atol=1e-4)
+        np.testing.assert_array_equal(reference.rotation_radians, 0.0)
         np.testing.assert_allclose(moving.rotation_center_x, CENTRE[0])
+        np.testing.assert_allclose(moving.rotation_center_y, CENTRE[1])
+        coeff = self.on.get_polynomial_coefficients(0).set_index(
+            'dataChannel')
+        self.assertAlmostEqual(coeff.loc[1, 'rotation_radians'],
+                               np.radians(THETA_DEG), places=15)
+
+    def test_rotation_status(self):
+        status = self.on.get_rotation_status(0).set_index('dataChannel')
+        self.assertEqual(status.loc[0, 'source'], 'reference')
+        self.assertEqual(status.loc[1, 'source'], 'round')
+        self.assertTrue(bool(status.loc[1, 'trusted']))
+        self.assertAlmostEqual(status.loc[1, 'measured_radians'],
+                               np.radians(THETA_DEG), places=15)
 
     def test_transform_matches_truth_at_corners(self):
         corners = np.array([[40, 40], [470, 40], [40, 470], [470, 470]])
@@ -213,19 +257,31 @@ class RotationTests(unittest.TestCase):
                     SHAPE[1] - int(np.ceil(max(0.0, tx.max()))))
         self.assertEqual(bounds, expected)
 
-    def test_rigid_only_channel_gets_no_angle_and_is_flagged(self):
+    def test_rigid_only_channel_gets_the_round_angle(self):
         task = run(True, rigidOnly=[1])
         table = task.get_transformation_table(0)
-        np.testing.assert_array_equal(
-            table[table.dataChannel == 1].rotation_radians, 0.0)
+        rows = table[table.dataChannel == 1]
+        np.testing.assert_allclose(rows.rotation_radians,
+                                   np.radians(THETA_DEG), rtol=0, atol=1e-15)
+        self.assertEqual(rows.xshift.nunique(), 1)
+        # measured on the turned-back 2D frame, so right at the corners of
+        # the 2D frame's depth (the synthetic 2D frame is the depth-0 map)
+        corners = np.array([[40, 40], [470, 40], [40, 470], [470, 470]])
+        error = np.linalg.norm(
+            transform.matrix_transform(
+                corners, task.get_transformation(0, 1, 0).params)
+            - transform.matrix_transform(corners, truth(0.0)), axis=1)
+        self.assertLess(error.max(), 0.5, error)
         flags = task.dataSet.load_dataframe_from_csv(
             'fit_quality_flags', resultIndex=0)
-        self.assertTrue(flags.reasons.str.contains('rotation not').any())
+        self.assertFalse(flags.reasons.str.contains('rotation').any())
+        status = task.get_rotation_status(0).set_index('dataChannel')
+        self.assertEqual(status.loc[1, 'source'], 'round')
 
     def test_rigid_transforms_carry_angle(self):
         # offsets_<fov>.npy (and the fiducial QC images, built from the same
-        # list) turn by the table's angle about the centre with rotation on,
-        # and stay a plain translation with it off
+        # list) turn by the table's angle about the centre with rotation_task,
+        # and stay a plain translation without it
         table = self.on.get_transformation_table(0)
         coeff = self.on.get_polynomial_coefficients(0).set_index('dataChannel')
         offsets = self.on.dataSet.saved['offsets', 0]
@@ -248,12 +304,113 @@ class RotationTests(unittest.TestCase):
                                  -offCoeff.loc[dataChannel, 'rigid_y']]
                 ).params)
 
-    def test_measurements_record_angle(self):
+    def test_no_angle_is_measured(self):
         m = pd.read_csv(io.StringIO(self.on.dataSet.saved['measurements', 0]))
-        theta = m[(m.stage == 'theta_deg') & (m.dataChannel == 1)]
-        self.assertGreater(len(theta), 3)
-        np.testing.assert_allclose(theta.measured.median(), THETA_DEG,
-                                   atol=0.025)
+        self.assertEqual(sorted(m.stage.unique()), ['x', 'y', 'z'])
+
+
+# The per-stack angle's options, at the defaults they had: every task saved
+# while they existed carries them.
+OLD_DEFAULTS = {
+    'rotation_correction': False, 'rotation_tiles': 6,
+    'rotation_tile_min_snr': 8.0, 'rotation_min_tiles': 8,
+    'rotation_min_planes': 5, 'rotation_max_degrees': 1.0,
+    'rotation_max_spread_degrees': 0.02,
+    'rotation_neighbor_substitution': True}
+
+
+class SavedParameterTests(unittest.TestCase):
+    """How an analysis json or a saved task.json written before the per-stack
+    angle was removed is read."""
+
+    def test_removed_options_are_dropped(self):
+        task = make(_DataSet(), **dict(OLD_DEFAULTS, rotation_tiles=4,
+                                       rotation_neighbor_substitution=False))
+        for name in OLD_DEFAULTS:
+            self.assertNotIn(name, task.parameters)
+
+    def test_saved_and_regenerated_parameters_agree(self):
+        # dataset.save_analysis_task compares the task loaded from task.json
+        # with the one built from the analysis json; both go through __init__
+        saved = make(_DataSet(), **OLD_DEFAULTS).get_parameters()
+        regenerated = make(_DataSet()).get_parameters()
+        saved.pop('merlin_version')
+        regenerated.pop('merlin_version')
+        self.assertEqual(saved, regenerated)
+        roundSaved = make(_DataSet(), **dict(
+            OLD_DEFAULTS, rotation_correction=True,
+            rotation_task='RoundRot')).get_parameters()
+        roundNew = make(_DataSet(), rotation_task='RoundRot').get_parameters()
+        roundSaved.pop('merlin_version')
+        roundNew.pop('merlin_version')
+        self.assertEqual(roundSaved, roundNew)
+
+    def test_rotation_correction_with_rotation_task_is_redundant(self):
+        task = make(_DataSet(), rotation_correction=True,
+                    rotation_task='RoundRot')
+        self.assertNotIn('rotation_correction', task.parameters)
+        self.assertEqual(task.get_dependencies(), ['RoundRot'])
+
+    def test_contradiction_and_type_are_refused(self):
+        with self.assertRaises(ValueError):
+            make(_DataSet(), rotation_correction=False,
+                 rotation_task='RoundRot')
+        with self.assertRaises(ValueError):
+            make(_DataSet(), rotation_correction=1)
+
+
+class StackAngleTaskTests(unittest.TestCase):
+    """A task saved with the removed per-stack angle (rotation_correction
+    true, no rotation_task) loads, its tables are read as written, and it
+    does not run."""
+
+    @classmethod
+    def setUpClass(cls):
+        # tables with an angle, as such a task wrote them
+        cls.written = run(True)
+        cls.legacy = FiducialPolynomialWarp3D(cls.written.dataSet, dict(
+            PARAMETERS, **dict(OLD_DEFAULTS, rotation_correction=True)),
+            'PolyWarp')
+
+    def test_loads(self):
+        self.assertTrue(self.legacy.parameters['rotation_correction'])
+        self.assertIsNone(self.legacy.parameters['rotation_task'])
+        for name in FiducialPolynomialWarp3D._REMOVED_PARAMETERS:
+            self.assertNotIn(name, self.legacy.parameters)
+
+    def test_refuses_to_run(self):
+        with self.assertRaisesRegex(ValueError, 'per-stack angle'):
+            self.legacy._run_analysis(0)
+        with self.assertRaisesRegex(ValueError, 'per-stack angle'):
+            self.legacy.finalize()
+
+    def test_tables_are_applied_as_written(self):
+        for a, b in zip(self.legacy.get_transformation(0),
+                        self.written.get_transformation(0)):
+            np.testing.assert_array_equal(a.params, b.params)
+        self.assertNotEqual(
+            float(self.legacy.get_transformation(0, 1, 5).params[1, 0]), 0.0)
+        aligned = self.legacy.get_aligned_image(0, 1, 5)
+        np.testing.assert_array_equal(
+            aligned, self.written.get_aligned_image(0, 1, 5))
+
+
+class CompositeWarpRefusalTests(unittest.TestCase):
+    """CrossFOVCompositeWarp reads xshift/yshift as a pure translation, so it
+    refuses a PolyWarp task whose tables carry an angle."""
+
+    def composite(self, **polyParameters):
+        dataSet = _DataSet()
+        make(dataSet, **polyParameters)
+        return CrossFOVCompositeWarp(dataSet, {'polywarp_task': 'PolyWarp'},
+                                     'Composite')
+
+    def test_refusals(self):
+        self.composite()._polywarp()
+        with self.assertRaises(ValueError):
+            self.composite(rotation_task='RoundRot')._polywarp()
+        with self.assertRaises(ValueError):
+            self.composite(rotation_correction=True)._polywarp()
 
 
 if __name__ == '__main__':
