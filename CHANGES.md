@@ -241,14 +241,12 @@ major change was made.
     no rotation. This is the only way an angle is estimated. Lida Cheng's
     `rotation_correction` (one angle per FOV from the 2D frame) was the
     starting point.
-  - `affine_correction` (default false): A per-FOV 2x2 linear part L(z)
-    (stretch, shear, small turn) on top of the round angle, changing with
-    depth: tile fit at each xy sample depth (`affine_tiles`,
-    `affine_tile_min_snr`, `affine_min_tiles`, `affine_refine_passes`), each
-    element fitted in depth (`affine_polynomial_order`, default 1); identity
-    and a flag below `affine_min_samples` usable samples. The table gains
-    `affine_xx/xy/yx/yy` and `affine_center_x/y`; QC in
-    `affine_fit_status_<fov>.csv` and `affine_samples_<fov>.csv`.
+  - `affine_correction` (default false): Per-FOV 2x2 linear part L(z) on top
+    of the round angle, fitted in depth from tile fits at the xy sample depths
+    (`affine_*` options); table `affine_xx/xy/yx/yy`, `affine_center_x/y`; QC
+    `affine_fit_status_<fov>.csv`, `affine_samples_<fov>.csv`. Requires
+    `rotation_task`; a stack with too few usable samples or an unfitted z keeps
+    the identity, with a flag.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:

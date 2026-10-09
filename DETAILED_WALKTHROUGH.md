@@ -127,9 +127,13 @@ tile snr and robustly trimmed. One residual pass on the plane resampled with
 that fit removes the few-percent underestimate of a single fit. Each of L's
 four elements is then fitted as a polynomial in depth, with the same robust
 trimming as the xy fit. A stack with too few usable samples keeps the identity
-and is registered exactly as without the option, with a flag. The round angle
-stays the only rotation that is estimated for the whole round; L's small
-rotation part is per FOV and is treated as part of the gel's deformation.
+and is registered exactly as without the option, with a flag. So does a stack
+whose z fit failed: its planes would be compared at a zero z curve, so it is
+not measured, and it keeps the identity when `finalize()` gives it the
+neighbours' z curve. The round angle stays the only rotation that is estimated
+for the whole round; L's small rotation part is per FOV and is treated as part
+of the gel's deformation. The option therefore requires `rotation_task`:
+without the round angle, L would also take up the turn of the whole sample.
 
 Two details matter when the beads cover only part of the frame, as they often
 do at a sample edge. A tile that beads cover only partly measures the

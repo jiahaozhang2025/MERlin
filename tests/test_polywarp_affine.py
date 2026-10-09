@@ -112,13 +112,16 @@ class _RoundTask:
 
 
 class _DataSet:
-    def __init__(self, theta_deg=THETA_DEG, linear=True, channels=(0, 1)):
+    def __init__(self, theta_deg=THETA_DEG, linear=True, channels=(0, 1),
+                 zShift=1, fovs=(0,)):
         self.channels = channels
+        self.fovs = list(fovs)
         self.fixed = [beads(10 + i) for i in range(NPLANES)]
-        # one-plane axial offset: moving plane k+1 holds fixed plane k
-        self.moving = [beads(999)] + [
+        # axial offset of zShift planes: moving plane k+zShift holds fixed
+        # plane k (every fov has the same planes)
+        self.moving = [beads(999 + k) for k in range(zShift)] + [
             moved(self.fixed[k], truth(Z[k], theta_deg, linear))
-            for k in range(NPLANES - 1)]
+            for k in range(NPLANES - zShift)]
         self.fixed2D = beads(5)
         self.moving2D = moved(self.fixed2D, truth(0.0, theta_deg, linear))
         self.saved = {}
@@ -128,7 +131,10 @@ class _DataSet:
         return _Org(self.channels)
 
     def get_fovs(self):
-        return [0]
+        return self.fovs
+
+    def get_fov_offset(self, fov):
+        return (100.0 * fov, 0.0)
 
     def get_z_positions(self):
         return list(Z)
@@ -189,6 +195,24 @@ def run(dataSet=None, **extra):
     with contextlib.redirect_stdout(io.StringIO()):
         task._run_analysis(0)
     return task
+
+
+def fail_z(task, fovs, channels=(1,)):
+    """The z samples of these fovs' and channels' stacks score 0, below
+    z_min_score, so their z is unfitted."""
+    measure = task._measure_z_offsets
+
+    def failing(fov, dataChannel, *args, **kwargs):
+        z, offset, score, ceiling = measure(fov, dataChannel, *args, **kwargs)
+        if fov in fovs and dataChannel in channels:
+            score = np.zeros_like(score)
+        return z, offset, score, ceiling
+
+    task._measure_z_offsets = failing
+
+
+def saved_table(saved, name, fov):
+    return pd.read_csv(io.StringIO(saved[name, fov]))
 
 
 def corner_error(task, zIndex, expected, points=CORNERS):
@@ -318,17 +342,115 @@ class AffineRecoveryTests(unittest.TestCase):
 
 
 class AffineWithoutRotationTests(unittest.TestCase):
-    """affine_correction alone, with no round angle (the moving round is not
-    turned)."""
+    """The linear part is measured on top of the round angle. Without
+    rotation_task it would also take up the turn of the whole sample, so the
+    task refuses the option."""
 
-    def test_corners_recovered(self):
-        task = run(_DataSet(theta_deg=0.0), affine_correction=True,
-                   rotation_task=None)
-        table = task.get_transformation_table(0)
-        self.assertFalse(any('rotation' in c for c in table.columns))
-        for zIndex in range(1, NPLANES - 2):
-            error = corner_error(task, zIndex, truth(Z[zIndex], 0.0))
-            self.assertLess(error.max(), 0.2, (zIndex, error))
+    def test_refused_without_rotation_task(self):
+        for rotationTask in (None, ''):
+            with self.assertRaisesRegex(ValueError,
+                                        'requires rotation_task'):
+                make(_DataSet(theta_deg=0.0), affine_correction=True,
+                     rotation_task=rotationTask)
+        # nor with the removed per-stack angle, which loads without
+        # rotation_task
+        with self.assertRaisesRegex(ValueError, 'requires rotation_task'):
+            make(_DataSet(theta_deg=0.0), affine_correction=True,
+                 rotation_task=None, rotation_correction=True)
+
+    def test_off_without_rotation_task(self):
+        for extra in ({}, {'affine_correction': False}):
+            task = make(_DataSet(theta_deg=0.0), rotation_task=None, **extra)
+            self.assertFalse(task.parameters['affine_correction'])
+
+
+class AffineUnfittedZTests(unittest.TestCase):
+    """A stack whose z is unfitted is not measured: its linear part is the
+    identity, with a flag, and it is registered exactly as without the
+    option; finalize() substitutes its z curve and leaves the identity. Two
+    fovs with the same planes; the moving stack has no axial offset, so the
+    unfitted (zero) z curve is right here and the linear part could be
+    measured on it, as it is in fov 0, where z is fitted."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fragment, cls.final, cls.task = {}, {}, {}
+        for affine in (True, False):
+            dataSet = _DataSet(zShift=0, fovs=(0, 1))
+            task = make(dataSet, affine_correction=affine,
+                        z_neighbor_rings_um=[1000.0],
+                        z_neighbor_min_donors=1, z_neighbor_min_samples=2)
+            fail_z(task, fovs=(1,))
+            with contextlib.redirect_stdout(io.StringIO()):
+                for fragment in range(2):
+                    task._run_analysis(fragment)
+                cls.fragment[affine] = dict(dataSet.saved)
+                task.finalize()
+            cls.final[affine] = dict(dataSet.saved)
+            cls.task[affine] = task
+
+    def test_fragment_identity_and_flag(self):
+        saved = self.fragment[True]
+        zStatus = saved_table(saved, 'z_fit_status', 1).set_index(
+            'dataChannel')
+        self.assertEqual(zStatus.loc[1, 'source'], 'unfitted')
+        status = saved_table(saved, 'affine_fit_status', 1).set_index(
+            'dataChannel')
+        self.assertEqual(status.loc[1, 'source'], 'identity')
+        self.assertTrue(status.loc[1, 'reason'].startswith('z unfitted'))
+        self.assertEqual(status.loc[1, 'n_samples'], 0)
+        self.assertFalse(status.loc[1, 'fitted'])
+        # where z is fitted, the same stack is measured and fitted
+        self.assertEqual(saved_table(saved, 'affine_fit_status', 0)
+                         .set_index('dataChannel').loc[1, 'source'], 'fit')
+        flags = saved_table(saved, 'fit_quality_flags', 1)
+        self.assertTrue(flags[flags.dataChannel == 1].reasons.str.contains(
+            'affine: z unfitted').any())
+        self.assertEqual(len(saved_table(saved, 'affine_samples', 1)), 0)
+        table = saved_table(saved, 'transformation_table', 1)
+        np.testing.assert_array_equal(table.affine_xx, 1.0)
+        np.testing.assert_array_equal(table.affine_xy, 0.0)
+        np.testing.assert_array_equal(table.affine_yx, 0.0)
+        np.testing.assert_array_equal(table.affine_yy, 1.0)
+        plain = saved_table(self.fragment[False], 'transformation_table', 1)
+        np.testing.assert_array_equal(table[plain.columns].to_numpy(),
+                                      plain.to_numpy())
+
+    def test_finalize_keeps_the_identity(self):
+        saved, before = self.final[True], self.fragment[True]
+        zStatus = saved_table(saved, 'z_fit_status', 1).set_index(
+            'dataChannel')
+        self.assertEqual(zStatus.loc[1, 'source'], 'neighbor')
+        report = saved_table(saved, 'z_neighbor_substitutions', None)
+        self.assertEqual(list(zip(report.fov, report.dataChannel,
+                                  report.donors.astype(str))), [(1, 1, '0')])
+        # fov 1's z curve is now fov 0's, in the coefficients and the table
+        donor = saved_table(saved, 'polynomial_coefficients', 0).set_index(
+            'dataChannel').loc[1]
+        substituted = saved_table(
+            saved, 'polynomial_coefficients', 1).set_index(
+            'dataChannel').loc[1]
+        zColumns = [c for c in donor.index if c.startswith('z_c')]
+        np.testing.assert_allclose(substituted[zColumns].astype(float),
+                                   donor[zColumns].astype(float), atol=1e-12)
+        table = saved_table(saved, 'transformation_table', 1)
+        channel = table[table.dataChannel == 1]
+        poly = [donor['z_c%d' % k] for k in range(len(zColumns) - 1, -1, -1)]
+        np.testing.assert_allclose(channel.z_offset,
+                                   np.polyval(poly, channel.zPos), atol=1e-9)
+        np.testing.assert_array_equal(table.affine_xx, 1.0)
+        np.testing.assert_array_equal(table.affine_xy, 0.0)
+        np.testing.assert_array_equal(table.affine_yx, 0.0)
+        np.testing.assert_array_equal(table.affine_yy, 1.0)
+        for name in ('affine_fit_status', 'affine_samples',
+                     'fit_quality_flags'):
+            self.assertEqual(saved[name, 1], before[name, 1], name)
+        plain = saved_table(self.final[False], 'transformation_table', 1)
+        np.testing.assert_array_equal(table[plain.columns].to_numpy(),
+                                      plain.to_numpy())
+        for a, b in zip(self.task[True].get_transformation(1),
+                        self.task[False].get_transformation(1)):
+            np.testing.assert_array_equal(a.params, b.params)
 
 
 class AffineFallbackTests(unittest.TestCase):
@@ -444,7 +566,7 @@ class AffineParameterTests(unittest.TestCase):
 
     def test_composite_warp_refuses(self):
         dataSet = _DataSet()
-        make(dataSet, affine_correction=True, rotation_task=None)
+        make(dataSet, affine_correction=True)
         with self.assertRaises(ValueError):
             CrossFOVCompositeWarp(dataSet, {'polywarp_task': 'PolyWarp'},
                                   'Composite')._polywarp()

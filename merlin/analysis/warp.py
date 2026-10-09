@@ -703,13 +703,15 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     rigid body. A translation cannot absorb that either. With the option on,
     every non-reference stack also gets a 2x2 linear part L(z) about the
     frame centre, per fov and changing with depth, measured at the depths
-    and fitted the way the xy shift is:
+    and fitted the way the xy shift is. The option requires rotation_task
+    (__init__ refuses it otherwise): without the round angle, L would also
+    take up the turn of the whole sample.
 
       a1. at every depth the xy pass sampled (every xy_sample_step'th
           plane), on the planes it used -- the reference plane, and the
-          moving plane at the fitted z, turned back by the round angle with
-          rotation_task -- the moving plane is shifted by that depth's xy
-          sample (its whole-frame correlation peak);
+          moving plane at the fitted z, turned back by the round angle --
+          the moving plane is shifted by that depth's xy sample (its
+          whole-frame correlation peak);
       a2. both planes are cut into affine_tiles x affine_tiles tiles and
           each tile pair is correlated as FiducialRoundRotation does (peak
           within xy_search_bound px of zero; empty tiles, peaks on the
@@ -732,7 +734,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
           affine_polynomial_order, with the xy fit's sigma trimming. With
           fewer than affine_min_samples usable samples nothing is fitted: L
           is the identity, the stack is registered exactly as without the
-          option, and fit_quality_flags says so;
+          option, and fit_quality_flags says so. The same holds for a stack
+          whose z is unfitted (fewer than z_min_good_samples good z
+          samples), which is not measured at all: its planes would be
+          compared at the zero z curve. finalize() leaves its L at the
+          identity when it substitutes the z curve;
       a5. the xy samples are moved to the frame centre. A whole-frame
           correlation peak measures the shift where the frame's beads are,
           at the centroid b of the signed product of the two planes; with a
@@ -1125,6 +1131,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 raise ValueError('%s must be an integer >= 0' % name)
         if self.parameters['affine_tiles'] < 2:
             raise ValueError('affine_tiles must be at least 2')
+        # The linear part is what a fov does on top of the round angle.
+        # Without the round angle it would also take up the turn of the whole
+        # sample, so the option requires rotation_task.
+        if self.parameters['affine_correction'] \
+                and not self.parameters['rotation_task']:
+            raise ValueError(
+                'affine_correction requires rotation_task: the linear part is '
+                'measured on top of the round angle, and without it would '
+                'take up the rotation of the whole sample. Set rotation_task '
+                'to a FiducialRoundRotation task.')
 
         # Options of the removed per-stack angle, and how an old analysis json
         # or saved task.json that still sets them is read. Dropping them where
@@ -2122,9 +2138,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         """affine_correction, steps a1-a3 of the class docstring, at every
         depth the xy pass sampled, on the same planes it used: the reference
         plane, and the moving plane at the fitted z (turned back by the round
-        angle with rotation_task). sampleY, sampleX are the xy pass's frame
-        shifts in the measurement frame, in its order. Returns one dict per
-        sample."""
+        angle). sampleY, sampleX are the xy pass's frame shifts in the
+        measurement frame, in its order. Returns one dict per sample."""
         zPositions = np.asarray(
             self.dataSet.get_data_organization()
             .get_fiducial3D_stack_frame_zPos(dataChannel), dtype=float)
@@ -2210,11 +2225,13 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         return matrices
 
     def _solve_affine(self, fov: int, dataChannel: int, onReference: bool,
-                      zCoefficients, sampleZ, sampleY, sampleX) -> dict:
+                      zCoefficients, sampleZ, sampleY, sampleX,
+                      zUnfitted: str = None) -> dict:
         """affine_correction for one stack: measure (a1-a3), fit in depth
         (a4) and re-reference the xy samples to the frame centre (a5); see
         the class docstring. sampleZ/Y/X are the xy pass's samples in the
-        measurement frame.
+        measurement frame. zUnfitted: None if the stack's z was fitted, else
+        why not; such a stack is not measured.
 
         Returns a dict: source ('fit', 'identity', or 'reference' for the
         reference stack, which is not measured), fitted, n_samples, n_good,
@@ -2227,6 +2244,12 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 'n_samples': 0, 'n_good': 0, 'reason': '',
                 'coefficients': zeros, 'samples': []}
         if onReference:
+            return info
+        if zUnfitted is not None:
+            # its planes would be compared at the zero z curve, not at the
+            # depth finalize() may substitute: the identity, not measured
+            info.update(source='identity',
+                        reason='z unfitted (%s), not measured' % zUnfitted)
             return info
         samples = self._measure_affine_samples(
             fov, dataChannel, zCoefficients, sampleY, sampleX)
@@ -2444,8 +2467,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     def get_affine_fit_status(self, fov: int) -> pd.DataFrame:
         """Per data channel, written only with affine_correction: whether
         the linear part was fitted (source 'fit'), left at the identity
-        because too few samples were usable ('identity', with the reason),
-        or not measured ('reference': the reference stack; 'rigid_only').
+        because too few samples were usable or the stack's z is unfitted
+        ('identity', with the reason; a z-unfitted stack is not measured,
+        n_samples 0), or not measured ('reference': the reference stack;
+        'rigid_only').
         n_samples / n_good: the xy sample depths and how many gave a usable
         tile fit; z_min_good_um / z_max_good_um: the depth range of those (a
         fitted L is extrapolated beyond it); kept_fraction: the smallest
@@ -2465,8 +2490,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         (dxx, dxy, dyx, dyy; first_d.. = before the residual pass), the depth
         fit at that depth (fit_d..) and whether the fit kept the sample
         (kept_d..), and the shifts, in px in the measurement frame (planes
-        turned back by the round angle, if any) and in the sense of the xy
-        samples: frame_shift (the xy pass's whole-frame peak), tile_shift
+        turned back by the round angle) and in the sense of the xy samples:
+        frame_shift (the xy pass's whole-frame peak), tile_shift
         (the tile fit's centre shift), centre_shift (the frame shift moved
         from the beads' centroid (centroid_x, centroid_y) to the frame
         centre with the fitted L; what the y/x polynomials are fitted on)."""
@@ -2496,7 +2521,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         run finds nothing left to repair and writes nothing.
 
         No angle is repaired: with rotation_task every stack has its round's
-        angle, and without it there is none.
+        angle, and without it there is none. No linear part is repaired
+        either (affine_correction): a stack whose z was unfitted keeps the
+        identity once its z curve is substituted.
         """
         self._refuse_stack_rotation('finalize()')
         if self.parameters['z_neighbor_substitution']:
@@ -2926,12 +2953,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             # linear part, measured at the final xy sample depths on the same
             # (turned-back) planes, and the xy samples moved from where the
             # frame's beads are to the frame centre with it; nothing changes
-            # for a stack that is not fitted
+            # for a stack that is not fitted, and a stack whose z is unfitted
+            # is not measured
             affineInfo = None
             if self.parameters['affine_correction']:
                 affineInfo = self._solve_affine(
                     fov, dataChannel, key == affineReference, zCoefficients,
-                    xySampleZ, xySampleY, xySampleX)
+                    xySampleZ, xySampleY, xySampleX,
+                    zUnfitted=None if zFitted else (
+                        '%d of %d z samples passed the gate, min %s'
+                        % (nGood, len(zGate),
+                           self.parameters['z_min_good_samples'])))
                 if affineInfo['fitted']:
                     xySampleY, xySampleX = \
                         affineInfo['centre_y'], affineInfo['centre_x']
