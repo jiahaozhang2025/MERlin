@@ -67,13 +67,6 @@ misidentification rate and all of `Segment`.
   FOVs whose own angle was untrusted or deviated (flagged, not corrected).
   Without `rotation_task` there is no rotation. `CrossFOVCompositeWarp` does
   not accept a `PolyWarp` with `rotation_task`.
-- `affine_correction`: Turn it on when FOVs at the edge of the sample stay off
-  at the frame corners after the round angle, by an amount that grows with
-  depth (the gel stretches or shears there). Each FOV and stack then also gets
-  a linear part that changes with depth; `affine_fit_status_<fov>.csv` says
-  which stacks were fitted and how far it moves the corners (stacks whose z
-  is unfitted keep the identity). Requires `rotation_task`. Not accepted by
-  `CrossFOVCompositeWarp` either.
 - `z_xy_refine`: Turn it on when `z_fit_status` shows stacks with few good z
   samples although their xy fits are clean and the beads are bright, typically
   because the stack's xy moves by a few pixels with depth. z is then sampled

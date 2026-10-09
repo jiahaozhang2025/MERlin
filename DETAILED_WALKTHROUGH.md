@@ -77,8 +77,7 @@ the z drift and the xy drift, on the turned-back planes, per FOV as usual. The
 angle and the depth-dependent shift are applied together in a single
 resampling. Without `rotation_task` nothing is turned and the tables have no
 rotation columns. A FOV whose bead field deforms with depth (stretch or shear
-of the gel) is not described by the round angle, which is the rigid part only;
-`affine_correction` (below) models that part.
+of the gel) is not described by the round angle, which is the rigid part only.
 
 The angle is taken from the bead stack, not from the 2D coverglass frame.
 When the two were compared, the frame's angle disagreed with the bead-stack
@@ -111,49 +110,6 @@ of the gel, not as a turn of its own. The round angle is now the only way an
 angle is estimated (the removed option is
 `rotation_correction` without `rotation_task`; CHANGES.md says how old task
 files are read).
-
-*A per-FOV linear part that changes with depth (`affine_correction`, off by
-default).* The gel need not move as a rigid body. Near the edges of a sample a
-FOV's bead field can stretch, shear and turn a little further than the round
-angle, by amounts that grow with depth, and a translation per depth cannot
-remove that either: the centre is aligned and the corners stay off. With the
-option on, each FOV and stack also gets a 2x2 linear part L(z) about the frame
-centre, which may change with depth. It is measured where and how the xy shift
-is. At every depth the xy pass samples, the moving plane is taken at the
-fitted z, turned back by the round angle and shifted by that depth's xy
-sample. Both planes are cut into tiles, as for the round angle, and the tile
-displacements are fitted with a translation and a linear part, weighted by
-tile snr and robustly trimmed. One residual pass on the plane resampled with
-that fit removes the few-percent underestimate of a single fit. Each of L's
-four elements is then fitted as a polynomial in depth, with the same robust
-trimming as the xy fit. A stack with too few usable samples keeps the identity
-and is registered exactly as without the option, with a flag. So does a stack
-whose z fit failed: its planes would be compared at a zero z curve, so it is
-not measured, and it keeps the identity when `finalize()` gives it the
-neighbours' z curve. The round angle stays the only rotation that is estimated
-for the whole round; L's small rotation part is per FOV and is treated as part
-of the gel's deformation. The option therefore requires `rotation_task`:
-without the round angle, L would also take up the turn of the whole sample.
-
-Two details matter when the beads cover only part of the frame, as they often
-do at a sample edge. A tile that beads cover only partly measures the
-displacement where its beads are, so the fit uses the centroid of the tile's
-correlation weight, not the tile centre. Likewise a whole-frame correlation
-measures the shift where the frame's beads are. With a linear part, the shift
-at the frame centre then differs from it by L(z) - I times the distance from
-the beads' centroid to the centre, and that difference is added before the
-shift is fitted in depth. The table keeps `xshift`/`yshift` as the
-displacement of the frame centre and gains L's elements and its centre; the
-transform is centre + R L (p - centre) + shift, the order in which the
-measurement composed them. The z offset is untouched, and a per-plane z tilt
-across the frame is not modelled. That tilt matters for L too: the tiles of a
-sample are compared at one depth, so with a tilt they are compared at
-different relative defocus across the frame, and a tile's apparent
-displacement can change with defocus. This shows up as scatter of the samples
-about the depth fit (`affine_fit_status` reports it). Each element is fitted
-as a straight line in depth by default: on real stacks, higher orders
-predicted held-out samples no better and extrapolated to the deepest samples
-worse.
 
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame
