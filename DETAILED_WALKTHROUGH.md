@@ -142,7 +142,14 @@ shift is fitted in depth. The table keeps `xshift`/`yshift` as the
 displacement of the frame centre and gains L's elements and its centre; the
 transform is centre + R L (p - centre) + shift, the order in which the
 measurement composed them. The z offset is untouched, and a per-plane z tilt
-across the frame is not modelled.
+across the frame is not modelled. That tilt matters for L too: the tiles of a
+sample are compared at one depth, so with a tilt they are compared at
+different relative defocus across the frame, and a tile's apparent
+displacement can change with defocus. This shows up as scatter of the samples
+about the depth fit (`affine_fit_status` reports it). Each element is fitted
+as a straight line in depth by default: on real stacks, higher orders
+predicted held-out samples no better and extrapolated to the deepest samples
+worse.
 
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame

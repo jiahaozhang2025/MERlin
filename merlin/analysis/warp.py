@@ -754,7 +754,15 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     on by a translation only). The reference stack and rigid_only_channels
     keep the identity; offsets_<fov>.npy and the fiducial QC images stay
     rigid. L is extrapolated beyond the depths of the usable samples, as the
-    xy polynomial is.
+    xy polynomial is, and beyond the part of the frame that holds beads.
+
+    The tiles are compared at one depth per sample, the frame's. Where the
+    depth match changes across the frame (a z tilt between rounds), tiles
+    on opposite sides are compared at different relative defocus, and a
+    tile's apparent displacement can depend on its defocus; this adds
+    scatter to the samples, which the depth fit averages over but does not
+    remove. affine_samples (scatter of the samples about the fit) and
+    affine_fit_status (residual_ppm) show how large it is.
 
     RIGID WALK CONFIRMATION (rigid_walk_confirm, default off). The walk's
     first plane is searched wide, so that it can overrule a bad 2D frame. On
@@ -1082,7 +1090,13 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                           (bool, np.bool_)):
             raise ValueError('affine_correction must be true or false')
         # Order of the polynomial in depth fitted to each element of the
-        # linear part; 1 is a straight line in depth.
+        # linear part; 1 is a straight line in depth. On real thick-gel
+        # stacks, leaving one sample out at a time, orders 1, 2 and 3
+        # predicted it equally well; predicting the deepest quarter of the
+        # samples from the rest, order 1 was better than 2 in about 70% of
+        # cases and than 3 in about 80% (the higher orders swing at the
+        # ends, which a fitted L reaches wherever the deep tile fits fail).
+        # Order 0 was worse than 1 where L changes with depth.
         if 'affine_polynomial_order' not in self.parameters:
             self.parameters['affine_polynomial_order'] = 1
         # Fewer usable samples than this and no linear part is fitted: the
