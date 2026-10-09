@@ -653,12 +653,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     IN-PLANE ROTATION, ONE ANGLE PER ROUND (rotation_task, default unset).
     The sample can turn slightly about the optical axis between rounds, and a
     translation cannot absorb that: the frame centre is aligned and the
-    corners stay off by theta * r. The turn comes from the stage: the whole
-    sample turns as one rigid body, so every fov of a round turns by the same
-    angle. The angle is therefore not measured here. rotation_task names a
-    FiducialRoundRotation task, which measures each fov's angle on one
-    shallow bead plane and takes the median over fovs as the round's angle
-    (see its docstring). Per fov, every moving stack of a round is then
+    corners stay off by theta * r. The design takes the turn to come from
+    the stage: the whole sample turns as one rigid body, so every fov of a
+    round turns by the same angle, and the angle is not measured here.
+    rotation_task names a FiducialRoundRotation task, which measures each
+    fov's angle on one shallow bead plane and takes the median over fovs as
+    the round's angle (see its docstring). What a fov's bead field does
+    beyond that with depth (stretch, shear) is not treated as a rotation and
+    is not modelled here. Per fov, every moving stack of a round is then
     handled as follows:
 
       t1. its fiducial planes and its 2D fiducial frame are turned back by
