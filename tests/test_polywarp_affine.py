@@ -405,6 +405,29 @@ class TilePositionTests(unittest.TestCase):
         self.assertLess(errors['weighted'], 0.6 * errors['centre'], errors)
         self.assertLess(errors['weighted'], 0.3, errors)
 
+    def test_centroid_ignores_independent_noise(self):
+        # beads in the left third only, each round with its own noise: the
+        # signed product's centroid stays on the beads; a product clipped at
+        # zero would weight every bead-free pixel and drift to the centre
+        rng = np.random.default_rng(4)
+        image = np.zeros((300, 300), np.float32)
+        x, y = rng.integers(10, 100, 400), rng.integers(10, 290, 400)
+        np.add.at(image, (y, x), 2000.0)
+        clean = cv2.GaussianBlur(image, (0, 0), 1.2).astype(np.float64)
+        energy = clean * clean
+        trueX = float(energy.sum(axis=0) @ np.arange(300)) / energy.sum()
+        first = clean + rng.normal(0, 20, clean.shape)
+        second = clean + rng.normal(0, 20, clean.shape)
+        signedX, _ = FiducialPolynomialWarp3D._correlation_centroid(
+            first, second)
+        clipped = np.maximum(first * second, 0.0)
+        clippedX = float(clipped.sum(axis=0) @ np.arange(300)) / clipped.sum()
+        self.assertLess(abs(signedX - trueX), 2.0, (signedX, trueX))
+        self.assertGreater(abs(clippedX - trueX), 5.0, (clippedX, trueX))
+        # no positive correlation weight: no centroid
+        self.assertTrue(np.isnan(FiducialPolynomialWarp3D._correlation_centroid(
+            first, -second)[0]))
+
 
 class AffineParameterTests(unittest.TestCase):
 

@@ -718,8 +718,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
           trimmed as FiducialRoundRotation does, with a translation and a
           linear part D = L - I: d(v) = t + D v, v the tile position
           relative to the frame centre. A tile's position is where its
-          beads are (the centroid of the product of the two tiles), not its
-          centre: a tile that beads cover only partly measures the
+          beads are (the centroid of the signed product of the two tiles,
+          i.e. of each pixel's contribution to the tile's correlation), not
+          its centre: a tile that beads cover only partly measures the
           displacement there. A sample is usable if at least
           affine_min_tiles tiles survive and they spread over the frame in
           both directions (_AFFINE_MIN_SPREAD_TILES);
@@ -734,10 +735,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
           option, and fit_quality_flags says so;
       a5. the xy samples are moved to the frame centre. A whole-frame
           correlation peak measures the shift where the frame's beads are,
-          at the centroid b of the product of the two planes; with a linear
-          part the shift at the frame centre differs from it by D(z) (b - c),
-          which is added before the y/x polynomials are fitted. The tile
-          fit's own centre shift is recorded beside it, as a check.
+          at the centroid b of the signed product of the two planes; with a
+          linear part the shift at the frame centre differs from it by
+          D(z) (b - c), which is added before the y/x polynomials are
+          fitted. The tile fit's own centre shift is recorded beside it, as
+          a check.
 
     Applied as one resampling: input = c + R(theta) L(z) (p - c) + t(z). The
     table gains affine_xx, affine_xy, affine_yx and affine_yy (L, acting on
@@ -1463,11 +1465,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         displacement (the content at reference position p sits in movingImage
         at p + d, i.e. minus the measured shift), weight its snr; measured is
         the number of tile pairs with both sides non-empty. The position is
-        the tile centre, or with weightedPosition the centroid of the tile's
-        contribution to its correlation peak: the product of the two tiles,
-        clipped at zero. A tile that is only partly covered by beads measures
-        the displacement where its beads are, not at its centre; the two
-        differ wherever the displacement varies across the frame.
+        the tile centre, or with weightedPosition the centroid of each pixel's
+        contribution to the tile's correlation peak (_correlation_centroid).
+        A tile that is only partly covered by beads measures the displacement
+        where its beads are, not at its centre; the two differ wherever the
+        displacement varies across the frame.
         """
         height, width = fixedImage.shape
         cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
@@ -1489,14 +1491,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 px = 0.5 * (cols[j] + cols[j + 1] - 1)
                 py = 0.5 * (rows[i] + rows[i + 1] - 1)
                 if weightedPosition:
-                    product = np.maximum(
-                        f.astype(np.float64) * m.astype(np.float64), 0.0)
-                    total = float(product.sum())
-                    if total > 0:
-                        px = cols[j] + float(
-                            product.sum(axis=0) @ np.arange(f.shape[1])) / total
-                        py = rows[i] + float(
-                            product.sum(axis=1) @ np.arange(f.shape[0])) / total
+                    wx, wy = self._correlation_centroid(f, m)
+                    if np.isfinite(wx):
+                        px, py = cols[j] + wx, rows[i] + wy
                 vx.append(px - cx)
                 vy.append(py - cy)
                 dx.append(-sx)          # displacement = minus the shift
@@ -1504,6 +1501,29 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 weight.append(snr)
         return (np.asarray(vx), np.asarray(vy), np.asarray(dx),
                 np.asarray(dy), np.asarray(weight), measured)
+
+    @staticmethod
+    def _correlation_centroid(fixedImage: np.ndarray,
+                              movingImage: np.ndarray):
+        """(x, y), in pixels of the image, of the centroid of each pixel's
+        contribution to the correlation of two aligned images: their
+        product. This is where a correlation measures its shift when the
+        shift varies across the image. The product is signed: in bead-free
+        pixels the two rounds' noise is independent, so its product averages
+        to zero there (clipping it at zero would give those pixels a positive
+        weight and pull the centroid towards the image centre). (NaN, NaN)
+        if the products do not sum to a positive value; the centroid is
+        clipped to the image."""
+        product = (np.asarray(fixedImage, dtype=np.float64)
+                   * np.asarray(movingImage, dtype=np.float64))
+        total = float(product.sum())
+        if not total > 0:
+            return np.nan, np.nan
+        height, width = product.shape
+        x = float(product.sum(axis=0) @ np.arange(width)) / total
+        y = float(product.sum(axis=1) @ np.arange(height)) / total
+        return (float(np.clip(x, 0, width - 1)),
+                float(np.clip(y, 0, height - 1)))
 
     @staticmethod
     def _robust_tile_lstsq(design: np.ndarray, target: np.ndarray,
@@ -2111,22 +2131,13 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 zPosition + float(np.polyval(zCoefficients, zPosition)))
             # a1: the moving plane shifted by the xy pass's own frame shift
             shifted = self._shift_image(movingImage, frameY, frameX)
-            height, width = fixedImage.shape
             record = dict(zPos=zPosition, plane_index=int(planeIndex),
                           ok=False, reason='', frame_shift_y=frameY,
                           frame_shift_x=frameX)
             # where the frame's correlation peak is measured: the centroid of
-            # each pixel's contribution to it (product of the planes, >= 0)
-            product = np.maximum(
-                fixedImage.astype(np.float64) * shifted.astype(np.float64),
-                0.0)
-            total = float(product.sum())
-            record['centroid_x'] = (float(product.sum(axis=0)
-                                          @ np.arange(width)) / total
-                                    if total > 0 else np.nan)
-            record['centroid_y'] = (float(product.sum(axis=1)
-                                          @ np.arange(height)) / total
-                                    if total > 0 else np.nan)
+            # each pixel's contribution to it
+            record['centroid_x'], record['centroid_y'] = \
+                self._correlation_centroid(fixedImage, shifted)
             # a2: tile fit on the shifted plane
             fit = self._affine_tile_fit(fixedImage, shifted)
             prefix = 'first pass: '
