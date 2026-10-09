@@ -659,9 +659,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     rotation_task names a FiducialRoundRotation task, which measures each
     fov's angle on one shallow bead plane and takes the median over fovs as
     the round's angle (see its docstring). What a fov's bead field does
-    beyond that with depth (stretch, shear) is not treated as a rotation and
-    is not modelled here. Per fov, every moving stack of a round is then
-    handled as follows:
+    beyond that with depth (stretch, shear) is not treated as a rotation;
+    affine_correction (below) models it as a linear part per fov. Per fov,
+    every moving stack of a round is then handled as follows:
 
       t1. its fiducial planes and its 2D fiducial frame are turned back by
           the round angle about the frame centre, from the start;
@@ -695,6 +695,64 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     saved with it still loads, so the tables it wrote can be read and
     applied (their angle is in rotation_radians), but it does not run (see
     __init__).
+
+    PER-FOV LINEAR PART THAT CHANGES WITH DEPTH (affine_correction, default
+    off). The round angle is the rigid turn of the whole sample. On top of
+    it a fov's bead field can stretch, shear and turn a little further, by
+    amounts that change with depth: the gel deforms, unevenly and not as a
+    rigid body. A translation cannot absorb that either. With the option on,
+    every non-reference stack also gets a 2x2 linear part L(z) about the
+    frame centre, per fov and changing with depth, measured at the depths
+    and fitted the way the xy shift is:
+
+      a1. at every depth the xy pass sampled (every xy_sample_step'th
+          plane), on the planes it used -- the reference plane, and the
+          moving plane at the fitted z, turned back by the round angle with
+          rotation_task -- the moving plane is shifted by that depth's xy
+          sample (its whole-frame correlation peak);
+      a2. both planes are cut into affine_tiles x affine_tiles tiles and
+          each tile pair is correlated as FiducialRoundRotation does (peak
+          within xy_search_bound px of zero; empty tiles, peaks on the
+          window edge and snr below affine_tile_min_snr dropped). The tile
+          displacements are fitted, weighted by tile snr and robustly
+          trimmed as FiducialRoundRotation does, with a translation and a
+          linear part D = L - I: d(v) = t + D v, v the tile position
+          relative to the frame centre. A tile's position is where its
+          beads are (the centroid of the product of the two tiles), not its
+          centre: a tile that beads cover only partly measures the
+          displacement there. A sample is usable if at least
+          affine_min_tiles tiles survive and they spread over the frame in
+          both directions (_AFFINE_MIN_SPREAD_TILES);
+      a3. affine_refine_passes residual passes (default 1): the moving plane
+          is resampled with the fit so far and a2 is repeated on it; the
+          residual is composed in. As for the round angle, a single fit of
+          sub-pixel tile displacements reads a few percent short;
+      a4. each element of D is fitted as a polynomial in depth of order
+          affine_polynomial_order, with the xy fit's sigma trimming. With
+          fewer than affine_min_samples usable samples nothing is fitted: L
+          is the identity, the stack is registered exactly as without the
+          option, and fit_quality_flags says so;
+      a5. the xy samples are moved to the frame centre. A whole-frame
+          correlation peak measures the shift where the frame's beads are,
+          at the centroid b of the product of the two planes; with a linear
+          part the shift at the frame centre differs from it by D(z) (b - c),
+          which is added before the y/x polynomials are fitted. The tile
+          fit's own centre shift is recorded beside it, as a check.
+
+    Applied as one resampling: input = c + R(theta) L(z) (p - c) + t(z). The
+    table gains affine_xx, affine_xy, affine_yx and affine_yy (L, acting on
+    (x, y), in the frame turned back by the round angle) and
+    affine_center_x/y; xshift/yshift stay the displacement of the frame
+    centre. polynomial_coefficients gains the polynomials of D's elements
+    (affine_dxx_c0, ...), and two QC tables are written, affine_fit_status
+    per channel and affine_samples per sample (see their getters); with the
+    option on, the y/x rows of the measurements table hold the samples moved
+    to the frame centre. z is not touched: the linear part is measured after
+    the z fit (and z_xy_refine, which still shifts the planes it samples z
+    on by a translation only). The reference stack and rigid_only_channels
+    keep the identity; offsets_<fov>.npy and the fiducial QC images stay
+    rigid. L is extrapolated beyond the depths of the usable samples, as the
+    xy polynomial is.
 
     RIGID WALK CONFIRMATION (rigid_walk_confirm, default off). The walk's
     first plane is searched wide, so that it can overrule a bad 2D frame. On
@@ -1011,6 +1069,47 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # and nothing is computed or written differently.
         if 'rotation_task' not in self.parameters:
             self.parameters['rotation_task'] = None
+
+        # ---- per-fov linear part that changes with depth (see the class
+        # docstring, affine_correction) ----
+        # False (the default): no linear part; nothing is measured, computed
+        # or written differently.
+        if 'affine_correction' not in self.parameters:
+            self.parameters['affine_correction'] = False
+        if not isinstance(self.parameters['affine_correction'],
+                          (bool, np.bool_)):
+            raise ValueError('affine_correction must be true or false')
+        # Order of the polynomial in depth fitted to each element of the
+        # linear part; 1 is a straight line in depth.
+        if 'affine_polynomial_order' not in self.parameters:
+            self.parameters['affine_polynomial_order'] = 1
+        # Fewer usable samples than this and no linear part is fitted: the
+        # stack keeps the identity and is registered exactly as without the
+        # option, and a fit-quality flag is written.
+        if 'affine_min_samples' not in self.parameters:
+            self.parameters['affine_min_samples'] = 8
+        # The tile measurement, as FiducialRoundRotation's: tiles per side,
+        # minimum tile snr, minimum usable tiles per sample.
+        if 'affine_tiles' not in self.parameters:
+            self.parameters['affine_tiles'] = 6
+        if 'affine_tile_min_snr' not in self.parameters:
+            self.parameters['affine_tile_min_snr'] = 8.0
+        if 'affine_min_tiles' not in self.parameters:
+            self.parameters['affine_min_tiles'] = 8
+        # Residual passes of the tile fit on the plane resampled by the fit so
+        # far (as FiducialRoundRotation's refine_passes); 0 = one fit only.
+        if 'affine_refine_passes' not in self.parameters:
+            self.parameters['affine_refine_passes'] = 1
+        for name in ('affine_polynomial_order', 'affine_min_samples',
+                     'affine_tiles', 'affine_min_tiles',
+                     'affine_refine_passes'):
+            value = self.parameters[name]
+            if not isinstance(value, (int, np.integer)) \
+                    or isinstance(value, bool) or value < 0:
+                raise ValueError('%s must be an integer >= 0' % name)
+        if self.parameters['affine_tiles'] < 2:
+            raise ValueError('affine_tiles must be at least 2')
+
         # Options of the removed per-stack angle, and how an old analysis json
         # or saved task.json that still sets them is read. Dropping them where
         # they carry nothing keeps the saved and the regenerated parameters of
@@ -1343,6 +1442,108 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         return np.polyfit(z[kept], values[kept], order), kept
 
     # ==================================================================
+    # tile displacements: FiducialRoundRotation's angle and
+    # affine_correction's linear part
+    # ==================================================================
+
+    def _tile_displacements(self, fixedImage: np.ndarray,
+                            movingImage: np.ndarray, tiles: int,
+                            minSnr: float, weightedPosition: bool = False):
+        """The tile measurement shared by FiducialRoundRotation and
+        affine_correction.
+
+        Both planes are cut into tiles x tiles tiles, and each tile pair is
+        correlated with its peak searched within xy_search_bound px of zero
+        (_bounded_correlation_peak). A tile is dropped if either side is
+        empty, if its peak lies on the edge of the search window or if its
+        snr is below minSnr.
+
+        Returns (vx, vy, dx, dy, weight, measured), one entry per usable tile:
+        (vx, vy) its position relative to the frame centre, (dx, dy) its
+        displacement (the content at reference position p sits in movingImage
+        at p + d, i.e. minus the measured shift), weight its snr; measured is
+        the number of tile pairs with both sides non-empty. The position is
+        the tile centre, or with weightedPosition the centroid of the tile's
+        contribution to its correlation peak: the product of the two tiles,
+        clipped at zero. A tile that is only partly covered by beads measures
+        the displacement where its beads are, not at its centre; the two
+        differ wherever the displacement varies across the frame.
+        """
+        height, width = fixedImage.shape
+        cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
+        rows = np.linspace(0, height, tiles + 1).astype(int)
+        cols = np.linspace(0, width, tiles + 1).astype(int)
+        vx, vy, dx, dy, weight = [], [], [], [], []
+        measured = 0
+        for i in range(tiles):
+            for j in range(tiles):
+                f = fixedImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                m = movingImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
+                if not f.any() or not m.any():
+                    continue
+                measured += 1
+                sy, sx, snr, onEdge = self._bounded_correlation_peak(
+                    f, m, 0.0, 0.0)
+                if onEdge or not np.isfinite(snr) or snr < minSnr:
+                    continue
+                px = 0.5 * (cols[j] + cols[j + 1] - 1)
+                py = 0.5 * (rows[i] + rows[i + 1] - 1)
+                if weightedPosition:
+                    product = np.maximum(
+                        f.astype(np.float64) * m.astype(np.float64), 0.0)
+                    total = float(product.sum())
+                    if total > 0:
+                        px = cols[j] + float(
+                            product.sum(axis=0) @ np.arange(f.shape[1])) / total
+                        py = rows[i] + float(
+                            product.sum(axis=1) @ np.arange(f.shape[0])) / total
+                vx.append(px - cx)
+                vy.append(py - cy)
+                dx.append(-sx)          # displacement = minus the shift
+                dy.append(-sy)
+                weight.append(snr)
+        return (np.asarray(vx), np.asarray(vy), np.asarray(dx),
+                np.asarray(dy), np.asarray(weight), measured)
+
+    @staticmethod
+    def _robust_tile_lstsq(design: np.ndarray, target: np.ndarray,
+                           weight: np.ndarray, minTiles: int):
+        """Weighted least squares of tile displacements with robust trimming,
+        shared by FiducialRoundRotation and affine_correction.
+
+        design has 2k rows, the k tiles' x rows then their y rows; target is
+        (dx..., dy...); weight is the tiles' snr. Tiles whose residual (the
+        length of the tile's residual vector) is more than 3 robust sd
+        (1.4826 x the median residual) are dropped and the fit repeated,
+        twice at most, never keeping fewer than minTiles tiles. Returns
+        (solution, keep, rms, solve): rms is the snr-weighted rms residual of
+        the kept tiles, and solve(matrix, keep) fits another design to the
+        same tiles."""
+        k = len(weight)
+        rootWeight = np.sqrt(np.r_[weight, weight])
+
+        def solve(matrix, keep):
+            rowsKept = np.r_[keep, keep]
+            solution, *_ = np.linalg.lstsq(
+                matrix[rowsKept] * rootWeight[rowsKept, None],
+                target[rowsKept] * rootWeight[rowsKept], rcond=None)
+            residual = target - matrix @ solution
+            return solution, np.hypot(residual[:k], residual[k:])
+
+        keep = np.ones(k, bool)
+        for _ in range(2):
+            _, tileResidual = solve(design, keep)
+            scale = 1.4826 * np.median(tileResidual) + 1e-6
+            good = tileResidual < 3.0 * scale
+            if good.sum() < minTiles:
+                break
+            keep = good
+        solution, tileResidual = solve(design, keep)
+        rms = float(np.sqrt(np.sum(weight[keep] * tileResidual[keep] ** 2)
+                            / np.sum(weight[keep])))
+        return solution, keep, rms, solve
+
+    # ==================================================================
     # measurement
     # ==================================================================
 
@@ -1658,9 +1859,36 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         input = c + R(theta) (p - c) + t, t = (xshift, yshift); a table
         without rotation columns, or with theta 0, gives exactly the plain
         translation of a table without rotation.
+
+        With affine_correction the row also holds the linear part L
+        (affine_xx, affine_xy, affine_yx, affine_yy, acting on (x, y)) and
+        its centre, and input = c + R(theta) L (p - c) + t: L is applied in
+        the measurement frame (planes turned back by theta), then the round
+        angle, as the measurement composed them. A row whose L is exactly
+        the identity gives exactly the transform of a row without it.
         """
         theta = float(row['rotation_radians']) \
             if 'rotation_radians' in row else 0.0
+        if 'affine_xx' in row:
+            linear = np.array([
+                [float(row['affine_xx']), float(row['affine_xy'])],
+                [float(row['affine_yx']), float(row['affine_yy'])]])
+            if not np.all(np.isfinite(linear)):
+                raise ValueError('transformation row with a non-finite '
+                                 'linear part: %s' % linear.tolist())
+            if not np.array_equal(linear, np.eye(2)):
+                if not np.isfinite(theta):
+                    theta = 0.0
+                c, s = np.cos(theta), np.sin(theta)
+                matrix = np.array([[c, -s], [s, c]]) @ linear
+                centre = np.array([float(row['affine_center_x']),
+                                   float(row['affine_center_y'])])
+                offset = centre - matrix @ centre + np.array(
+                    [float(row['xshift']), float(row['yshift'])])
+                return transform.AffineTransform(matrix=np.array([
+                    [matrix[0, 0], matrix[0, 1], offset[0]],
+                    [matrix[1, 0], matrix[1, 1], offset[1]],
+                    [0.0, 0.0, 1.0]]))
         if not np.isfinite(theta) or theta == 0.0:
             return transform.SimilarityTransform(
                 translation=[row['xshift'], row['yshift']])
@@ -1761,6 +1989,311 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         return float(y), float(x)
 
     # ==================================================================
+    # affine_correction: a per-fov linear part that changes with depth
+    # ==================================================================
+
+    # A sample counts only if its kept tiles spread over the frame in both
+    # directions: the snr-weighted standard deviation of their positions,
+    # along the direction where it is smallest, must be at least this many
+    # tile sizes. Below it (every tile in one row, say) the linear part is
+    # not determined by the tiles.
+    _AFFINE_MIN_SPREAD_TILES = 0.5
+    # Where a tile's displacement is taken to be: 'weighted', where its beads
+    # are (see _tile_displacements), or 'centre', the tile centre.
+    # Deliberately not an option; an attribute only so the two can be
+    # compared.
+    _affineTilePosition = 'weighted'
+    # Elements of the linear part, L = [[xx, xy], [yx, yy]], acting on (x, y).
+    _AFFINE_ELEMENTS = ('xx', 'xy', 'yx', 'yy')
+
+    @staticmethod
+    def _resample_affine(image: np.ndarray, linear: np.ndarray,
+                         shiftX: float, shiftY: float) -> np.ndarray:
+        """out(q) = image(c + linear (q - c) - s), c the frame centre,
+        s = (shiftX, shiftY), zero fill: a moving plane put onto the
+        reference by a linear part about the centre and a centre shift (s in
+        the sense of _bounded_correlation_peak: the shift applied to the
+        moving plane)."""
+        height, width = image.shape
+        cx, cy = (width - 1) / 2.0, (height - 1) / 2.0
+        (a, b), (c, d) = linear
+        matrix = np.array([[a, b, cx - a * cx - b * cy - shiftX],
+                           [c, d, cy - c * cx - d * cy - shiftY]],
+                          dtype=np.float64)
+        return cv2.warpAffine(
+            np.ascontiguousarray(image, dtype=np.float32), matrix,
+            (width, height), flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+            borderValue=0)
+
+    def _affine_tile_fit(self, fixedImage: np.ndarray,
+                         movingImage: np.ndarray) -> dict:
+        """Translation and linear part fitted to the tile displacements of
+        movingImage against fixedImage: d(v) = t + D v, v the tile position
+        relative to the frame centre, so the content at reference p sits in
+        movingImage at c + (I + D)(p - c) + t. Tiles, tile rejection and the
+        robust weighted fit are FiducialRoundRotation's (_tile_displacements,
+        _robust_tile_lstsq), with this task's affine_tiles,
+        affine_tile_min_snr and affine_min_tiles; tile positions follow
+        _affineTilePosition.
+
+        Returns a dict: ok, reason, n_measured, n_usable, n_used, spread_px
+        (see _AFFINE_MIN_SPREAD_TILES), rms_px (snr-weighted rms tile
+        residual), D (2x2, acting on (x, y)) and tx, ty."""
+        tiles = int(self.parameters['affine_tiles'])
+        minTiles = int(self.parameters['affine_min_tiles'])
+        vx, vy, dx, dy, weight, measured = self._tile_displacements(
+            fixedImage, movingImage, tiles,
+            float(self.parameters['affine_tile_min_snr']),
+            weightedPosition=self._affineTilePosition == 'weighted')
+        result = {'ok': False, 'reason': '', 'n_measured': measured,
+                  'n_usable': len(vx), 'n_used': 0, 'spread_px': np.nan,
+                  'rms_px': np.nan, 'D': None, 'tx': np.nan, 'ty': np.nan}
+        # six unknowns: fewer tiles than that cannot be fitted at all
+        if len(vx) < max(minTiles, 3):
+            result['reason'] = ('only %d of %d tiles usable (min %d)'
+                                % (len(vx), tiles * tiles, minTiles))
+            return result
+        k = len(vx)
+        # dx = tx + Dxx vx + Dxy vy; dy = ty + Dyx vx + Dyy vy
+        design = np.zeros((2 * k, 6))
+        design[:k, 0] = 1.0
+        design[k:, 1] = 1.0
+        design[:k, 2] = vx
+        design[:k, 3] = vy
+        design[k:, 4] = vx
+        design[k:, 5] = vy
+        solution, keep, rms, _ = self._robust_tile_lstsq(
+            design, np.r_[dx, dy], weight, max(minTiles, 3))
+        w = weight[keep] / np.sum(weight[keep])
+        px, py = vx[keep], vy[keep]
+        px, py = px - np.sum(w * px), py - np.sum(w * py)
+        covariance = np.array([[np.sum(w * px * px), np.sum(w * px * py)],
+                               [np.sum(w * px * py), np.sum(w * py * py)]])
+        spread = float(np.sqrt(max(np.linalg.eigvalsh(covariance)[0], 0.0)))
+        height, width = fixedImage.shape
+        minSpread = self._AFFINE_MIN_SPREAD_TILES * min(height, width) / tiles
+        result.update(n_used=int(keep.sum()), spread_px=spread, rms_px=rms)
+        if spread < minSpread:
+            result['reason'] = ('kept tiles spread %.0f px, below %.0f px: '
+                                'linear part not determined'
+                                % (spread, minSpread))
+            return result
+        result.update(ok=True, tx=float(solution[0]), ty=float(solution[1]),
+                      D=np.array([[solution[2], solution[3]],
+                                  [solution[4], solution[5]]]))
+        return result
+
+    def _measure_affine_samples(self, fov: int, dataChannel: int,
+                                zCoefficients, sampleY, sampleX):
+        """affine_correction, steps a1-a3 of the class docstring, at every
+        depth the xy pass sampled, on the same planes it used: the reference
+        plane, and the moving plane at the fitted z (turned back by the round
+        angle with rotation_task). sampleY, sampleX are the xy pass's frame
+        shifts in the measurement frame, in its order. Returns one dict per
+        sample."""
+        zPositions = np.asarray(
+            self.dataSet.get_data_organization()
+            .get_fiducial3D_stack_frame_zPos(dataChannel), dtype=float)
+        planeIndices = list(range(1, len(zPositions) - 1,
+                                  self.parameters['xy_sample_step']))
+        if len(planeIndices) != len(sampleY):
+            raise ValueError('affine_correction: %d xy samples for %d sample '
+                             'planes' % (len(sampleY), len(planeIndices)))
+        frameShift = dict(zip(planeIndices, zip(sampleY, sampleX)))
+        passes = int(self.parameters['affine_refine_passes'])
+
+        def measure_one(planeIndex):
+            frameY, frameX = (float(v) for v in frameShift[planeIndex])
+            zPosition = float(zPositions[planeIndex])
+            fixedImage = self._fiducial_plane(0, fov, planeIndex)
+            movingImage = self._fiducial_plane_at_z(
+                dataChannel, fov,
+                zPosition + float(np.polyval(zCoefficients, zPosition)))
+            # a1: the moving plane shifted by the xy pass's own frame shift
+            shifted = self._shift_image(movingImage, frameY, frameX)
+            height, width = fixedImage.shape
+            record = dict(zPos=zPosition, plane_index=int(planeIndex),
+                          ok=False, reason='', frame_shift_y=frameY,
+                          frame_shift_x=frameX)
+            # where the frame's correlation peak is measured: the centroid of
+            # each pixel's contribution to it (product of the planes, >= 0)
+            product = np.maximum(
+                fixedImage.astype(np.float64) * shifted.astype(np.float64),
+                0.0)
+            total = float(product.sum())
+            record['centroid_x'] = (float(product.sum(axis=0)
+                                          @ np.arange(width)) / total
+                                    if total > 0 else np.nan)
+            record['centroid_y'] = (float(product.sum(axis=1)
+                                          @ np.arange(height)) / total
+                                    if total > 0 else np.nan)
+            # a2: tile fit on the shifted plane
+            fit = self._affine_tile_fit(fixedImage, shifted)
+            prefix = 'first pass: '
+            first = fit
+            if fit['ok']:
+                # content at reference p sits in the moving plane at
+                # c + (I + D)(p - c) + t - s_w: centre shift s = s_w - t
+                linear = np.eye(2) + fit['D']
+                shift = np.array([frameX - fit['tx'], frameY - fit['ty']])
+                # a3: residual passes on the plane resampled by the fit so
+                # far; the residual (D_r, t_r) composes as
+                # L <- L (I + D_r), s <- s - L t_r
+                for _ in range(passes):
+                    prefix = 'residual pass: '
+                    residual = self._affine_tile_fit(
+                        fixedImage, self._resample_affine(
+                            movingImage, linear, shift[0], shift[1]))
+                    fit = residual
+                    if not residual['ok']:
+                        break
+                    shift = shift - linear @ np.array(
+                        [residual['tx'], residual['ty']])
+                    linear = linear @ (np.eye(2) + residual['D'])
+            record.update(n_measured=fit['n_measured'],
+                          n_usable=fit['n_usable'], n_used=fit['n_used'],
+                          spread_px=fit['spread_px'], rms_px=fit['rms_px'])
+            for name in self._AFFINE_ELEMENTS:
+                record['d' + name] = np.nan
+                record['first_d' + name] = np.nan
+            record.update(tile_shift_y=np.nan, tile_shift_x=np.nan)
+            if first['ok']:
+                for (i, j), name in zip(((0, 0), (0, 1), (1, 0), (1, 1)),
+                                        self._AFFINE_ELEMENTS):
+                    record['first_d' + name] = float(first['D'][i, j])
+            if not fit['ok']:
+                record['reason'] = prefix + fit['reason']
+                return record
+            deformation = linear - np.eye(2)
+            for (i, j), name in zip(((0, 0), (0, 1), (1, 0), (1, 1)),
+                                    self._AFFINE_ELEMENTS):
+                record['d' + name] = float(deformation[i, j])
+            record.update(ok=True, tile_shift_x=float(shift[0]),
+                          tile_shift_y=float(shift[1]))
+            return record
+
+        return self._map_over_planes(measure_one, planeIndices)
+
+    def _affine_matrices(self, coefficients, zPositions) -> np.ndarray:
+        """D(z) = L(z) - I at each depth, from the per-element polynomials:
+        an array (n, 2, 2) acting on (x, y)."""
+        zPositions = np.asarray(zPositions, dtype=float)
+        matrices = np.zeros((len(zPositions), 2, 2))
+        for (i, j), name in zip(((0, 0), (0, 1), (1, 0), (1, 1)),
+                                self._AFFINE_ELEMENTS):
+            matrices[:, i, j] = np.polyval(coefficients[name], zPositions)
+        return matrices
+
+    def _solve_affine(self, fov: int, dataChannel: int, onReference: bool,
+                      zCoefficients, sampleZ, sampleY, sampleX) -> dict:
+        """affine_correction for one stack: measure (a1-a3), fit in depth
+        (a4) and re-reference the xy samples to the frame centre (a5); see
+        the class docstring. sampleZ/Y/X are the xy pass's samples in the
+        measurement frame.
+
+        Returns a dict: source ('fit', 'identity', or 'reference' for the
+        reference stack, which is not measured), fitted, n_samples, n_good,
+        reason, coefficients ({element: polynomial of D's element in z}),
+        samples (the per-sample records, with the fit and the kept flags)
+        and, if fitted, centre_y / centre_x (the re-referenced xy samples)."""
+        order = int(self.parameters['affine_polynomial_order'])
+        zeros = {name: np.zeros(order + 1) for name in self._AFFINE_ELEMENTS}
+        info = {'source': 'reference', 'fitted': False,
+                'n_samples': 0, 'n_good': 0, 'reason': '',
+                'coefficients': zeros, 'samples': []}
+        if onReference:
+            return info
+        samples = self._measure_affine_samples(
+            fov, dataChannel, zCoefficients, sampleY, sampleX)
+        z = np.array([s['zPos'] for s in samples], dtype=float)
+        good = np.array([bool(s['ok']) for s in samples], dtype=bool)
+        nGood = int(good.sum())
+        # the robust fit needs order + 2 points to trim anything
+        minSamples = max(int(self.parameters['affine_min_samples']),
+                         order + 2)
+        fitted = nGood >= minSamples
+        info.update(source='fit' if fitted else 'identity', fitted=fitted,
+                    n_samples=len(samples), n_good=nGood, samples=samples)
+        if not fitted:
+            info['reason'] = ('only %d of %d samples usable (min %d)'
+                              % (nGood, len(samples), minSamples))
+        coefficients = {}
+        for name in self._AFFINE_ELEMENTS:
+            values = np.array([s['d' + name] for s in samples], dtype=float)
+            kept = np.zeros(len(samples), bool)
+            if fitted:
+                coefficients[name], goodKept = self._robust_polyfit(
+                    z[good], values[good], order)
+                kept[np.flatnonzero(good)] = goodKept
+            else:
+                coefficients[name] = np.zeros(order + 1)
+            fitValues = np.polyval(coefficients[name], z)
+            for record, value, isKept in zip(samples, fitValues, kept):
+                record['fit_d' + name] = float(value) if fitted else np.nan
+                record['kept_d' + name] = bool(isKept)
+        info['coefficients'] = coefficients
+        if fitted:
+            # a5: the frame shift is the displacement where the frame's beads
+            # are (their centroid b); at the frame centre it is
+            # s_w + D(z) (b - c)
+            height, width = self.dataSet.get_image_dimensions()
+            centre = np.array([(width - 1) / 2.0, (height - 1) / 2.0])
+            matrices = self._affine_matrices(coefficients, z)
+            centreY, centreX = [], []
+            for record, matrix in zip(samples, matrices):
+                b = np.array([record['centroid_x'], record['centroid_y']])
+                correction = matrix @ (b - centre) if np.all(np.isfinite(b)) \
+                    else np.zeros(2)
+                record['centre_shift_x'] = record['frame_shift_x'] \
+                    + float(correction[0])
+                record['centre_shift_y'] = record['frame_shift_y'] \
+                    + float(correction[1])
+                centreX.append(record['centre_shift_x'])
+                centreY.append(record['centre_shift_y'])
+            info['centre_y'] = np.array(centreY)
+            info['centre_x'] = np.array(centreX)
+        else:
+            for record in samples:
+                record['centre_shift_x'] = record['frame_shift_x']
+                record['centre_shift_y'] = record['frame_shift_y']
+        return info
+
+    def _affine_status_row(self, fov: int, dataChannel: int, info: dict,
+                           zPositions) -> dict:
+        """One affine_fit_status row (see get_affine_fit_status)."""
+        row = {'fov': fov, 'dataChannel': dataChannel,
+               'n_samples': info['n_samples'], 'n_good': info['n_good'],
+               'fitted': bool(info['fitted']), 'source': info['source'],
+               'reason': info['reason'],
+               'order': int(self.parameters['affine_polynomial_order']),
+               'z_min_good_um': np.nan, 'z_max_good_um': np.nan,
+               'kept_fraction': np.nan, 'residual_ppm': np.nan,
+               'max_corner_px': 0.0}
+        samples = info['samples']
+        good = [s for s in samples if s['ok']]
+        if good:
+            row.update(z_min_good_um=min(s['zPos'] for s in good),
+                       z_max_good_um=max(s['zPos'] for s in good))
+        if info['fitted']:
+            keptFraction, residual = [], []
+            for name in self._AFFINE_ELEMENTS:
+                kept = [s for s in good if s['kept_d' + name]]
+                keptFraction.append(len(kept) / float(len(good)))
+                residual.append(np.median(np.abs(
+                    [s['d' + name] - s['fit_d' + name] for s in kept])))
+            height, width = self.dataSet.get_image_dimensions()
+            corners = np.array([[0.0, 0.0], [width - 1.0, 0.0],
+                                [0.0, height - 1.0],
+                                [width - 1.0, height - 1.0]]) \
+                - np.array([(width - 1) / 2.0, (height - 1) / 2.0])
+            matrices = self._affine_matrices(info['coefficients'], zPositions)
+            row.update(kept_fraction=float(min(keptFraction)),
+                       residual_ppm=float(1e6 * max(residual)),
+                       max_corner_px=float(np.max(np.hypot(
+                           *np.einsum('nij,kj->ink', matrices, corners)))))
+        return row
+
+    # ==================================================================
     # storage
     # ==================================================================
 
@@ -1785,6 +2318,12 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             for name in ('z', 'y', 'x'):
                 for order, value in enumerate(entry[name][::-1]):
                     row['%s_c%d' % (name, order)] = value
+            if self.parameters['affine_correction']:
+                # polynomials in z of the elements of D = L - I
+                for name in self._AFFINE_ELEMENTS:
+                    for order, value in enumerate(
+                            entry['affine'][name][::-1]):
+                        row['affine_d%s_c%d' % (name, order)] = value
             coefficientRows.append(row)
         self.dataSet.save_dataframe_to_csv(
             pd.DataFrame(coefficientRows), 'polynomial_coefficients',
@@ -1794,6 +2333,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         tableRows = []
         if self.parameters['rotation_task']:
             height, width = self.dataSet.get_image_dimensions()
+        if self.parameters['affine_correction']:
+            affineHeight, affineWidth = self.dataSet.get_image_dimensions()
         for dataChannel in dataChannels:
             entry = coefficients[dataChannel]
             zOffset = np.polyval(entry['z'], zPositions)
@@ -1814,6 +2355,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 planeTable['rotation_radians'] = entry.get('theta', 0.0)
                 planeTable['rotation_center_x'] = (width - 1) / 2.0
                 planeTable['rotation_center_y'] = (height - 1) / 2.0
+            if self.parameters['affine_correction']:
+                # L(z) = I + D(z), in the measurement frame (see
+                # _row_transform); exactly the identity where nothing was
+                # fitted
+                matrices = self._affine_matrices(entry['affine'], zPositions)
+                planeTable['affine_xx'] = 1.0 + matrices[:, 0, 0]
+                planeTable['affine_xy'] = matrices[:, 0, 1]
+                planeTable['affine_yx'] = matrices[:, 1, 0]
+                planeTable['affine_yy'] = 1.0 + matrices[:, 1, 1]
+                planeTable['affine_center_x'] = (affineWidth - 1) / 2.0
+                planeTable['affine_center_y'] = (affineHeight - 1) / 2.0
             tableRows.append(planeTable)
         self.dataSet.save_dataframe_to_csv(
             pd.concat(tableRows, ignore_index=True), 'transformation_table',
@@ -1862,6 +2414,39 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         rigid_walk_confirm on."""
         return self.dataSet.load_dataframe_from_csv(
             'rigid_walk', self, resultIndex=fov,
+            subdirectory='transformations')
+
+    def get_affine_fit_status(self, fov: int) -> pd.DataFrame:
+        """Per data channel, written only with affine_correction: whether
+        the linear part was fitted (source 'fit'), left at the identity
+        because too few samples were usable ('identity', with the reason),
+        or not measured ('reference': the reference stack; 'rigid_only').
+        n_samples / n_good: the xy sample depths and how many gave a usable
+        tile fit; z_min_good_um / z_max_good_um: the depth range of those (a
+        fitted L is extrapolated beyond it); kept_fraction: the smallest
+        fraction of usable samples the robust depth fit kept, over the four
+        elements; residual_ppm: the largest, over the elements, median
+        |sample - fit| of the kept samples, in ppm; max_corner_px: the
+        largest displacement L(z) - I gives a frame corner at any table
+        depth, i.e. how much the linear part changes the registration."""
+        return self.dataSet.load_dataframe_from_csv(
+            'affine_fit_status', self, resultIndex=fov,
+            subdirectory='transformations')
+
+    def get_affine_samples(self, fov: int) -> pd.DataFrame:
+        """Per measured stack and xy sample depth, written only with
+        affine_correction: the tile fit (ok, reason, n_measured, n_usable,
+        n_used, spread_px, rms_px), the measured elements of D = L - I
+        (dxx, dxy, dyx, dyy; first_d.. = before the residual pass), the depth
+        fit at that depth (fit_d..) and whether the fit kept the sample
+        (kept_d..), and the shifts, in px in the measurement frame (planes
+        turned back by the round angle, if any) and in the sense of the xy
+        samples: frame_shift (the xy pass's whole-frame peak), tile_shift
+        (the tile fit's centre shift), centre_shift (the frame shift moved
+        from the beads' centroid (centroid_x, centroid_y) to the frame
+        centre with the fitted L; what the y/x polynomials are fitted on)."""
+        return self.dataSet.load_dataframe_from_csv(
+            'affine_samples', self, resultIndex=fov,
             subdirectory='transformations')
 
     # ==================================================================
@@ -2229,6 +2814,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
         referenceStack = (dataOrganization.get_fiducial3D_filename(0, fov)
                           if roundAngles is not None else None)
+        # affine_correction: the reference stack (channel 0's) is not
+        # measured; its linear part is the identity
+        affineReference = (dataOrganization.get_fiducial3D_filename(0, fov)
+                           if self.parameters['affine_correction'] else None)
 
         def solve_stack(item):
             key, members = item
@@ -2308,6 +2897,20 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                         self._measure_xy_offsets(fov, dataChannel, rigidY,
                                                  rigidX, zCoefficients)
 
+            # affine_correction (steps a1-a5 of the class docstring): the
+            # linear part, measured at the final xy sample depths on the same
+            # (turned-back) planes, and the xy samples moved from where the
+            # frame's beads are to the frame centre with it; nothing changes
+            # for a stack that is not fitted
+            affineInfo = None
+            if self.parameters['affine_correction']:
+                affineInfo = self._solve_affine(
+                    fov, dataChannel, key == affineReference, zCoefficients,
+                    xySampleZ, xySampleY, xySampleX)
+                if affineInfo['fitted']:
+                    xySampleY, xySampleX = \
+                        affineInfo['centre_y'], affineInfo['centre_x']
+
             if theta != 0.0:
                 # shifts measured on the turned-back planes -> shift of the
                 # frame centre in the moving frame: s = R(theta) s'
@@ -2323,6 +2926,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                      'x': xCoefficients}
             if roundAngles is not None:
                 entry['theta'] = theta
+            affineStatus = None
+            if affineInfo is not None:
+                entry['affine'] = affineInfo['coefficients']
+                affineStatus = self._affine_status_row(
+                    fov, dataChannel, affineInfo, self.dataSet.get_z_positions())
             status = {'fov': fov, 'dataChannel': dataChannel,
                       'n_samples': int(len(zGate)), 'n_good': nGood,
                       'n_gated_out': int(len(zGate) - nGood),
@@ -2410,6 +3018,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                          'fovs curve if z_neighbor_substitution is on. ***'
                          % (fov, dataChannel, nGood, len(zGate),
                             self.parameters['z_min_good_samples']))
+            if affineStatus is not None and affineStatus['source'] == 'fit':
+                line += (', affine: %d/%d samples, up to %.2f px at the '
+                         'corners' % (affineStatus['n_good'],
+                                      affineStatus['n_samples'],
+                                      affineStatus['max_corner_px']))
+            elif affineStatus is not None \
+                    and affineStatus['source'] == 'identity':
+                line += ('\n  *** AFFINE NOT FITTED, fov %d channel %d: %s; '
+                         'linear part left at the identity (registered as '
+                         'without affine_correction). ***'
+                         % (fov, dataChannel, affineStatus['reason']))
             # rotation_task: the round angle and the rotation task's verdict
             # on this fov's own first-plane angle, written as rotation_status
             rotationStatus = None
@@ -2418,7 +3037,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     fov, dataChannel, theta, key == referenceStack,
                     roundVerdicts)
             return (key, entry, stackMeasurements, line, flag, status,
-                    rotationStatus)
+                    rotationStatus, affineInfo, affineStatus)
 
         stackThreads = max(1, int(self.parameters['stack_num_threads']))
         items = list(stackMembers.items())
@@ -2437,18 +3056,32 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # whatever order the threads happened to finish in.
         coefficients = {}
         measurements = []
-        entryOf = {key: entry for key, entry, _, _, _, _, _ in solvedStacks}
+        entryOf = {key: entry for key, entry, *_ in solvedStacks}
         qcFlags = []
         zStatus = []
         rotationOf = {}
-        for key, _, stackMeasurements, line, flag, status, rotationStatus \
-                in solvedStacks:
+        affineOf = {}
+        affineSamples = []
+        for key, _, stackMeasurements, line, flag, status, rotationStatus, \
+                affineInfo, affineStatus in solvedStacks:
             zStatus.append(status)
             rotationOf[status['dataChannel']] = rotationStatus
             measurements.extend(stackMeasurements)
             print(line, flush=True)
             if flag is not None:
                 qcFlags.append(flag)
+            if affineStatus is not None:
+                affineOf[status['dataChannel']] = affineStatus
+                affineSamples.extend(
+                    dict(record, fov=fov, dataChannel=status['dataChannel'])
+                    for record in affineInfo['samples'])
+                if affineStatus['source'] == 'identity':
+                    qcFlags.append({
+                        'fov': fov, 'dataChannel': status['dataChannel'],
+                        'z_residual_um': np.nan, 'y_residual_px': np.nan,
+                        'x_residual_px': np.nan, 'fraction_kept': np.nan,
+                        'reasons': 'affine: %s; linear part left at the '
+                                   'identity' % affineStatus['reason']})
         if self.parameters['rigid_walk_confirm'] and walkRecords is not None:
             # a far first walk plane either overruled the 2D answer (confirmed)
             # or was thrown away as a ghost (rejected); both are worth a look
@@ -2526,6 +3159,20 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 'rigid_y': rigidY, 'rigid_x': rigidX}
             if roundAngles is not None:
                 coefficients[dataChannel]['theta'] = roundAngles[dataChannel]
+            if self.parameters['affine_correction']:
+                # no depth information: the identity, as for the 3D warp
+                rigidOnlyAffine = {
+                    'source': 'rigid_only', 'fitted': False, 'n_samples': 0,
+                    'n_good': 0, 'reason': '', 'samples': [],
+                    'coefficients': {
+                        name: np.zeros(int(self.parameters[
+                            'affine_polynomial_order']) + 1)
+                        for name in self._AFFINE_ELEMENTS}}
+                coefficients[dataChannel]['affine'] = \
+                    rigidOnlyAffine['coefficients']
+                affineOf[dataChannel] = self._affine_status_row(
+                    fov, dataChannel, rigidOnlyAffine,
+                    self.dataSet.get_z_positions())
             print('fov %d channel %d: rigid only (%.2f, %.2f), no 3D warp '
                   'fitted' % (fov, dataChannel, rigidY, rigidX), flush=True)
             statusRows.append(dict(
@@ -2583,6 +3230,44 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 pd.DataFrame(rotationRows, columns=rotationColumns)
                 .sort_values('dataChannel'),
                 'rotation_status', self.get_analysis_name(), resultIndex=fov,
+                subdirectory='transformations', index=False)
+
+        if self.parameters['affine_correction']:
+            # One row per data channel, like z_fit_status (see
+            # get_affine_fit_status), and one row per measured stack and
+            # sample depth (see get_affine_samples).
+            affineRows = []
+            for key, members in stackMembers.items():
+                owner = members[0][0]
+                for dataChannel, _, _ in members:
+                    affineRows.append(dict(affineOf[owner],
+                                           dataChannel=dataChannel,
+                                           owner_channel=owner))
+            for dataChannel, _, _ in rigidOnlyMembers:
+                affineRows.append(dict(affineOf[dataChannel],
+                                       owner_channel=dataChannel))
+            self.dataSet.save_dataframe_to_csv(
+                pd.DataFrame(affineRows, columns=[
+                    'fov', 'dataChannel', 'owner_channel', 'n_samples',
+                    'n_good', 'fitted', 'source', 'reason', 'order',
+                    'z_min_good_um', 'z_max_good_um', 'kept_fraction',
+                    'residual_ppm', 'max_corner_px'])
+                .sort_values('dataChannel'),
+                'affine_fit_status', self.get_analysis_name(),
+                resultIndex=fov, subdirectory='transformations', index=False)
+            sampleColumns = (
+                ['fov', 'dataChannel', 'zPos', 'plane_index', 'ok', 'reason',
+                 'n_measured', 'n_usable', 'n_used', 'spread_px', 'rms_px']
+                + ['d' + n for n in self._AFFINE_ELEMENTS]
+                + ['fit_d' + n for n in self._AFFINE_ELEMENTS]
+                + ['kept_d' + n for n in self._AFFINE_ELEMENTS]
+                + ['first_d' + n for n in self._AFFINE_ELEMENTS]
+                + ['frame_shift_y', 'frame_shift_x', 'tile_shift_y',
+                   'tile_shift_x', 'centroid_y', 'centroid_x',
+                   'centre_shift_y', 'centre_shift_x'])
+            self.dataSet.save_dataframe_to_csv(
+                pd.DataFrame(affineSamples, columns=sampleColumns),
+                'affine_samples', self.get_analysis_name(), resultIndex=fov,
                 subdirectory='transformations', index=False)
 
         self._save_results(fov, coefficients, measurements)
@@ -2856,28 +3541,10 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         n = int(self.parameters['rotation_tiles'])
         minSnr = float(self.parameters['rotation_tile_min_snr'])
         minTiles = int(self.parameters['rotation_min_tiles'])
-        height, width = fixedImage.shape
-        cy, cx = (height - 1) / 2.0, (width - 1) / 2.0
-        rows = np.linspace(0, height, n + 1).astype(int)
-        cols = np.linspace(0, width, n + 1).astype(int)
-        vx, vy, dx, dy, weight = [], [], [], [], []
-        measured = 0
-        for i in range(n):
-            for j in range(n):
-                f = fixedImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
-                m = movingImage[rows[i]:rows[i + 1], cols[j]:cols[j + 1]]
-                if not f.any() or not m.any():
-                    continue
-                measured += 1
-                sy, sx, snr, onEdge = measurer._bounded_correlation_peak(
-                    f, m, 0.0, 0.0)
-                if onEdge or not np.isfinite(snr) or snr < minSnr:
-                    continue
-                vx.append(0.5 * (cols[j] + cols[j + 1] - 1) - cx)
-                vy.append(0.5 * (rows[i] + rows[i + 1] - 1) - cy)
-                dx.append(-sx)          # displacement = minus the shift
-                dy.append(-sy)
-                weight.append(snr)
+        # the tile measurement and the robust fit are FiducialPolynomialWarp3D's
+        # (shared with its affine_correction); tile positions are tile centres
+        vx, vy, dx, dy, weight, measured = measurer._tile_displacements(
+            fixedImage, movingImage, n, minSnr)
         result = {'ok': False, 'reason': '', 'n_tiles': n * n,
                   'n_measured': measured, 'n_usable': len(vx), 'n_used': 0,
                   'theta': np.nan, 'tx': np.nan, 'ty': np.nan,
@@ -2886,7 +3553,6 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
             result['reason'] = ('only %d of %d tiles usable (min %d)'
                                 % (len(vx), n * n, minTiles))
             return result
-        vx, vy, dx, dy, weight = map(np.asarray, (vx, vy, dx, dy, weight))
         k = len(vx)
         # d = t + theta * (-v_y, v_x): rows 0..k-1 are x, k..2k-1 are y
         design = np.zeros((2 * k, 3))
@@ -2894,28 +3560,8 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         design[k:, 1] = 1.0
         design[:k, 2] = -vy
         design[k:, 2] = vx
-        target = np.r_[dx, dy]
-        rootWeight = np.sqrt(np.r_[weight, weight])
-
-        def solve(matrix, keep):
-            rowsKept = np.r_[keep, keep]
-            solution, *_ = np.linalg.lstsq(
-                matrix[rowsKept] * rootWeight[rowsKept, None],
-                target[rowsKept] * rootWeight[rowsKept], rcond=None)
-            residual = target - matrix @ solution
-            return solution, np.hypot(residual[:k], residual[k:])
-
-        keep = np.ones(k, bool)
-        for _ in range(2):
-            _, tileResidual = solve(design, keep)
-            scale = 1.4826 * np.median(tileResidual) + 1e-6
-            good = tileResidual < 3.0 * scale
-            if good.sum() < minTiles:
-                break
-            keep = good
-        solution, tileResidual = solve(design, keep)
-        rms = float(np.sqrt(np.sum(weight[keep] * tileResidual[keep] ** 2)
-                            / np.sum(weight[keep])))
+        solution, keep, rms, solve = measurer._robust_tile_lstsq(
+            design, np.r_[dx, dy], weight, minTiles)
         # diagnostic: d = t + theta * (-v_y, v_x) + kappa * (v_x, v_y),
         # scale = 1 + kappa
         similarity = np.zeros((2 * k, 4))
