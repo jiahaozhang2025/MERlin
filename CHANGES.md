@@ -241,6 +241,14 @@ major change was made.
     no rotation. This is the only way an angle is estimated. Lida Cheng's
     `rotation_correction` (one angle per FOV from the 2D frame) was the
     starting point.
+  - `affine_correction` (default false): A per-FOV 2x2 linear part L(z)
+    (stretch, shear, small turn) on top of the round angle, changing with
+    depth: tile fit at each xy sample depth (`affine_tiles`,
+    `affine_tile_min_snr`, `affine_min_tiles`, `affine_refine_passes`), each
+    element fitted in depth (`affine_polynomial_order`, default 1); identity
+    and a flag below `affine_min_samples` usable samples. The table gains
+    `affine_xx/xy/yx/yy` and `affine_center_x/y`; QC in
+    `affine_fit_status_<fov>.csv` and `affine_samples_<fov>.csv`.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
@@ -299,8 +307,8 @@ major change was made.
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
   synthetic spots, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
-  PolyWarp round angle (`rotation_task`), round rotation
-  (`FiducialRoundRotation`).
+  PolyWarp round angle (`rotation_task`), PolyWarp linear part
+  (`affine_correction`), round rotation (`FiducialRoundRotation`).
 - Removed: PolyWarp's per-stack in-plane angle (`rotation_correction` without
   `rotation_task`, with `rotation_tiles`, `rotation_tile_min_snr`,
   `rotation_min_tiles`, `rotation_min_planes`, `rotation_max_degrees`,

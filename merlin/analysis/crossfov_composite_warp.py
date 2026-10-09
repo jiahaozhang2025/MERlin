@@ -102,6 +102,12 @@ class CrossFOVCompositeWarp(warp.FiducialPolynomialWarp3D):
                 raise ValueError('CrossFOVCompositeWarp does not support a '
                                  'PolyWarp task with an in-plane rotation '
                                  '(rotation_task)')
+            # affine_correction gives the tables a linear part, which the
+            # margins and the neighbour fill do not read either
+            if pw.get('affine_correction', False):
+                raise ValueError('CrossFOVCompositeWarp does not support a '
+                                 'PolyWarp task with a linear part '
+                                 '(affine_correction)')
         return self._pw
 
     # ------------------------------------------------------------------
