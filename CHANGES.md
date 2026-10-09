@@ -241,12 +241,6 @@ major change was made.
     no rotation. This is the only way an angle is estimated. Lida Cheng's
     `rotation_correction` (one angle per FOV from the 2D frame) was the
     starting point.
-  - `affine_correction` (default false): Per-FOV 2x2 linear part L(z) on top
-    of the round angle, fitted in depth from tile fits at the xy sample depths
-    (`affine_*` options); table `affine_xx/xy/yx/yy`, `affine_center_x/y`; QC
-    `affine_fit_status_<fov>.csv`, `affine_samples_<fov>.csv`. Requires
-    `rotation_task`; a stack with too few usable samples or an unfitted z keeps
-    the identity, with a flag.
   - `z_fit_status_<fov>.csv`, `z_neighbor_substitutions.csv`, `write_qc_table`:
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
@@ -305,8 +299,8 @@ major change was made.
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
   synthetic spots, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
-  PolyWarp round angle (`rotation_task`), PolyWarp linear part
-  (`affine_correction`), round rotation (`FiducialRoundRotation`).
+  PolyWarp round angle (`rotation_task`), round rotation
+  (`FiducialRoundRotation`).
 - Removed: PolyWarp's per-stack in-plane angle (`rotation_correction` without
   `rotation_task`, with `rotation_tiles`, `rotation_tile_min_snr`,
   `rotation_min_tiles`, `rotation_min_planes`, `rotation_max_degrees`,
@@ -315,6 +309,8 @@ major change was made.
   and `rotation_correction` true is redundant next to `rotation_task`. A task
   with `rotation_correction` true alone keeps its tables readable (Decode
   applies their angle) but refuses to run.
+- Removed: PolyWarp's `affine_correction` (per-FOV linear part) and its
+  `affine_*` options; a task.json carrying `affine_*` keys is no longer supported.
 - `-i`: Accepts a fragment range (`0-25`) or list (`3,8,11`), run in one process.
 - snakemake: Imported only when running a whole analysis with snakemake; an
   optional extra.
