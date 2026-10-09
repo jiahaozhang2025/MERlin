@@ -71,7 +71,8 @@ misidentification rate and all of `Segment`.
   at the frame corners after the round angle, by an amount that grows with
   depth (the gel stretches or shears there). Each FOV and stack then also gets
   a linear part that changes with depth; `affine_fit_status_<fov>.csv` says
-  which stacks were fitted and how far it moves the corners. Not accepted by
+  which stacks were fitted and how far it moves the corners (stacks whose z
+  is unfitted keep the identity). Requires `rotation_task`. Not accepted by
   `CrossFOVCompositeWarp` either.
 - `z_xy_refine`: Turn it on when `z_fit_status` shows stacks with few good z
   samples although their xy fits are clean and the beads are bright, typically
