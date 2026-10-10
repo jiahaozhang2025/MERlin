@@ -533,20 +533,31 @@ class ChainTests(unittest.TestCase):
 
 class AreaEdgeTests(unittest.TestCase):
 
-    def test_quantile_edges(self):
+    def test_equal_count_edges(self):
+        # 1000 molecules: area 2 x 500, 3 x 300, then 4 .. 203 once each.
+        # 2 and 3 take a bin each; the 8 left split the other 200 by 25.
         areas = np.r_[np.full(500, 2), np.full(300, 3), np.arange(4, 204)]
-        edges = deduplicate.area_quantile_edges(areas, 10)
-        self.assertEqual(edges[0], 2)
-        self.assertEqual(edges[-1], 204)
-        self.assertTrue(np.all(np.diff(edges) > 0))
-        self.assertTrue(np.all(edges == np.floor(edges)))
-        self.assertLess(len(edges) - 1, 10)              # ties merged
+        edges = deduplicate.area_equal_count_edges(
+            np.random.default_rng(0).permutation(areas), 10)
+        np.testing.assert_array_equal(
+            edges, [2, 3, 4, 29, 54, 79, 104, 129, 154, 179, 204])
         counts = np.histogram(areas, edges)[0]
-        self.assertEqual(counts.sum(), len(areas))
+        self.assertEqual(counts.tolist(), [500, 300] + [25] * 8)
+
+    def test_fewer_distinct_areas_than_bins(self):
+        np.testing.assert_array_equal(
+            deduplicate.area_equal_count_edges(np.array([5, 2, 2, 3, 9]), 10),
+            [2, 3, 5, 9, 10])
+
+    def test_one_bin(self):
+        np.testing.assert_array_equal(
+            deduplicate.area_equal_count_edges(np.array([4, 2, 7]), 1),
+            [2, 8])
 
     def test_empty_falls_back_to_unit_edges(self):
         np.testing.assert_array_equal(
-            deduplicate.area_quantile_edges(np.array([]), 5), np.arange(1, 7))
+            deduplicate.area_equal_count_edges(np.array([]), 5),
+            np.arange(1, 7))
 
 
 if __name__ == '__main__':
