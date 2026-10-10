@@ -54,7 +54,8 @@ clipped to 65535 in 'area' (area_sum itself is 32-bit).
 Summed areas run far beyond the 1..area_bins+1 area edges the adaptive
 threshold uses by default (every molecule above that would share the top bin).
 GenerateMoleculeAdaptiveThreshold therefore sets the area edges from the
-molecules themselves (area_bin_edges 'quantile', see area_quantile_edges)
+molecules themselves (area_bin_edges 'equal_count', see
+area_equal_count_edges)
 before the base threshold runs; 'unit' keeps the base edges.
 """
 import time
@@ -295,26 +296,39 @@ def deduplicate_barcodes(barcodes: pandas.DataFrame, zPositions,
                        'n_links': links}
 
 
-def area_quantile_edges(areas: np.ndarray, binCount: int) -> np.ndarray:
+def area_equal_count_edges(areas: np.ndarray, binCount: int) -> np.ndarray:
     """Integer area bin edges with about equal numbers of molecules per bin.
 
-    The k-th inner edge is floor(q_k) + 1 for the quantile q_k at k/binCount,
-    so a bin [e_k, e_k+1) holds the integer areas e_k .. e_k+1 - 1 and the
-    quantile value falls in the lower bin. The first edge is the smallest area,
-    the last the largest area + 1; repeated edges are merged, so heavily tied
-    small areas give fewer than binCount bins. Areas outside the range (in fovs
-    not sampled) go to the end bins, as with the base threshold.
+    Areas are integers and one area value is never split between bins.
+    Walking up from the smallest area, a bin is closed as soon as it holds
+    its share of the molecules not yet binned (their count over the bins
+    left), so an area value that alone holds more than its share gets a bin of
+    its own and the remaining bins are shared out over the rest. This gives
+    binCount bins unless there are fewer distinct areas (then one bin per
+    area). A bin [e_k, e_k+1) holds the areas e_k .. e_k+1 - 1; the first
+    edge is the smallest area and the last the largest area + 1. Areas outside
+    that range (in fovs not sampled) go to the end bins, as with the base
+    threshold.
     """
     areas = np.asarray(areas, dtype=np.float64)
-    areas = areas[np.isfinite(areas)]
+    areas = np.floor(areas[np.isfinite(areas)]).astype(np.int64)
     if areas.size == 0:
         return np.arange(1, binCount + 2, dtype=np.float64)
-    low = np.floor(areas.min())
-    high = np.floor(areas.max()) + 1
-    quantiles = np.quantile(areas, np.linspace(0, 1, binCount + 1)[1:-1])
-    inner = np.floor(quantiles) + 1
-    inner = inner[(inner > low) & (inner < high)]
-    return np.unique(np.concatenate(([low], inner, [high])))
+    low = int(areas.min())
+    counts = np.bincount(areas - low)
+    values = np.flatnonzero(counts)
+    counts = counts[values]
+    edges = [int(values[0])]
+    binsLeft, moleculesLeft, inBin = int(binCount), int(counts.sum()), 0
+    for k in range(len(values) - 1):
+        inBin += int(counts[k])
+        if binsLeft > 1 and inBin * binsLeft >= moleculesLeft:
+            edges.append(int(values[k + 1]))
+            moleculesLeft -= inBin
+            binsLeft -= 1
+            inBin = 0
+    edges.append(int(values[-1]) + 1)
+    return np.asarray(edges, dtype=np.float64) + low
 
 
 class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
@@ -469,22 +483,23 @@ class GenerateMoleculeAdaptiveThreshold(
     """GenerateAdaptiveThreshold with area edges set from the molecules.
 
     area_bin_edges:
-    - 'quantile' (default): before the histogram is built, the edges are
-      area_quantile_edges of the areas of all molecules (coding and blank) in
-      bin_sample_fovs fovs (default 20) spread evenly over the selected fovs;
-      at most area_bins bins, fewer where small areas are tied. Saved as the
-      task's area_bins result, which the base task then uses (and reuses on
-      a rerun).
-    - 'unit': the base edges 1, 2, ..., area_bins + 1.
+    - 'equal_count' (default): before the histogram is built, the edges are
+      area_equal_count_edges of the areas of all molecules (coding and blank)
+      in bin_sample_fovs fovs (default 20) spread evenly over the selected
+      fovs: area_bins bins of about equal molecule counts, a heavily tied
+      small area getting a bin of its own. Saved as the task's area_bins
+      result, which the base task then uses (and reuses on a rerun).
+    - 'unit': the base edges 1, 2, ..., area_bins + 1 (areas above pooled in
+      the top bin).
     Everything else is the base task's.
     """
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
         if 'area_bin_edges' not in self.parameters:
-            self.parameters['area_bin_edges'] = 'quantile'
-        if self.parameters['area_bin_edges'] not in ('quantile', 'unit'):
-            raise ValueError("area_bin_edges must be 'quantile' or 'unit'")
+            self.parameters['area_bin_edges'] = 'equal_count'
+        if self.parameters['area_bin_edges'] not in ('equal_count', 'unit'):
+            raise ValueError("area_bin_edges must be 'equal_count' or 'unit'")
 
     def _area_sample_fragments(self) -> List[int]:
         selected = self._selected_fragments()
@@ -496,7 +511,7 @@ class GenerateMoleculeAdaptiveThreshold(
         return [selected[p] for p in positions]
 
     def _run_analysis(self):
-        if self.parameters['area_bin_edges'] == 'quantile' and \
+        if self.parameters['area_bin_edges'] == 'equal_count' and \
                 self.dataSet.load_numpy_analysis_result_if_available(
                     'area_bins', self, None) is None:
             decodeTask = self.dataSet.load_analysis_task(
@@ -508,7 +523,8 @@ class GenerateMoleculeAdaptiveThreshold(
             areas = np.concatenate([
                 barcodeDB.get_barcodes(f, columnList=['area'])[
                     'area'].to_numpy(np.float64) for f in sample])
-            edges = area_quantile_edges(areas, self.parameters['area_bins'])
+            edges = area_equal_count_edges(areas,
+                                           self.parameters['area_bins'])
             self.dataSet.save_numpy_analysis_result(edges, 'area_bins', self)
             print('%s: %d area bins from %d molecules in fovs %s: edges %s'
                   % (self.get_analysis_name(), len(edges) - 1, len(areas),
