@@ -64,6 +64,17 @@ major change was made.
 - `l2_regularization`: Controls regularization strength for the logistic filter.
 - `max_iterations`: Limits logistic-model optimization iterations.
 
+### Molecule deduplication (`merlin/analysis/deduplicate.py`)
+
+- `DeduplicateBarcodes`: New task between Decode and the adaptive threshold.
+  It merges a molecule's detections on nearby z planes (same barcode,
+  `xy_radius_px`, `max_z_gap_um`) into one row, so the misidentification
+  target holds per molecule; `molecule_features` sets how a molecule's
+  intensity, distance and area are formed.
+- `GenerateMoleculeAdaptiveThreshold`: The adaptive threshold with area bin
+  edges taken from the molecules' areas (`area_bin_edges`), as summed areas
+  run past the default edges.
+
 ### Example images (Preprocess, Decode, adaptive filters; `merlin/util/imagesample.py`)
 
 - Preprocess, Decode and the adaptive filters write example images by default,
