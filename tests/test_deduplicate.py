@@ -454,7 +454,7 @@ class ChainTests(unittest.TestCase):
             dedup.save()
             threshold = deduplicate.GenerateMoleculeAdaptiveThreshold(
                 ds, {'decode_task': 'Dedup', 'run_after_task': 'Dedup',
-                     'poll_interval': 0}, 'Thresh')
+                     'poll_interval': 0, 'area_bins': 20}, 'Thresh')
             threshold.save()
             filterTask = filterbarcodes.AdaptiveFilterBarcodes(
                 ds, {'decode_task': 'Dedup', 'adaptive_task': 'Thresh',
@@ -520,14 +520,15 @@ class ChainTests(unittest.TestCase):
             dedup.save()
             threshold = deduplicate.GenerateMoleculeAdaptiveThreshold(
                 ds, {'decode_task': 'Dedup', 'run_after_task': 'Dedup',
-                     'poll_interval': 0, 'area_bin_edges': 'unit'}, 'Thresh')
+                     'poll_interval': 0, 'area_bins': 12,
+                     'area_bin_edges': 'unit'}, 'Thresh')
             threshold.save()
             for fov in ds.get_fovs():
                 decodeTask.run(fov)
                 dedup.run(fov)
             threshold.run()
             np.testing.assert_array_equal(threshold.get_area_bins(),
-                                          np.arange(1, 22))
+                                          np.arange(1, 14))
 
 
 class AreaEdgeTests(unittest.TestCase):
