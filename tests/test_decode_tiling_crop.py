@@ -8,12 +8,14 @@ edges. compute_crop_bounds then gives the valid region rows 10:80,
 cols 20:90 for crop_width 6 and 0 alike. It is square, so tiles split it
 evenly and the extractor's own edge filter cannot drop anything.
 
-Image space (crop_in_image_space True): x, y are in the cropped frame, every
-spot inside the region is kept, and global x, y are raw pixel + the fov's
-global offset, i.e. local + (colStart, rowStart). tiling_factor 2 has to give
-the same barcodes as no tiling. Barcode space (False): the frame is not
-cropped, spots within crop_width of the frame edge are dropped, and the global
-offset is zero, tiled or not.
+Image space (crop_in_image_space True): every spot inside the region is
+kept, and x, y are full-frame raw pixels (the crop corner (colStart, rowStart)
+is added back), so global x, y are raw pixel + the fov's global offset.
+tiling_factor 2 has to give the same barcodes as no tiling. Barcode space
+(False): the frame is not cropped, spots within crop_width of the frame edge
+are dropped, and x, y are full-frame as decoded, tiled or not. The six bits
+are data channels 0-5 and the codebook uses all six, so the adaptive margin
+over the codebook's channels (the default) is the one over every channel.
 
 Run with `python -m unittest tests/test_decode_tiling_crop.py`.
 """
@@ -60,6 +62,15 @@ class _Codebook:
     def get_barcodes(self, ignoreBlanks=False):
         return codewords()
 
+    def get_bit_names(self):
+        return ['bit%d' % b for b in range(BITS)]
+
+
+class _DataOrganization:
+
+    def get_data_channel_for_bit(self, bitName):
+        return int(bitName[3:])
+
 
 class _Warp:
 
@@ -72,12 +83,17 @@ class _Warp:
         return [transform.SimilarityTransform(),
                 transform.SimilarityTransform(translation=(-20, -10)),
                 transform.SimilarityTransform(translation=(0, 16)),
-                transform.SimilarityTransform(translation=(6, 0))]
+                transform.SimilarityTransform(translation=(6, 0)),
+                transform.SimilarityTransform(),
+                transform.SimilarityTransform()]
 
 
 class _Preprocess:
 
     parameters = {'warp_task': 'Warp'}
+
+    def get_codebook(self):
+        return _Codebook()
 
     def get_processed_image_set(self, fov, zIndex, chromaticCorrector=None):
         images = np.zeros((BITS, FRAME, FRAME), dtype=np.float32)
@@ -105,6 +121,9 @@ class _DataSet:
 
     def get_image_dimensions(self):
         return (FRAME, FRAME)
+
+    def get_data_organization(self):
+        return _DataOrganization()
 
     def load_analysis_task(self, name):
         return self.tasks[name]
@@ -148,7 +167,7 @@ def expected(cropInImageSpace, cropWidth):
             if not (rowStart < row < rowEnd - 1
                     and colStart < col < colEnd - 1):
                 continue
-            x, y = col - colStart, row - rowStart
+            x, y = col, row
         else:
             if not (cropWidth <= col <= FRAME - cropWidth
                     and cropWidth <= row <= FRAME - cropWidth):
@@ -191,28 +210,29 @@ class TilingCropTests(unittest.TestCase):
         self._check(False, 6)
 
     def test_image_space_keeps_spots_near_the_region_edge(self):
-        # the three spots within crop_width of the cropped frame's edge, and
-        # their raw-pixel global coordinates
+        # the three spots within crop_width of the cropped frame's edge, at
+        # their full-frame raw pixels, and their raw-pixel global coordinates
         tiled = decode_plane(True, 6, 2)
         self.assertEqual(sorted(tiled['barcode_id'].tolist()),
                          [0, 1, 2, 3, 4, 5])
         nearEdge = tiled[tiled['barcode_id'].isin([0, 1, 2])].sort_values(
             'barcode_id')
         np.testing.assert_allclose(nearEdge[['x', 'y']].to_numpy(),
-                                   [[2, 2], [67, 67], [66, 40]])
+                                   [[22, 12], [87, 77], [86, 50]])
         np.testing.assert_allclose(
             nearEdge[['global_x', 'global_y']].to_numpy(),
             [[5022, 7012], [5087, 7077], [5086, 7050]])
 
     def test_image_space_global_is_raw_pixel(self):
-        # global = raw pixel + fov offset for every spot, i.e. local x, y
-        # plus (colStart, rowStart) = (20, 10), not plus crop_width
+        # x, y = raw pixel (the cropped image's x, y plus (colStart,
+        # rowStart) = (20, 10), not plus crop_width) and global = raw pixel
+        # + fov offset for every spot
         raw = {code: (col, row) for code, row, col in SPOTS[:6]}
         for tilingFactor in (None, 2):
             df = decode_plane(True, 6, tilingFactor)
             for _, bc in df.iterrows():
                 col, row = raw[int(bc['barcode_id'])]
-                self.assertEqual((bc['x'] + 20, bc['y'] + 10), (col, row))
+                self.assertEqual((bc['x'], bc['y']), (col, row))
                 self.assertEqual(
                     (bc['global_x'] - GLOBAL_OFFSET[0],
                      bc['global_y'] - GLOBAL_OFFSET[1]), (col, row))
