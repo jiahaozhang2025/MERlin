@@ -53,21 +53,24 @@ The decode table's area column is 16-bit unsigned; an area_sum above 65535 is
 clipped to 65535 in 'area' (area_sum itself is 32-bit).
 
 Valid box (crop_to_valid_box, off by default). Decode trims each fov to its
-valid region, decode.compute_crop_bounds: crop_width on every edge, widened
-(with adaptive_crop) to the widest strip that any of the warp task's
-transforms leaves without data, over every channel and plane and at the
-turned corners of a rotation. Decode applies that region only when it crops
-in image space (crop_in_image_space); in barcode space it removes just the
-barcodes within crop_width of the frame edge, so detections in the strip
-where some channel has no warped data are kept. With crop_to_valid_box the
-detections whose x, y centroid lies outside the region (the decode task's
-preprocess_task's warp_task, crop_width and adaptive_crop) are dropped before
-linking: x in [colStart, colEnd] and y in [rowStart, rowEnd], inclusive like
-Decode's crop_width filter. In image space the decode's x, y are relative to
-(colStart, rowStart) and are shifted back first, so nothing is dropped there;
-with adaptive_crop off the region is the crop_width box and nothing more is
-dropped either. The region is the same for every codebook decoded with one
-warp task, as it spans all the warp task's channels.
+valid region, decode.compute_crop_bounds: crop_width on each edge, widened
+(with adaptive_crop) to the widest strip that the warp task's transforms
+leave without data, over the decode codebook's own data channels
+(adaptive_crop_channels 'codebook', the default; 'all' = every channel) and
+every plane, and at the turned corners of a rotation. Decode applies that
+region only when it crops in image space (crop_in_image_space); in barcode
+space it removes just the barcodes within crop_width of the frame edge, so
+detections in the strip where some bit has no warped data are kept. With
+crop_to_valid_box the detections whose x, y centroid lies outside the region
+are dropped before linking: x in [colStart, colEnd] and y in [rowStart,
+rowEnd], inclusive like Decode's crop_width filter. The region is the one
+the decode recorded for the fov (Decode.get_crop_bounds), so it is per
+codebook, the same bounds an image-space decode was cut to. An image-space
+decode has nothing outside it to drop: its x, y are full-frame and inside the
+region (an image-space decode from before x, y were written full-frame has
+x, y relative to (colStart, rowStart), which are shifted back first); with
+adaptive_crop off the region is the crop_width box and nothing more is
+dropped either.
 
 Summed areas run far beyond the 1..area_bins+1 area edges the adaptive
 threshold uses by default (every molecule above that would share the top bin).
@@ -348,18 +351,42 @@ def _check_valid_box_parameters(decodeTask) -> Dict:
     return parameters
 
 
-def decode_valid_box(dataSet, decodeTask, fov: int
+def decode_valid_box(dataSet, decodeTask, fov: int,
+                     legacyImageSpace: bool = False
                      ) -> Tuple[int, int, int, int]:
     """(rowStart, rowEnd, colStart, colEnd) of the decode task's valid region
-    of fov: decode.compute_crop_bounds with the warp task of the decode
-    task's preprocess_task and the decode task's crop_width and
-    adaptive_crop, as Decode itself computes it."""
+    of fov, as Decode itself computes it: a Decode's recorded bounds of the
+    fov (Decode.get_crop_bounds; the current settings if the fov has no
+    record), otherwise decode.task_crop_bounds, i.e. compute_crop_bounds
+    with the warp task of the decode task's preprocess_task, its crop_width,
+    adaptive_crop and adaptive_crop_channels (all channels without it).
+
+    legacyImageSpace (decode_xy_is_cropped): the region an image-space
+    decode from before the per-codebook crop was cut to, over every channel
+    of the warp task, whose corner its x, y are relative to."""
     parameters = _check_valid_box_parameters(decodeTask)
-    warpTaskName = dataSet.load_analysis_task(
-        parameters['preprocess_task']).get_parameters()['warp_task']
-    return decode.compute_crop_bounds(dataSet, warpTaskName, fov,
-                                      parameters['crop_width'],
-                                      parameters['adaptive_crop'])
+    if legacyImageSpace:
+        warpTaskName = dataSet.load_analysis_task(
+            parameters['preprocess_task']).get_parameters()['warp_task']
+        return tuple(int(b) for b in decode.compute_crop_bounds(
+            dataSet, warpTaskName, fov, parameters['crop_width'],
+            parameters['adaptive_crop']))
+    getBounds = getattr(decodeTask, 'get_crop_bounds', None)
+    if getBounds is not None:
+        return tuple(int(b) for b in getBounds(fov))
+    return tuple(int(b) for b in decode.task_crop_bounds(decodeTask, fov))
+
+
+def decode_xy_is_cropped(decodeTask, fov: int) -> bool:
+    """True when the decode task's x, y of fov are relative to its crop
+    corner (colStart, rowStart) rather than full-frame: an image-space
+    decode that wrote no full-frame crop record, i.e. ran before Decode
+    wrote x, y in the full frame."""
+    if not decodeTask.get_parameters().get('crop_in_image_space', False):
+        return False
+    getRecord = getattr(decodeTask, 'get_crop_record', None)
+    record = getRecord(fov) if getRecord is not None else None
+    return record is None or record.get('xy_frame') != 'full_frame'
 
 
 def valid_box_mask(barcodes: pandas.DataFrame,
@@ -368,8 +395,9 @@ def valid_box_mask(barcodes: pandas.DataFrame,
     """True for the detections whose x, y centroid lies in bounds
     (rowStart, rowEnd, colStart, colEnd): colStart <= x <= colEnd and
     rowStart <= y <= rowEnd. With cropInImageSpace, x and y are relative to
-    (colStart, rowStart), the corner of the image the decode cropped, and are
-    shifted back to the full frame first."""
+    (colStart, rowStart), the corner of the image the decode cropped (an
+    image-space decode from before x, y were written full-frame, see
+    decode_xy_is_cropped), and are shifted back to the full frame first."""
     rowStart, rowEnd, colStart, colEnd = (float(b) for b in bounds)
     x = barcodes['x'].to_numpy(np.float64)
     y = barcodes['y'].to_numpy(np.float64)
@@ -529,10 +557,10 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         boxSummary = {}
         if self.parameters['crop_to_valid_box']:
             start = time.time()
-            bounds = decode_valid_box(self.dataSet, decodeTask, fragmentIndex)
-            inside = valid_box_mask(
-                barcodes, bounds,
-                bool(decodeTask.get_parameters()['crop_in_image_space']))
+            legacy = decode_xy_is_cropped(decodeTask, fragmentIndex)
+            bounds = decode_valid_box(self.dataSet, decodeTask, fragmentIndex,
+                                      legacy)
+            inside = valid_box_mask(barcodes, bounds, legacy)
             boxSummary = _outside_box_counts(barcodes, inside,
                                              decodeTask.get_codebook())
             boxSummary['valid_box'] = [int(b) for b in bounds]

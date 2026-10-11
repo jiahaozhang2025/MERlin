@@ -18,6 +18,9 @@ major change was made.
 - `adaptive_crop`: Defaults to excluding each FOV's unaligned warp margins so
   invalid image regions do not contaminate barcode extraction; the margins come
   from the warp's corner displacements, so rotated transforms are covered.
+- `adaptive_crop_channels`: `codebook` (default) takes the adaptive margin from
+  the decode codebook's own data channels only, so each library gets its own
+  crop; `all` uses every warp transformation (the previous behaviour).
 
 ### Registration (`merlin/analysis/warp.py`)
 
@@ -72,8 +75,9 @@ major change was made.
   target holds per molecule; `molecule_features` (`summed`, the default, or
   `brightest`) sets how a molecule's intensity, distance and area are formed.
 - `crop_to_valid_box` (`DeduplicateBarcodes`, off by default): Drops the
-  detections outside the decode task's valid region (`compute_crop_bounds`),
-  which Decode itself applies only with `crop_in_image_space`.
+  detections outside the decode task's recorded per-codebook region
+  (`Decode.get_crop_bounds`), which Decode itself applies only with
+  `crop_in_image_space`.
 - `GenerateMoleculeAdaptiveThreshold`: The adaptive threshold with area bin
   edges taken from the molecules' areas (`area_bin_edges`), as summed areas
   run past the default edges.
@@ -127,10 +131,19 @@ major change was made.
 - `write_unique_id_images`: Writes decoded images with globally unique barcode
   labels.
 - `write_decoded_z`: Selects z planes for decoded-image output.
-- `crop_in_image_space`: Applies edge cropping before decoding and restores the
-  crop offset in output coordinates.
-- `crop_offset`: Supports independent x/y offsets after asymmetric adaptive
-  cropping.
+- `crop_in_image_space`: Crops each FOV to its crop bounds before decoding, so
+  pixels outside are never decoded; barcode x, y are written in the full frame.
+- `crop_width`: One integer for every edge or `[top, bottom, left, right]`;
+  each edge is cropped by max(its `crop_width`, its adaptive margin).
+- `crop_bounds_<fov>.json`: Decode records each FOV's crop (bounds, fixed and
+  adaptive margins, channels); read with `get_crop_record`, `get_crop_bounds`
+  or `get_crop_bounds_table`.
+- `crop_offset`: The crop corner `(colStart, rowStart)`, added to x, y and the
+  global coordinates after the edge filter.
+- Edge filter: Compares x with the image width and y with its height (they were
+  swapped, which dropped barcodes on non-square images and tiles).
+- `use_segmentation_mask`: The mask is cropped with the image in image space
+  (a full-frame mask no longer mismatches the cropped image).
 - `minimum_area`: Now defaults to 2 (was 0), dropping single-pixel barcodes.
 - `resumable_z_decoding: false` now empties the barcode table on rerun instead
   of appending a second copy.
@@ -138,8 +151,8 @@ major change was made.
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
-- `adaptive_crop`: Defaults to the same per-FOV valid warp region as Decode
-  during scale-factor and chromatic estimation.
+- `adaptive_crop`: Defaults to the per-FOV valid warp region (every channel,
+  one `crop_width`) during scale-factor and chromatic estimation.
 - `normalize_scale_factors`: Returns scale factors as mean-one ratios for
   consistency across preprocessing configurations.
 - `cleanup_fragment_results`: Removes fragment-level intermediate arrays after

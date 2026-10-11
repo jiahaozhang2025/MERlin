@@ -24,6 +24,44 @@ except ImportError:
 Utility functions for pixel based decoding.
 """
 
+
+def crop_widths(cropWidth) -> Tuple[int, int, int, int]:
+    """(top, bottom, left, right) fixed crop from a crop width: one integer
+    for every edge, or a list of four, [top, bottom, left, right]."""
+    if isinstance(cropWidth, (list, tuple, np.ndarray)):
+        values = list(cropWidth)
+        if len(values) != 4:
+            raise ValueError(
+                'crop_width must be one integer or four, [top, bottom, left, '
+                'right]; got %r' % (cropWidth,))
+    else:
+        values = [cropWidth] * 4
+    widths = []
+    for value in values:
+        if isinstance(value, (bool, np.bool_)) \
+                or not isinstance(value, (int, float, np.integer,
+                                          np.floating)) \
+                or not np.isfinite(value) or value != int(value) \
+                or value < 0:
+            raise ValueError('crop_width values must be integers >= 0; got %r'
+                             % (cropWidth,))
+        widths.append(int(value))
+    return tuple(widths)
+
+
+def crop_filter_mask(x, y, imageShape, cropWidth) -> np.ndarray:
+    """True for the barcodes whose centroid is at least the crop width from
+    each edge of an image of imageShape (rows, cols): x (a column) in
+    [left, cols - right] and y (a row) in [top, rows - bottom], ends
+    included. cropWidth is one integer or [top, bottom, left, right]."""
+    top, bottom, left, right = crop_widths(cropWidth)
+    rows, cols = imageShape[0], imageShape[1]
+    x = np.asarray(x)
+    y = np.asarray(y)
+    return ((x >= left) & (x <= cols - right)
+            & (y >= top) & (y <= rows - bottom))
+
+
 def normalize(x):
     norm = np.linalg.norm(x)
     if norm > 0:
@@ -494,14 +532,21 @@ class PixelBasedDecoder(object):
                 pixel trace and the assigned barcode for each pixel
             fov: the index of the field of view
             cropWidth: the number of pixels around the edge of each image within
-                which barcodes are excluded from the output list.
+                which barcodes are excluded from the output list: one integer
+                for every edge or [top, bottom, left, right]
+                (crop_filter_mask, on the image's own x, y).
             zIndex: the index of the z position
             globalAligner: the aligner used for converted to local x,y
                 coordinates to global x,y coordinates
             minimumArea: the minimum area of barcodes to identify. Barcodes
                 less than the specified minimum area are ignored.
             outputLabels: output barcode labels and filtered labels
-            
+            crop_offset: (x, y) = (colStart, rowStart), the full-frame
+                position of the image's pixel (0, 0) when the image was
+                cropped before decoding. It is added to x and y (after the
+                cropWidth filter, which works on the image's own frame), so
+                x, y and the global coordinates are full-frame.
+
         Returns:
             a pandas dataframe containing all the barcodes decoded with the
                 specified barcode index
@@ -567,8 +612,17 @@ class PixelBasedDecoder(object):
             barcodeIds = np.zeros(maxLabel + 1, dtype=np.int32)
             barcodeIds[uniqueLabels] = decodedValues[firstIndexes]
 
-            x = (sumCols[validLabels] / validAreasFloat).astype(np.float32)
-            y = (sumRows[validLabels] / validAreasFloat).astype(np.float32)
+            # The crop filter works on the image's own frame; crop_offset
+            # then moves x, y to the full frame (added in float64, so a
+            # cropped image gives the same float32 x, y as the full one).
+            offX, offY = crop_offset
+            xLocal = sumCols[validLabels] / validAreasFloat
+            yLocal = sumRows[validLabels] / validAreasFloat
+            insideCrop = crop_filter_mask(
+                xLocal.astype(np.float32), yLocal.astype(np.float32),
+                decodedImage.shape, cropWidth)
+            x = (xLocal + offX).astype(np.float32)
+            y = (yLocal + offY).astype(np.float32)
             z = np.full(len(validLabels), zIndex, dtype=np.float32)
 
             data = {
@@ -591,13 +645,11 @@ class PixelBasedDecoder(object):
             }
 
             if globalAligner is not None:
-                # crop_offset adds back the image-space crop so global coords
-                # are in the full-FOV frame while local x,y stay cropped. It is
-                # (x, y) = (colStart, rowStart): with an asymmetric per-FOV crop
-                # the two axes differ, so a single scalar would skew every
-                # barcode by the difference.
-                offX, offY = crop_offset
-                centroids = np.stack([z, x + offX, y + offY], axis=1)
+                # x, y already carry crop_offset (x, y) = (colStart,
+                # rowStart): with an asymmetric per-FOV crop the two axes
+                # differ, so a single scalar would skew every barcode by the
+                # difference.
+                centroids = np.stack([z, x, y], axis=1)
                 globalCentroids = globalAligner.fov_coordinate_array_to_global(
                     fov, centroids)
                 data['global_z'] = globalCentroids[:, 0]
@@ -622,6 +674,7 @@ class PixelBasedDecoder(object):
                         traceSums[validLabels] / validAreasFloat).astype(
                             np.float32)
         else:
+            insideCrop = np.zeros(0, dtype=bool)
             data = {
                 'unique_id': np.array([], dtype=np.int32),
                 'barcode_id': np.array([], dtype=np.int32),
@@ -645,10 +698,12 @@ class PixelBasedDecoder(object):
 
         df = pandas.DataFrame(data)
 
-        # Crop filter
-        df = df[(df['x'].between(cropWidth, decodedImage.shape[0] - cropWidth)) &
-                (df['y'].between(cropWidth, decodedImage.shape[1] - cropWidth))]
-        
+        # Crop filter, on the image's own x (a column, against the image's
+        # width) and y (a row, against its height). It used to compare x with
+        # shape[0] and y with shape[1], which drops barcodes on a non-square
+        # image.
+        df = df[insideCrop]
+
         if outputLabels:
             return df, filteredLabels
             

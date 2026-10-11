@@ -31,6 +31,24 @@ reference. The baseline excluded one fixed `crop_width` from every edge of every
 FOV, which is too little where the shift is large (empty pixels get decoded) and
 too much where it is small (valid pixels are thrown away). `adaptive_crop`
 reads each FOV's own transformations and excludes exactly its invalid region.
+Each edge is cropped by the larger of the fixed `crop_width` and that edge's
+invalid margin, not their sum, and `crop_width` can differ per edge.
+
+Only the decode codebook's own bits enter a pixel's call, so only their
+missing data can corrupt it: the margin is taken over that codebook's data
+channels (`adaptive_crop_channels` `codebook`). Rounds that only another
+library or a stain uses can drift further; counting them would cut pixels
+where every bit of this codebook is valid. Two libraries registered with one
+warp task therefore get different crops.
+
+With `crop_in_image_space` the image is cut to that region before decoding,
+so the invalid strip is never decoded. (Without it the whole frame is decoded
+and only `crop_width` is filtered afterwards, so barcodes from the strip are
+kept.) Barcode x, y are written in the full frame (the crop
+corner is added back), the same frame as segmentation and the stage
+positions, and each FOV's crop is saved (`crop_bounds_<fov>.json`) for
+downstream steps that need to know which part of the FOV was decoded. A
+molecule cut by the crop edge keeps only its inside part.
 
 ## Registration
 

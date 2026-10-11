@@ -7,9 +7,11 @@ import tifffile
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from typing import List, Tuple
 
 from merlin.core import dataset
 from merlin.core import analysistask
+from merlin.analysis import warp
 from merlin.util import decoding
 from merlin.util import barcodedb
 from merlin.data.codebook import Codebook
@@ -21,16 +23,65 @@ from merlin.util import imagesample
 DECODED_IMAGE_CHANNELS = ('barcodes', 'magnitude', 'distance', 'unique_id')
 
 
-def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
-    """(rowStart, rowEnd, colStart, colEnd) of the valid region of one FOV.
+# adaptive_crop_channels: whose warp transformations set the adaptive margin.
+# 'codebook' = the data channels of the decode task's own codebook bits,
+# 'all' = every transformation of the warp task (every data channel, also
+# those another codebook or no codebook uses).
+ADAPTIVE_CROP_CHANNELS = ('codebook', 'all')
 
-    Each edge is trimmed by max(crop_width, that edge's invalid margin), NOT by
-    their sum. crop_width exists because the frame edges are unreliable even
-    with zero shift (vignetting, the filter's border, chromatic roll-off); the
-    adaptive margin exists because a warp leaves an actually-invalid strip. A
-    shift smaller than crop_width is already inside the region crop_width
-    discards, so adding them double-counts and throws away good pixels: with
-    crop_width 100 and a 60 px shift the old code cropped 160.
+# Name of the per-fov record Decode writes (crop_bounds_<fov>.json).
+CROP_RECORD_NAME = 'crop_bounds'
+
+
+# (top, bottom, left, right) from crop_width: one integer or four.
+crop_widths = decoding.crop_widths
+
+
+def codebook_data_channels(dataSet, codebook) -> List[int]:
+    """Data channels of a codebook's bits (looked up by readout name), in
+    bit order."""
+    org = dataSet.get_data_organization()
+    return [int(org.get_data_channel_for_bit(b))
+            for b in codebook.get_bit_names()]
+
+
+def warp_transformations(warpTask, fov: int, dataChannels=None) -> list:
+    """The warp task's transformations of fov: all of them (dataChannels
+    None), or only those of the given data channels.
+
+    A FiducialPolynomialWarp3D has one transformation per (data channel,
+    plane) row of its transformation table, and get_transformation(fov)
+    lists them in the table's row order; the other warp tasks have one per
+    data channel, indexed by the channel.
+    """
+    transforms = list(warpTask.get_transformation(fov))
+    if dataChannels is None:
+        return transforms
+    wanted = sorted({int(c) for c in dataChannels})
+    if isinstance(warpTask, warp.FiducialPolynomialWarp3D):
+        table = warpTask.get_transformation_table(fov)
+        if len(table) != len(transforms):
+            raise ValueError(
+                'fov %d: %d transformations for %d transformation-table rows'
+                % (fov, len(transforms), len(table)))
+        tableChannels = table['dataChannel'].to_numpy(int)
+        missing = sorted(set(wanted) - set(tableChannels.tolist()))
+        keep = np.isin(tableChannels, wanted)
+        selected = [t for t, k in zip(transforms, keep) if k]
+    else:
+        missing = [c for c in wanted if c < 0 or c >= len(transforms)]
+        selected = [transforms[c] for c in wanted if c not in missing]
+    if missing:
+        raise ValueError('fov %d: the warp task has no transformation for '
+                         'data channels %s' % (fov, missing))
+    return selected
+
+
+def adaptive_margins(dataSet, warpTaskName, fov: int, dataChannels=None
+                     ) -> Tuple[int, int, int, int]:
+    """(top, bottom, left, right) strips of fov that the warp task's
+    transformations (those of dataChannels, or all with None) leave without
+    data on at least one of them.
 
     transform.warp maps output->input, so output (r, c) samples input
     (r+ty, c+tx): tx<0 invalidates |tx| columns on the LEFT, tx>0 that many on
@@ -42,22 +93,71 @@ def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive):
     (tx, ty) and this is exactly the translation-only margin.
     """
     h, w = dataSet.get_image_dimensions()
-    top = bottom = left = right = 0
-    if adaptive:
-        warpTask = dataSet.load_analysis_task(warpTaskName)
-        tforms = warpTask.get_transformation(fov)
-        corners = np.array([[0, 0, 1], [w - 1, 0, 1],
-                            [0, h - 1, 1], [w - 1, h - 1, 1]], dtype=float)
-        matrices = np.asarray([t.params for t in tforms], dtype=float)
-        displacement = np.einsum('nij,kj->nki', matrices - np.eye(3), corners)
-        dxs, dys = displacement[:, :, 0], displacement[:, :, 1]
-        left = int(np.ceil(max(0.0, float((-dxs).max()))))
-        right = int(np.ceil(max(0.0, float(dxs.max()))))
-        top = int(np.ceil(max(0.0, float((-dys).max()))))
-        bottom = int(np.ceil(max(0.0, float(dys.max()))))
-    top, bottom = max(top, cropWidth), max(bottom, cropWidth)
-    left, right = max(left, cropWidth), max(right, cropWidth)
+    warpTask = dataSet.load_analysis_task(warpTaskName)
+    tforms = warp_transformations(warpTask, fov, dataChannels)
+    if not tforms:
+        return (0, 0, 0, 0)
+    corners = np.array([[0, 0, 1], [w - 1, 0, 1],
+                        [0, h - 1, 1], [w - 1, h - 1, 1]], dtype=float)
+    matrices = np.asarray([t.params for t in tforms], dtype=float)
+    displacement = np.einsum('nij,kj->nki', matrices - np.eye(3), corners)
+    dxs, dys = displacement[:, :, 0], displacement[:, :, 1]
+    left = int(np.ceil(max(0.0, float((-dxs).max()))))
+    right = int(np.ceil(max(0.0, float(dxs.max()))))
+    top = int(np.ceil(max(0.0, float((-dys).max()))))
+    bottom = int(np.ceil(max(0.0, float(dys.max()))))
+    return (top, bottom, left, right)
+
+
+def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive,
+                        dataChannels=None):
+    """(rowStart, rowEnd, colStart, colEnd) of the valid region of one FOV,
+    full-frame pixels, as slice bounds (rows rowStart .. rowEnd - 1).
+
+    Each edge is trimmed by max(that edge's crop_width, that edge's invalid
+    margin), NOT by their sum. crop_width exists because the frame edges are
+    unreliable even with zero shift (vignetting, the filter's border,
+    chromatic roll-off); the adaptive margin (adaptive_margins) exists because
+    a warp leaves an actually-invalid strip. A shift smaller than crop_width
+    is already inside the region crop_width discards, so adding them
+    double-counts and throws away good pixels: with crop_width 100 and a 60 px
+    shift the old code cropped 160.
+
+    cropWidth is one integer for every edge or [top, bottom, left, right].
+    dataChannels limits the adaptive margin to the transformations of those
+    data channels (a decode task passes its codebook's channels); None takes
+    every transformation of the warp task.
+    """
+    h, w = dataSet.get_image_dimensions()
+    margins = (adaptive_margins(dataSet, warpTaskName, fov, dataChannels)
+               if adaptive else (0, 0, 0, 0))
+    top, bottom, left, right = (max(fixed, margin) for fixed, margin
+                                in zip(crop_widths(cropWidth), margins))
     return (top, h - bottom, left, w - right)
+
+
+def task_crop_bounds(task, fov: int) -> Tuple[int, int, int, int]:
+    """compute_crop_bounds with a decode task's own settings: the warp task
+    of its preprocess_task, its crop_width and adaptive_crop, and the
+    channels adaptive_crop_channels names (a task without that parameter,
+    i.e. one that is not a Decode, takes every channel)."""
+    parameters = task.parameters
+    warpTaskName = task.dataSet.load_analysis_task(
+        parameters['preprocess_task']).parameters['warp_task']
+    return compute_crop_bounds(task.dataSet, warpTaskName, fov,
+                               parameters['crop_width'],
+                               parameters['adaptive_crop'],
+                               task_crop_channels(task))
+
+
+def task_crop_channels(task):
+    """The data channels whose transformations set a decode task's adaptive
+    margin: its codebook's (adaptive_crop_channels 'codebook') or None for
+    all of them ('all', or no such parameter) and without adaptive_crop."""
+    if not task.parameters.get('adaptive_crop', False) \
+            or task.parameters.get('adaptive_crop_channels', 'all') == 'all':
+        return None
+    return codebook_data_channels(task.dataSet, task.get_codebook())
 
 
 class BarcodeSavingParallelAnalysisTask(analysistask.ParallelAnalysisTask):
@@ -125,20 +225,23 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 'lowpass_sigma is no longer a Decode parameter -- set it on the '
                 'preprocess task instead, where Optimize sees it too.')
 
+        # One integer for every edge, or [top, bottom, left, right].
         if 'crop_width' not in self.parameters:
             self.parameters['crop_width'] = 100
+        crop_widths(self.parameters['crop_width'])     # refuse a bad value
         if 'crop_in_image_space' not in self.parameters:
-            # When True, crop_width is applied in IMAGE space (the image is
-            # cropped by crop_width on every edge BEFORE decoding) and ALL
-            # decoded barcodes are kept (no barcode-space edge filter). Local
-            # x,y stay in the cropped frame; crop_width is added back only when
-            # computing global coordinates.
-            # Default is image-space: it places the FOV corner at raw pixel
-            # (0,0) (crop_offset = +crop_width), matching how segmentation and
-            # stage positions are defined. The barcode-space path (False)
-            # assumes stage positions are calibrated to pixel (crop_width,
-            # crop_width) and subtracts crop_width, which shifts barcodes by
-            # -crop_width*mpp relative to the segmentation -> mispartitioning.
+            # When True, the image is cropped to the fov's crop bounds
+            # (compute_crop_bounds: crop_width per edge, widened by the
+            # adaptive margin) BEFORE decoding, so pixels outside are never
+            # decoded, and every decoded barcode is kept (no barcode-space
+            # edge filter). x, y are written in the full frame: the crop
+            # corner (colStart, rowStart) is added back, so x, y and global
+            # x, y place the FOV corner at raw pixel (0,0), as segmentation
+            # and stage positions do. The decoded images stay in the cropped
+            # frame (crop_bounds_<fov>.json says where). When False (barcode
+            # space), the whole frame is decoded and barcodes within
+            # crop_width of the frame edge are dropped; adaptive_crop is not
+            # applied to the barcodes.
             self.parameters['crop_in_image_space'] = True
         if 'write_decoded_images' not in self.parameters:
             self.parameters['write_decoded_images'] = True
@@ -180,6 +283,16 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # that away from every other one; here each FOV pays only what it owes.
         if 'adaptive_crop' not in self.parameters:
             self.parameters['adaptive_crop'] = True
+        # Whose transformations set the adaptive margin: 'codebook' (this
+        # task's own bits' data channels; a channel another library or a
+        # stain uses cannot invalidate this codebook's pixels) or 'all'
+        # (every transformation of the warp task, the behaviour before).
+        if 'adaptive_crop_channels' not in self.parameters:
+            self.parameters['adaptive_crop_channels'] = 'codebook'
+        if self.parameters['adaptive_crop_channels'] \
+                not in ADAPTIVE_CROP_CHANNELS:
+            raise ValueError('adaptive_crop_channels must be one of %s'
+                             % (ADAPTIVE_CROP_CHANNELS,))
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
@@ -298,12 +411,102 @@ class Decode(BarcodeSavingParallelAnalysisTask):
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
 
-    def _crop_bounds(self, fov: int):
-        warpTaskName = self.dataSet.load_analysis_task(
-            self.parameters['preprocess_task']).parameters['warp_task']
-        return compute_crop_bounds(self.dataSet, warpTaskName, fov,
-                                   self.cropWidth,
-                                   self.parameters['adaptive_crop'])
+    def _crop_bounds(self, fov: int) -> Tuple[int, int, int, int]:
+        """(rowStart, rowEnd, colStart, colEnd) of fov under this task's
+        settings (task_crop_bounds), computed once per fov: every plane of a
+        fov is cut to the same region."""
+        cache = getattr(self, '_cropBoundsCache', None)
+        if cache is None:
+            cache = self._cropBoundsCache = {}
+        if fov not in cache:
+            cache[fov] = tuple(int(b) for b in task_crop_bounds(self, fov))
+        return cache[fov]
+
+    def _crop_record(self, fov: int) -> dict:
+        """What crop_bounds_<fov>.json holds; see get_crop_record."""
+        h, w = self.dataSet.get_image_dimensions()
+        top, bottom, left, right = crop_widths(self.parameters['crop_width'])
+        channels = task_crop_channels(self)
+        margins = None
+        if self.parameters['adaptive_crop']:
+            warpTaskName = self.dataSet.load_analysis_task(
+                self.parameters['preprocess_task']).parameters['warp_task']
+            margins = [int(m) for m in adaptive_margins(
+                self.dataSet, warpTaskName, fov, channels)]
+        bounds = [int(b) for b in self._crop_bounds(fov)]
+        imageSpace = bool(self.parameters['crop_in_image_space'])
+        return {
+            'fov': int(fov),
+            'image_shape': [int(h), int(w)],
+            'crop_in_image_space': imageSpace,
+            'crop_width': [top, bottom, left, right],
+            'adaptive_crop': bool(self.parameters['adaptive_crop']),
+            'adaptive_crop_channels':
+                self.parameters['adaptive_crop_channels'],
+            'data_channels': None if channels is None
+            else [int(c) for c in channels],
+            'adaptive_margin': margins,
+            'crop_bounds': bounds,
+            'barcode_filter': None if imageSpace
+            else [top, h - bottom, left, w - right],
+            'xy_frame': 'full_frame'}
+
+    def get_crop_record(self, fov: int):
+        """The crop this task's run of fov used, or None if the fov ran
+        before the record existed (or has not run).
+
+        crop_bounds [rowStart, rowEnd, colStart, colEnd]: full-frame slice
+        bounds (rows rowStart .. rowEnd - 1) from compute_crop_bounds, each
+        edge max(crop_width [top, bottom, left, right], adaptive_margin
+        [top, bottom, left, right]; null without adaptive_crop), the margin
+        taken over the transformations of data_channels (null = all). With
+        crop_in_image_space only these pixels are decoded; without it the
+        whole frame is, barcode_filter [top, rowMax, left, colMax] keeps the
+        barcodes with top <= y <= rowMax and left <= x <= colMax (crop_width
+        only), and crop_bounds is the valid region for downstream use
+        (DeduplicateBarcodes' crop_to_valid_box). x, y are full-frame either
+        way (xy_frame).
+        """
+        try:
+            return self.dataSet.load_json_analysis_result(
+                CROP_RECORD_NAME, self, resultIndex=fov)
+        except FileNotFoundError:
+            return None
+
+    def get_crop_bounds(self, fov: int) -> Tuple[int, int, int, int]:
+        """(rowStart, rowEnd, colStart, colEnd) of fov: the recorded bounds
+        of its run, else those of the current settings."""
+        record = self.get_crop_record(fov)
+        if record is not None:
+            return tuple(int(b) for b in record['crop_bounds'])
+        return self._crop_bounds(fov)
+
+    def get_crop_bounds_table(self, fovs=None) -> pandas.DataFrame:
+        """One row per fov with a crop record: fov, row_start, row_end,
+        col_start, col_end (crop_bounds), the fixed crop_* and adaptive
+        margin_* per edge, crop_in_image_space and n_data_channels."""
+        if fovs is None:
+            fovs = self.dataSet.get_fovs()
+        rows = []
+        for fov in fovs:
+            record = self.get_crop_record(fov)
+            if record is None:
+                continue
+            row = dict(zip(('row_start', 'row_end', 'col_start', 'col_end'),
+                           record['crop_bounds']))
+            row = dict(fov=record['fov'], **row)
+            for edge, fixed in zip(('top', 'bottom', 'left', 'right'),
+                                   record['crop_width']):
+                row['crop_' + edge] = fixed
+            margins = record['adaptive_margin'] or [None] * 4
+            for edge, margin in zip(('top', 'bottom', 'left', 'right'),
+                                    margins):
+                row['margin_' + edge] = margin
+            row['crop_in_image_space'] = record['crop_in_image_space']
+            row['n_data_channels'] = (None if record['data_channels'] is None
+                                      else len(record['data_channels']))
+            rows.append(row)
+        return pandas.DataFrame(rows)
 
     def get_estimated_memory(self):
         return 2048
@@ -354,9 +557,19 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         zPositionCount = len(zPositions)
         bitCount = codebook.get_bit_count()
         imageShape = self.dataSet.get_image_dimensions()
+        # The crop of this fov, computed once, before any plane runs, and
+        # recorded for downstream tasks (get_crop_record).
+        self.dataSet.save_json_analysis_result(
+            self._crop_record(fragmentIndex), CROP_RECORD_NAME, self,
+            resultIndex=fragmentIndex)
         # image-space cropping: decoded images (and zarr) follow the cropped size
         if self.parameters['crop_in_image_space']:
             r0, r1, c0, c1 = self._crop_bounds(fragmentIndex)
+            if r1 <= r0 or c1 <= c0:
+                raise ValueError(
+                    'fov %d: nothing left to decode, crop bounds (rowStart, '
+                    'rowEnd, colStart, colEnd) = %s'
+                    % (fragmentIndex, (r0, r1, c0, c1)))
             imageShape = (r1 - r0, c1 - c0)
         
         # get decoded image path for a zarr file
@@ -615,7 +828,10 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         decodeMask = None
         if self.parameters['use_segmentation_mask']:
             decodeMask = self._get_segmentation_mask(fov, zIndex)
-        
+            # the mask is full-frame; cut it like the image
+            if self.parameters['crop_in_image_space']:
+                decodeMask = decodeMask[r0:r1, c0:c1]
+
         accumulatePixelTraces = self.parameters['extract_intensity_traces']
         onTileDone = None
         dfs = []
@@ -730,19 +946,20 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 
                 # Same rules as _extract_and_save_barcodes. Image space: di is
                 # already cropped to _crop_bounds, so every barcode is kept and
-                # (colStart, rowStart) -- the r0, c0 that cropped imageSet above,
-                # not cropWidth -- is added back for the global coordinates.
-                # Barcode space: x,y are full-frame, the cropWidth edge is
-                # filtered here and no offset is applied. FOV corner = raw
+                # (colStart, rowStart) -- the c0, r0 that cropped imageSet
+                # above, not cropWidth -- is added to x, y, which become
+                # full-frame. Barcode space: x, y are full-frame already and
+                # the crop_width edges are filtered here. FOV corner = raw
                 # pixel (0,0) either way, matching segmentation and positions.csv.
                 if self.parameters['crop_in_image_space']:
-                    cropOffset = (c0, r0)
+                    df['x'] = (df['x'].to_numpy(np.float64)
+                               + c0).astype(np.float32)
+                    df['y'] = (df['y'].to_numpy(np.float64)
+                               + r0).astype(np.float32)
                 else:
-                    cw = self.cropWidth
-                    if cw > 0:
-                         df = df[(df['x'].between(cw, di.shape[1] - cw)) &
-                                 (df['y'].between(cw, di.shape[0] - cw))]
-                    cropOffset = (0, 0)
+                    df = df[decoding.crop_filter_mask(
+                        df['x'].to_numpy(), df['y'].to_numpy(), di.shape,
+                        self.cropWidth)]
 
                 # Apply global alignment
                 globalTask = self.dataSet.load_analysis_task(self.parameters['global_align_task'])
@@ -750,8 +967,8 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 if len(df) > 0:
                      centroids = np.zeros([len(df), 3], dtype=np.float32)
                      centroids[:, 0] = df['z'].values
-                     centroids[:, 1] = df['x'].values + cropOffset[0] # col
-                     centroids[:, 2] = df['y'].values + cropOffset[1] # row
+                     centroids[:, 1] = df['x'].values # col
+                     centroids[:, 2] = df['y'].values # row
 
                      g = globalTask.fov_coordinate_array_to_global(fov, centroids)
                      df['global_z'] = g[:, 0]
@@ -831,14 +1048,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         if self.parameters['crop_in_image_space']:
             # keep all barcodes; the image is already cropped. x is a column and
             # y is a row, so the offsets that put them back in the full frame are
-            # colStart and rowStart respectively -- not one shared value.
+            # colStart and rowStart respectively -- not one shared value. They
+            # are added to x, y themselves (full-frame) and so to global x, y.
             r0, _, c0, _ = self._crop_bounds(fov)
             effCropWidth, cropOffset = 0, (c0, r0)
         else:
             # Barcode-space: image is NOT cropped; x,y are full-frame and edge
-            # barcodes are removed via effCropWidth. FOV corner = raw pixel (0,0)
-            # (same convention as segmentation and positions.csv), so no offset
-            # is applied to global coordinates.
+            # barcodes are removed via effCropWidth (per edge). FOV corner =
+            # raw pixel (0,0) (same convention as segmentation and
+            # positions.csv), so no offset is applied.
             effCropWidth, cropOffset = self.cropWidth, (0, 0)
         barcodeOutput = decoder.extract_barcodes_with_index(
             decodedImage, pixelMagnitudes, pixelTraces, distances, fov,
