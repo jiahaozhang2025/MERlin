@@ -51,6 +51,14 @@ major change was made.
 
 - `fft_highpass_sigma`: Applies FFT-space high-pass filtering to remove broad
   background artifacts before decoding.
+- `HotPixelMap` (`merlin/analysis/hotpixel.py`): New task that finds the
+  camera's hot pixels from raw frames sampled across FOVs and planes (a pixel
+  above its 5 x 5 median in the median frame of at least two channels of one
+  camera).
+- `hot_pixel_task` (`DeconvolutionPreprocess`, off by default): Replaces those
+  pixels in every raw frame by the median of their non-hot 3 x 3 neighbours,
+  in camera space before the depth blend and the warp (`get_aligned_image`'s
+  new `hotPixels` argument); the warp task is unchanged.
 
 ### Barcode filtering (`merlin/analysis/filterbarcodes.py`)
 
