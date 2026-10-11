@@ -728,29 +728,30 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             if len(dfs) > 0:
                 df = pandas.concat(dfs, ignore_index=True)
                 
-                # Apply cropWidth filter on the full image coordinates
-                cw = self.cropWidth
-                if cw > 0:
-                     df = df[(df['x'].between(cw, di.shape[1] - cw)) &
-                             (df['y'].between(cw, di.shape[0] - cw))]
-                
+                # Same rules as _extract_and_save_barcodes. Image space: di is
+                # already cropped to _crop_bounds, so every barcode is kept and
+                # (colStart, rowStart) -- the r0, c0 that cropped imageSet above,
+                # not cropWidth -- is added back for the global coordinates.
+                # Barcode space: x,y are full-frame, the cropWidth edge is
+                # filtered here and no offset is applied. FOV corner = raw
+                # pixel (0,0) either way, matching segmentation and positions.csv.
+                if self.parameters['crop_in_image_space']:
+                    cropOffset = (c0, r0)
+                else:
+                    cw = self.cropWidth
+                    if cw > 0:
+                         df = df[(df['x'].between(cw, di.shape[1] - cw)) &
+                                 (df['y'].between(cw, di.shape[0] - cw))]
+                    cropOffset = (0, 0)
+
                 # Apply global alignment
                 globalTask = self.dataSet.load_analysis_task(self.parameters['global_align_task'])
                 # Calculate global coordinates
                 if len(df) > 0:
-                     # FOV corner = raw pixel (0,0), matching segmentation and
-                     # positions.csv. In image-space mode the image was trimmed by
-                     # cropWidth before decoding, so cropWidth is added back; in
-                     # barcode-space mode x,y are already full-frame, so no offset.
-                     # Matches the equivalent cropOffset logic in _extract_and_save_barcodes.
-                     if self.parameters['crop_in_image_space'] and cw > 0:
-                         cropOffset = cw
-                     else:
-                         cropOffset = 0
                      centroids = np.zeros([len(df), 3], dtype=np.float32)
                      centroids[:, 0] = df['z'].values
-                     centroids[:, 1] = df['x'].values + cropOffset # col
-                     centroids[:, 2] = df['y'].values + cropOffset # row
+                     centroids[:, 1] = df['x'].values + cropOffset[0] # col
+                     centroids[:, 2] = df['y'].values + cropOffset[1] # row
 
                      g = globalTask.fov_coordinate_array_to_global(fov, centroids)
                      df['global_z'] = g[:, 0]
