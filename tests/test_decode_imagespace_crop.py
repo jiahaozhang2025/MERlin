@@ -1,7 +1,9 @@
 """Decode's per-codebook crop: crop_width per edge, the adaptive margin from
 the codebook's own data channels, image-space decoding with full-frame x, y,
 the per-fov crop record, the extractor's crop filter on non-square images,
-and DeduplicateBarcodes' crop_to_valid_box on the same bounds.
+DeduplicateBarcodes' crop_to_valid_box on the same bounds, the image-space
+adaptive_edge_margin (EdgeMarginTests; the other tests set it to 0) and the
+defaults (crop_width 50, adaptive_edge_margin 2).
 
 Synthetic data set: a non-square 72 x 104 frame, 8 data channels R0..R7.
 Library A decodes R0-R3, library B R4-R7, each with the six 2-of-4 codewords
@@ -193,11 +195,13 @@ class _LightDataSet:
 
 
 def light_decode(library, imageSpace, tilingFactor=None, fov=0, **extra):
+    # adaptive_edge_margin 0 unless given: these tests check the crop
+    # itself; EdgeMarginTests checks the margin on the same scene
     parameters = {'preprocess_task': 'Pre' + library, 'optimize_task': 'Opt',
                   'global_align_task': 'GA', 'crop_width': CROP,
                   'crop_in_image_space': imageSpace,
                   'tiling_factor': tilingFactor, 'write_decoded_fovs': [],
-                  'write_decoded_z': []}
+                  'write_decoded_z': [], 'adaptive_edge_margin': 0}
     parameters.update(extra)
     return decode.Decode(_LightDataSet(), parameters, 'Decode' + library)
 
@@ -596,7 +600,8 @@ def full_decode(ds, name, library, imageSpace, **extra):
     parameters = {'preprocess_task': 'Pre' + library, 'optimize_task': 'Opt',
                   'global_align_task': 'GA', 'crop_width': CROP,
                   'crop_in_image_space': imageSpace,
-                  'write_decoded_fovs': [0], 'write_decoded_z': [0]}
+                  'write_decoded_fovs': [0], 'write_decoded_z': [0],
+                  'adaptive_edge_margin': 0}
     parameters.update(extra)
     task = decode.Decode(ds, parameters, name)
     task.save()
@@ -754,12 +759,33 @@ class SavedParameterTests(unittest.TestCase):
             loaded = ds.load_analysis_task('OldDecode')
             self.assertEqual(loaded.parameters['adaptive_crop_channels'],
                              'codebook')
+            self.assertEqual(loaded.parameters['adaptive_edge_margin'], 2)
             self.assertEqual(loaded.parameters['crop_width'], 100)
             for key, value in self.OLD.items():
                 self.assertEqual(loaded.parameters[key], value, key)
             # generate: rebuild from the analysis json and save; raises
             # AnalysisAlreadyExistsException if the parameters differ
             decode.Decode(ds, dict(self.OLD), 'OldDecode').save()
+
+    def test_saved_crop_width_is_kept_and_an_unpinned_json_drifts(self):
+        # The default moved from 100 to 50. A saved task keeps its 100 on
+        # load; generate from an analysis json that omits crop_width builds
+        # the task with 50 and refuses, so such a json must pin 100.
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = make_dataset(root)
+            self._write_old(ds, 'OldDecode', self.OLD)
+            self.assertEqual(ds.load_analysis_task('OldDecode')
+                             .parameters['crop_width'], 100)
+            unpinned = {k: v for k, v in self.OLD.items()
+                        if k != 'crop_width'}
+            self.assertEqual(decode.Decode(ds, dict(unpinned), 'Other')
+                             .parameters['crop_width'], 50)
+            with self.assertRaises(
+                    analysistask.AnalysisAlreadyExistsException):
+                decode.Decode(ds, dict(unpinned), 'OldDecode').save()
+            decode.Decode(ds, dict(unpinned, crop_width=100),
+                          'OldDecode').save()
 
     def test_per_edge_crop_width_round_trips(self):
         with tempfile.TemporaryDirectory() as root, \
@@ -773,6 +799,194 @@ class SavedParameterTests(unittest.TestCase):
             self.assertEqual(loaded.parameters['crop_width'], [5, 3, 4, 6])
             self.assertEqual(loaded._crop_bounds(0), BOUNDS[('all', 0)])
             decode.Decode(ds, dict(parameters), 'NewDecode').save()
+
+
+
+class EdgeMarginTests(unittest.TestCase):
+    """adaptive_edge_margin: image space drops the barcodes within that many
+    px of an edge whose bound the adaptive margin set.
+
+    Library A, fov 0: region rows 5:65, cols 9:98; the bottom (margin 7 >
+    crop 3) and left (9 > 4) edges are set by the margin, the top (0 < 5)
+    and right (0 < 6) by the fixed crop. With 2 px the kept centroids are
+    rows 5..62, cols 11..97: the 'in' spot at row 63 (1 px from the last
+    row, 64) goes; the spot at col 11 (2 px from col 9) and the spots the
+    fixed top and right edges cut stay. Library B: rows 12:69, cols 4:89,
+    top (12 > 5) and right (15 > 6) set by the margin; kept rows 14..68,
+    cols 4..86: the 'in' spot at col 87 and the spot the top edge cuts
+    (rows 12-13, y 12.5) go, the one at row 14 stays.
+    """
+
+    def test_edges_the_margin_sets(self):
+        self.assertEqual(decode.margin_set_edges(CROP, MARGINS[('A', 0)]),
+                         (False, True, True, False))
+        self.assertEqual(decode.margin_set_edges(CROP, MARGINS[('B', 0)]),
+                         (True, False, False, True))
+        self.assertEqual(decode.margin_set_edges(CROP, MARGINS[('A', 1)]),
+                         (False, True, True, True))
+        # a tie counts (the missing data reaches the edge), a zero margin
+        # never does, no adaptive_crop sets no edge
+        self.assertEqual(decode.margin_set_edges(5, (5, 4, 0, 6)),
+                         (True, False, False, True))
+        self.assertEqual(decode.margin_set_edges(0, (0, 0, 1, 0)),
+                         (False, False, True, False))
+        self.assertEqual(decode.margin_set_edges(CROP, None), (False,) * 4)
+
+    def test_bounds_and_mask(self):
+        bounds = BOUNDS[('A', 0)]
+        edges = (False, True, True, False)
+        self.assertEqual(decode.edge_margin_bounds(bounds, edges, 2),
+                         (5, 62, 11, 97))
+        self.assertEqual(decode.edge_margin_bounds(bounds, edges, 0),
+                         (5, 64, 9, 97))
+        self.assertEqual(decode.edge_margin_bounds(bounds, (True,) * 4, 3),
+                         (8, 61, 12, 94))
+        x = np.array([11.0, 10.99, 50.0, 50.0, 97.0, 97.01])
+        y = np.array([30.0, 30.0, 62.0, 62.01, 5.0, 5.0])
+        np.testing.assert_array_equal(
+            decode.edge_margin_mask(x, y, bounds, edges, 2),
+            [True, False, True, False, True, False])
+
+    def test_refused_values(self):
+        for bad in (-1, 1.5, True, '2', None, float('nan')):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                light_decode('A', True, adaptive_edge_margin=bad)
+        self.assertEqual(light_decode('A', True, adaptive_edge_margin=3.0)
+                         .parameters['adaptive_edge_margin'], 3.0)
+
+    @staticmethod
+    def spots(df):
+        return sorted(zip(df['barcode_id'].astype(int),
+                          df['x'].astype(float), df['y'].astype(float)))
+
+    def test_image_space_drops_near_margin_edges_only(self):
+        dropped = {'A': [(2, 96.0, 63.0)],
+                   'B': [(2, 87.0, 67.0), (3, 60.0, 12.5)]}
+        for library in ('A', 'B'):
+            for tiling in (None, 2):
+                every = decode_plane(library, True, tiling)
+                kept = decode_plane(library, True, tiling,
+                                    adaptive_edge_margin=2)
+                gone = sorted(set(self.spots(every)) - set(self.spots(kept)))
+                self.assertEqual(gone, dropped[library], (library, tiling))
+                self.assertEqual(len(kept), len(every) - len(gone))
+                rowMin, rowMax, colMin, colMax = decode.edge_margin_bounds(
+                    BOUNDS[(library, 0)], decode.margin_set_edges(
+                        CROP, MARGINS[(library, 0)]), 2)
+                self.assertTrue(kept['x'].between(colMin, colMax).all())
+                self.assertTrue(kept['y'].between(rowMin, rowMax).all())
+                # the kept rows are unchanged, global coordinates included
+                np.testing.assert_allclose(
+                    ordered(kept).to_numpy(),
+                    ordered(every[every.set_index(['barcode_id', 'x', 'y'])
+                                  .index.isin(kept.set_index(
+                                      ['barcode_id', 'x', 'y']).index)])
+                    .to_numpy())
+
+    def test_margin_width(self):
+        # A's row-63 spot is 1 px from the last decoded row: 1 keeps it,
+        # 2 drops it; B's row-14 spot is 2 px from the first: 3 drops it
+        a1 = self.spots(decode_plane('A', True, adaptive_edge_margin=1))
+        self.assertIn((2, 96.0, 63.0), a1)
+        b3 = self.spots(decode_plane('B', True, adaptive_edge_margin=3))
+        self.assertNotIn((1, 6.0, 14.0), b3)
+        b2 = self.spots(decode_plane('B', True, adaptive_edge_margin=2))
+        self.assertIn((1, 6.0, 14.0), b2)
+
+    def test_not_applied_on_fixed_edges_or_without_adaptive_crop(self):
+        # all four edges fixed: crop 20 > every margin of library A
+        fixed = dict(crop_width=[20, 20, 20, 20], adaptive_edge_margin=5)
+        self.assertEqual(light_decode('A', True, **fixed)
+                         ._edge_margin_edges(0), (False,) * 4)
+        self.assertEqual(
+            self.spots(decode_plane('A', True, **fixed)),
+            self.spots(decode_plane('A', True, crop_width=[20] * 4)))
+        task = light_decode('A', True, adaptive_crop=False,
+                            adaptive_edge_margin=5)
+        self.assertEqual(task._edge_margin_edges(0), (False,) * 4)
+
+    def test_barcode_space_unchanged(self):
+        for library in ('A', 'B'):
+            plain = ordered(decode_plane(library, False))
+            margin = ordered(decode_plane(library, False,
+                                          adaptive_edge_margin=2))
+            np.testing.assert_array_equal(margin.to_numpy(),
+                                          plain.to_numpy())
+            self.assertEqual(light_decode(library, False,
+                                          adaptive_edge_margin=2)
+                             ._edge_margin_edges(0), (False,) * 4)
+
+    def test_record_and_table(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = make_dataset(root)
+            task = full_decode(ds, 'DecodeA', 'A', True,
+                               adaptive_edge_margin=2)
+            task.run(0)
+            record = task.get_crop_record(0)
+            self.assertEqual(record['adaptive_edge_margin'], 2)
+            self.assertEqual(record['edge_margin_edges'],
+                             [False, True, True, False])
+            self.assertEqual(record['barcode_bounds'], [5, 62, 11, 97])
+            self.assertEqual(record['crop_bounds'], list(BOUNDS[('A', 0)]))
+            self.assertIsNone(record['barcode_filter'])
+            barcodes = task.get_barcode_database().get_barcodes(0)
+            self.assertNotIn(63.0, barcodes['y'].tolist())
+            self.assertTrue(barcodes['y'].between(5, 62).all())
+            self.assertTrue(barcodes['x'].between(11, 97).all())
+            table = task.get_crop_bounds_table([0])
+            self.assertEqual(
+                table.loc[0, ['edge_margin_top', 'edge_margin_bottom',
+                              'edge_margin_left', 'edge_margin_right']]
+                .tolist(), [False, True, True, False])
+            self.assertEqual(
+                table.loc[0, ['barcode_row_min', 'barcode_row_max',
+                              'barcode_col_min', 'barcode_col_max']]
+                .tolist(), [5, 62, 11, 97])
+            self.assertEqual(table.loc[0, 'adaptive_edge_margin'], 2)
+
+            space = full_decode(ds, 'DecodeB', 'B', False,
+                                adaptive_edge_margin=2)
+            space.run(0)
+            record = space.get_crop_record(0)
+            self.assertEqual(record['edge_margin_edges'], [False] * 4)
+            self.assertEqual(record['barcode_bounds'],
+                             record['barcode_filter'])
+            self.assertEqual(record['barcode_bounds'], [5, H - 3, 4, W - 6])
+
+    def test_table_reads_a_record_from_before_the_margin(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = make_dataset(root)
+            task = full_decode(ds, 'DecodeA', 'A', True)
+            record = task._crop_record(0)
+            for key in ('adaptive_edge_margin', 'edge_margin_edges',
+                        'barcode_bounds'):
+                record.pop(key)
+            ds.save_json_analysis_result(record, decode.CROP_RECORD_NAME,
+                                         task, resultIndex=0)
+            table = task.get_crop_bounds_table([0])
+            self.assertEqual(table.loc[0, 'col_start'], BOUNDS[('A', 0)][2])
+            self.assertIsNone(table.loc[0, 'adaptive_edge_margin'])
+            self.assertIsNone(table.loc[0, 'barcode_row_max'])
+
+
+class DefaultTests(unittest.TestCase):
+
+    def test_crop_width_50_and_edge_margin_2(self):
+        task = decode.Decode(_LightDataSet(), {
+            'preprocess_task': 'PreA', 'optimize_task': 'Opt',
+            'global_align_task': 'GA', 'write_decoded_fovs': [],
+            'write_decoded_z': []}, 'DecodeDefault')
+        self.assertEqual(task.parameters['crop_width'], 50)
+        self.assertEqual(task.parameters['adaptive_edge_margin'], 2)
+        self.assertTrue(task.parameters['crop_in_image_space'])
+        self.assertTrue(task.parameters['adaptive_crop'])
+        # 50 floors every edge; library A's margins are all below it (the
+        # synthetic frame is too small to decode at 50, only the bounds are
+        # checked)
+        self.assertEqual(task._crop_bounds(0), (50, H - 50, 50, W - 50))
+        self.assertEqual(task._edge_margin_edges(0), (False,) * 4)
 
 
 if __name__ == '__main__':

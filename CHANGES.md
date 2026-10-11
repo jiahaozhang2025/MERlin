@@ -21,6 +21,10 @@ major change was made.
 - `adaptive_crop_channels`: `codebook` (default) takes the adaptive margin from
   the decode codebook's own data channels only, so each library gets its own
   crop; `all` uses every warp transformation (the previous behaviour).
+- `adaptive_edge_margin` (default 2 px, image space): Drops the barcodes within
+  that distance of an edge whose crop the adaptive margin set (missing data
+  just outside), where the cut leaves molecule fragments; edges set by the
+  fixed `crop_width` are left alone.
 
 ### Registration (`merlin/analysis/warp.py`)
 
@@ -142,10 +146,13 @@ major change was made.
 - `crop_in_image_space`: Crops each FOV to its crop bounds before decoding, so
   pixels outside are never decoded; barcode x, y are written in the full frame.
 - `crop_width`: One integer for every edge or `[top, bottom, left, right]`;
-  each edge is cropped by max(its `crop_width`, its adaptive margin).
+  each edge is cropped by max(its `crop_width`, its adaptive margin). Default
+  50 px (was 100), so neighbouring FOVs' decoded regions overlap by more than a
+  cell; datasets generated with the old default must pin 100 before
+  regenerating.
 - `crop_bounds_<fov>.json`: Decode records each FOV's crop (bounds, fixed and
-  adaptive margins, channels); read with `get_crop_record`, `get_crop_bounds`
-  or `get_crop_bounds_table`.
+  adaptive margins, channels, the edge margin and the kept barcode bounds);
+  read with `get_crop_record`, `get_crop_bounds` or `get_crop_bounds_table`.
 - `crop_offset`: The crop corner `(colStart, rowStart)`, added to x, y and the
   global coordinates after the edge filter.
 - Edge filter: Compares x with the image width and y with its height (they were
@@ -159,8 +166,15 @@ major change was made.
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
-- `adaptive_crop`: Defaults to the per-FOV valid warp region (every channel,
-  one `crop_width`) during scale-factor and chromatic estimation.
+- `adaptive_crop`, `adaptive_crop_channels` (default `codebook`), `crop_width`
+  (default 50, was 100; per edge): The barcodes kept, and the chromatic samples
+  measured on them, are those in the FOV's crop region, the same per-codebook
+  region Decode computes; recorded per FOV (`crop_bounds_<fov>.json`). The
+  scale factors, backgrounds and barcode counts use every decoded pixel.
+- Chromatic samples on raw-warped images (`chromatic_on_preprocessed` off):
+  Get the preprocess task's camera hot-pixel correction (`hot_pixel_task`).
+- `OptimizeIterationFOV`: No longer fails in `extract_refactors`
+  (`min_barcodes_for_refactoring` was not passed to the decoder).
 - `normalize_scale_factors`: Returns scale factors as mean-one ratios for
   consistency across preprocessing configurations.
 - `cleanup_fragment_results`: Removes fragment-level intermediate arrays after
