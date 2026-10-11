@@ -50,6 +50,24 @@ positions, and each FOV's crop is saved (`crop_bounds_<fov>.json`) for
 downstream steps that need to know which part of the FOV was decoded. A
 molecule cut by the crop edge keeps only its inside part.
 
+**`crop_width` default 50** (was 100). Neighbouring FOVs share a strip of
+tissue. A cell in that strip is decoded whole by at least one of the two FOVs
+only when each FOV's fixed crop is at most (overlap - cell diameter) / 2.
+With 100 px on each edge of a 2048 px frame and the usual ~10 % overlap, the
+two decoded regions barely meet, so seam cells are cut in both copies. 50 px
+leaves room for cells up to about 100 px at that overlap. Edges where the
+warp leaves missing data are still cut at the adaptive margin, which can be
+wider than the overlap; there the seam keeps a gap.
+
+**`adaptive_edge_margin`** (default 2 px). Where the adaptive margin sets an
+edge, the pixels just outside have no data in at least one bit. The image is
+cut there, so a molecule crossing the edge keeps only a fragment, next to
+pixels whose filtering saw the empty strip. In image space the barcodes
+whose centroid lies within this margin of such an edge are dropped. Edges set
+by the fixed `crop_width` have valid data outside and keep every barcode.
+The record lists which edges the margin applied to and the bounds of the
+kept centroids (`barcode_bounds`).
+
 ## Registration
 
 **`FiducialPolynomialWarp3D`** (replaces `FiducialCorrelationWarp3D`). In thick,
@@ -185,7 +203,15 @@ with few barcodes distort the rotation and scale.
 **`chromatic_on_preprocessed`**. Measures those samples on the preprocessed
 images already in memory instead of loading the warped images again. It is
 faster, but not equivalent: preprocessing clips negative values, which shifts
-spot centroids slightly. It is therefore off by default.
+spot centroids slightly. It is therefore off by default. The warped images it
+loads instead get the preprocess task's hot-pixel correction, if it has one.
+
+**Crop region**. Optimize decodes the whole frame and keeps the barcodes whose
+centroid lies in the FOV's crop region, the same per-codebook region (fixed
+crop per edge, widened by the adaptive margin) that Decode uses. These
+barcodes are the chromatic samples and the stored table. The scale factors,
+backgrounds and barcode counts are measured on every decoded pixel of the
+frame.
 
 **`chromatic_threads`**. When `chromatic_from_fragments` is off and the
 correction is fitted in one job, this parallelises that job over FOV/z planes.

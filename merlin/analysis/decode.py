@@ -136,28 +136,100 @@ def compute_crop_bounds(dataSet, warpTaskName, fov, cropWidth, adaptive,
     return (top, h - bottom, left, w - right)
 
 
+def task_warp_task_name(task) -> str:
+    """The warp task whose images a decode or optimize task decodes: the
+    warp_task of its preprocess_task."""
+    return task.dataSet.load_analysis_task(
+        task.parameters['preprocess_task']).parameters['warp_task']
+
+
 def task_crop_bounds(task, fov: int) -> Tuple[int, int, int, int]:
-    """compute_crop_bounds with a decode task's own settings: the warp task
-    of its preprocess_task, its crop_width and adaptive_crop, and the
-    channels adaptive_crop_channels names (a task without that parameter,
-    i.e. one that is not a Decode, takes every channel)."""
+    """compute_crop_bounds with a decode or optimize task's own settings: the
+    warp task of its preprocess_task, its crop_width and adaptive_crop, and
+    the channels adaptive_crop_channels names (a task without that
+    parameter takes every channel)."""
     parameters = task.parameters
-    warpTaskName = task.dataSet.load_analysis_task(
-        parameters['preprocess_task']).parameters['warp_task']
-    return compute_crop_bounds(task.dataSet, warpTaskName, fov,
+    return compute_crop_bounds(task.dataSet, task_warp_task_name(task), fov,
                                parameters['crop_width'],
                                parameters['adaptive_crop'],
                                task_crop_channels(task))
 
 
 def task_crop_channels(task):
-    """The data channels whose transformations set a decode task's adaptive
-    margin: its codebook's (adaptive_crop_channels 'codebook') or None for
-    all of them ('all', or no such parameter) and without adaptive_crop."""
+    """The data channels whose transformations set a decode or optimize
+    task's adaptive margin: its codebook's (adaptive_crop_channels
+    'codebook') or None for all of them ('all', or no such parameter) and
+    without adaptive_crop."""
     if not task.parameters.get('adaptive_crop', False) \
             or task.parameters.get('adaptive_crop_channels', 'all') == 'all':
         return None
     return codebook_data_channels(task.dataSet, task.get_codebook())
+
+
+def task_adaptive_margins(task, fov: int):
+    """adaptive_margins (top, bottom, left, right) of fov under a decode or
+    optimize task's settings, or None without adaptive_crop."""
+    if not task.parameters.get('adaptive_crop', False):
+        return None
+    return tuple(int(m) for m in adaptive_margins(
+        task.dataSet, task_warp_task_name(task), fov,
+        task_crop_channels(task)))
+
+
+def check_adaptive_crop_channels(value) -> None:
+    """Refuse an adaptive_crop_channels value that is not one of
+    ADAPTIVE_CROP_CHANNELS."""
+    if value not in ADAPTIVE_CROP_CHANNELS:
+        raise ValueError('adaptive_crop_channels must be one of %s'
+                         % (ADAPTIVE_CROP_CHANNELS,))
+
+
+def margin_set_edges(cropWidth, margins) -> Tuple[bool, bool, bool, bool]:
+    """(top, bottom, left, right): True for each edge whose bound the
+    adaptive margin sets, i.e. the warp leaves missing data right outside
+    it: margin > 0 and margin >= that edge's crop_width (a tie counts, the
+    missing data still reaches the edge). margins None (no adaptive_crop):
+    no edge."""
+    if margins is None:
+        return (False, False, False, False)
+    return tuple(bool(margin > 0 and margin >= fixed) for fixed, margin
+                 in zip(crop_widths(cropWidth), margins))
+
+
+def edge_margin_bounds(bounds, edges, edgeMargin: int
+                       ) -> Tuple[int, int, int, int]:
+    """[rowMin, rowMax, colMin, colMax], inclusive: the barcode centroids an
+    image-space decode keeps in its region bounds (rowStart, rowEnd,
+    colStart, colEnd; slice bounds, so the outermost decoded row is
+    rowEnd - 1). On each edge flagged in edges (top, bottom, left, right)
+    the limit moves edgeMargin px inward from the outermost decoded row or
+    column: a barcode is dropped when its centroid lies less than edgeMargin
+    px from it."""
+    rowStart, rowEnd, colStart, colEnd = (int(b) for b in bounds)
+    top, bottom, left, right = (int(edgeMargin) if e else 0 for e in edges)
+    return (rowStart + top, rowEnd - 1 - bottom, colStart + left,
+            colEnd - 1 - right)
+
+
+def edge_margin_mask(x, y, bounds, edges, edgeMargin: int) -> np.ndarray:
+    """True for the barcodes (full-frame centroids x, a column, and y, a
+    row) that edge_margin_bounds keeps: rowMin <= y <= rowMax and
+    colMin <= x <= colMax."""
+    rowMin, rowMax, colMin, colMax = edge_margin_bounds(bounds, edges,
+                                                        edgeMargin)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    return (x >= colMin) & (x <= colMax) & (y >= rowMin) & (y <= rowMax)
+
+
+def check_edge_margin(value) -> int:
+    """adaptive_edge_margin as an integer >= 0, or ValueError."""
+    if isinstance(value, (bool, np.bool_)) \
+            or not isinstance(value, (int, float, np.integer, np.floating)) \
+            or not np.isfinite(value) or value != int(value) or value < 0:
+        raise ValueError('adaptive_edge_margin must be an integer >= 0; got '
+                         '%r' % (value,))
+    return int(value)
 
 
 class BarcodeSavingParallelAnalysisTask(analysistask.ParallelAnalysisTask):
@@ -225,16 +297,25 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 'lowpass_sigma is no longer a Decode parameter -- set it on the '
                 'preprocess task instead, where Optimize sees it too.')
 
-        # One integer for every edge, or [top, bottom, left, right].
+        # One integer for every edge, or [top, bottom, left, right]: the
+        # fixed crop, the floor of each edge (the adaptive margin widens an
+        # edge whose warp leaves missing data, see compute_crop_bounds).
+        # Default 50 (was 100). Neighbouring fovs overlap by a strip, and a
+        # cell in it is decoded whole by at least one of the two fovs only
+        # when each fixed crop is at most (overlap - cell diameter) / 2;
+        # with 100 px on a 2048 px frame and the usual ~10 % overlap the two
+        # decoded regions barely meet and seam cells are cut in both.
         if 'crop_width' not in self.parameters:
-            self.parameters['crop_width'] = 100
+            self.parameters['crop_width'] = 50
         crop_widths(self.parameters['crop_width'])     # refuse a bad value
         if 'crop_in_image_space' not in self.parameters:
             # When True, the image is cropped to the fov's crop bounds
             # (compute_crop_bounds: crop_width per edge, widened by the
             # adaptive margin) BEFORE decoding, so pixels outside are never
             # decoded, and every decoded barcode is kept (no barcode-space
-            # edge filter). x, y are written in the full frame: the crop
+            # edge filter) except those adaptive_edge_margin drops at the
+            # edges the adaptive margin set. x, y are written in the full
+            # frame: the crop
             # corner (colStart, rowStart) is added back, so x, y and global
             # x, y place the FOV corner at raw pixel (0,0), as segmentation
             # and stage positions do. The decoded images stay in the cropped
@@ -289,10 +370,18 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # (every transformation of the warp task, the behaviour before).
         if 'adaptive_crop_channels' not in self.parameters:
             self.parameters['adaptive_crop_channels'] = 'codebook'
-        if self.parameters['adaptive_crop_channels'] \
-                not in ADAPTIVE_CROP_CHANNELS:
-            raise ValueError('adaptive_crop_channels must be one of %s'
-                             % (ADAPTIVE_CROP_CHANNELS,))
+        check_adaptive_crop_channels(self.parameters['adaptive_crop_channels'])
+        # Image space only: drop the barcodes whose centroid lies less than
+        # this many px from an edge whose bound the adaptive margin set
+        # (margin_set_edges: the warp leaves missing data right outside it).
+        # The image is cut there, so a molecule straddling the edge keeps
+        # only its inside part, next to pixels whose filtering saw the
+        # missing data. Edges set by the fixed crop_width have valid data
+        # outside and are left alone; barcode space keeps whole components
+        # and filters only crop_width, so it has no such edge. 0 = off.
+        if 'adaptive_edge_margin' not in self.parameters:
+            self.parameters['adaptive_edge_margin'] = 2
+        check_edge_margin(self.parameters['adaptive_edge_margin'])
         if 'remove_z_duplicated_barcodes' not in self.parameters:
             self.parameters['remove_z_duplicated_barcodes'] = False
         if self.parameters['remove_z_duplicated_barcodes']:
@@ -422,19 +511,49 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             cache[fov] = tuple(int(b) for b in task_crop_bounds(self, fov))
         return cache[fov]
 
+    def _adaptive_margins(self, fov: int):
+        """task_adaptive_margins of fov (None without adaptive_crop),
+        computed once per fov."""
+        cache = getattr(self, '_adaptiveMarginCache', None)
+        if cache is None:
+            cache = self._adaptiveMarginCache = {}
+        if fov not in cache:
+            cache[fov] = task_adaptive_margins(self, fov)
+        return cache[fov]
+
+    def _edge_margin_edges(self, fov: int) -> Tuple[bool, bool, bool, bool]:
+        """(top, bottom, left, right) edges of fov's region where
+        adaptive_edge_margin applies: in image space, those whose bound the
+        adaptive margin set (margin_set_edges); none in barcode space."""
+        if not self.parameters['crop_in_image_space'] \
+                or not self.parameters['adaptive_edge_margin']:
+            return (False, False, False, False)
+        return margin_set_edges(self.parameters['crop_width'],
+                                self._adaptive_margins(fov))
+
+    def _apply_edge_margin(self, df, fov: int):
+        """df without the barcodes within adaptive_edge_margin px of an
+        edge _edge_margin_edges flags (full-frame x, y)."""
+        edges = self._edge_margin_edges(fov)
+        if len(df) == 0 or not any(edges):
+            return df
+        keep = edge_margin_mask(df['x'].to_numpy(), df['y'].to_numpy(),
+                                self._crop_bounds(fov), edges,
+                                self.parameters['adaptive_edge_margin'])
+        if keep.all():
+            return df
+        return df[keep]
+
     def _crop_record(self, fov: int) -> dict:
         """What crop_bounds_<fov>.json holds; see get_crop_record."""
         h, w = self.dataSet.get_image_dimensions()
         top, bottom, left, right = crop_widths(self.parameters['crop_width'])
         channels = task_crop_channels(self)
-        margins = None
-        if self.parameters['adaptive_crop']:
-            warpTaskName = self.dataSet.load_analysis_task(
-                self.parameters['preprocess_task']).parameters['warp_task']
-            margins = [int(m) for m in adaptive_margins(
-                self.dataSet, warpTaskName, fov, channels)]
+        margins = self._adaptive_margins(fov)
         bounds = [int(b) for b in self._crop_bounds(fov)]
         imageSpace = bool(self.parameters['crop_in_image_space'])
+        edges = self._edge_margin_edges(fov)
+        barcodeFilter = [top, h - bottom, left, w - right]
         return {
             'fov': int(fov),
             'image_shape': [int(h), int(w)],
@@ -445,10 +564,15 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                 self.parameters['adaptive_crop_channels'],
             'data_channels': None if channels is None
             else [int(c) for c in channels],
-            'adaptive_margin': margins,
+            'adaptive_margin': None if margins is None else list(margins),
             'crop_bounds': bounds,
-            'barcode_filter': None if imageSpace
-            else [top, h - bottom, left, w - right],
+            'barcode_filter': None if imageSpace else barcodeFilter,
+            'adaptive_edge_margin': int(
+                self.parameters['adaptive_edge_margin']),
+            'edge_margin_edges': [bool(e) for e in edges],
+            'barcode_bounds': [int(b) for b in edge_margin_bounds(
+                bounds, edges, self.parameters['adaptive_edge_margin'])]
+            if imageSpace else barcodeFilter,
             'xy_frame': 'full_frame'}
 
     def get_crop_record(self, fov: int):
@@ -466,6 +590,14 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         only), and crop_bounds is the valid region for downstream use
         (DeduplicateBarcodes' crop_to_valid_box). x, y are full-frame either
         way (xy_frame).
+
+        barcode_bounds [rowMin, rowMax, colMin, colMax]: the barcodes kept
+        are those with rowMin <= y <= rowMax and colMin <= x <= colMax. In
+        image space that is the region less adaptive_edge_margin px on each
+        edge edge_margin_edges [top, bottom, left, right] flags (the edges
+        the adaptive margin set; edge_margin_bounds); in barcode space it is
+        barcode_filter. Records written before the edge margin existed have
+        none of these three keys (nothing was dropped at the edges).
         """
         try:
             return self.dataSet.load_json_analysis_result(
@@ -484,7 +616,11 @@ class Decode(BarcodeSavingParallelAnalysisTask):
     def get_crop_bounds_table(self, fovs=None) -> pandas.DataFrame:
         """One row per fov with a crop record: fov, row_start, row_end,
         col_start, col_end (crop_bounds), the fixed crop_* and adaptive
-        margin_* per edge, crop_in_image_space and n_data_channels."""
+        margin_* per edge, crop_in_image_space, n_data_channels, the
+        adaptive_edge_margin, edge_margin_* per edge (applied or not) and
+        barcode_row_min, barcode_row_max, barcode_col_min, barcode_col_max
+        (barcode_bounds); the last three are None for a record from before
+        the edge margin."""
         if fovs is None:
             fovs = self.dataSet.get_fovs()
         rows = []
@@ -505,6 +641,16 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             row['crop_in_image_space'] = record['crop_in_image_space']
             row['n_data_channels'] = (None if record['data_channels'] is None
                                       else len(record['data_channels']))
+            row['adaptive_edge_margin'] = record.get('adaptive_edge_margin')
+            edges = record.get('edge_margin_edges') or [None] * 4
+            for edge, applied in zip(('top', 'bottom', 'left', 'right'),
+                                     edges):
+                row['edge_margin_' + edge] = applied
+            kept = record.get('barcode_bounds') or [None] * 4
+            for name, value in zip(('barcode_row_min', 'barcode_row_max',
+                                    'barcode_col_min', 'barcode_col_max'),
+                                   kept):
+                row[name] = value
             rows.append(row)
         return pandas.DataFrame(rows)
 
@@ -956,6 +1102,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
                                + c0).astype(np.float32)
                     df['y'] = (df['y'].to_numpy(np.float64)
                                + r0).astype(np.float32)
+                    df = self._apply_edge_margin(df, fov)
                 else:
                     df = df[decoding.crop_filter_mask(
                         df['x'].to_numpy(), df['y'].to_numpy(), di.shape,
@@ -1068,9 +1215,13 @@ class Decode(BarcodeSavingParallelAnalysisTask):
             df, uid = barcodeOutput
         else:
             df = barcodeOutput
-            
+        if self.parameters['crop_in_image_space']:
+            # adaptive_edge_margin, on the full-frame x, y
+            df = self._apply_edge_margin(df, fov)
+            barcodeOutput = (df, uid) if outputLabels else df
+
         self._emit_barcodes(df, fov)
-        
+
         return barcodeOutput
         
     def _remove_z_duplicate_barcodes(self, bc):

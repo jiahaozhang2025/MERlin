@@ -1,6 +1,7 @@
+import inspect
+import itertools
 import numpy as np
 import scipy as sp
-import itertools
 from skimage import transform
 from typing import Dict
 from typing import List
@@ -48,8 +49,12 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             self.parameters['optimize_background'] = False
         if 'optimize_chromatic_correction' not in self.parameters:
             self.parameters['optimize_chromatic_correction'] = False
+        # One integer for every edge or [top, bottom, left, right], the same
+        # fixed crop as Decode's crop_width (default 50, was 100; see the note
+        # there).
         if 'crop_width' not in self.parameters:
-            self.parameters['crop_width'] = 100
+            self.parameters['crop_width'] = 50
+        decode.crop_widths(self.parameters['crop_width'])  # refuse a bad value
         # See the matching note in decode.Decode: all image filtering is done by
         # the preprocess task, so Optimize decodes exactly the pixels Decode
         # will decode.
@@ -105,13 +110,25 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         # centroids.
         if 'chromatic_on_preprocessed' not in self.parameters:
             self.parameters['chromatic_on_preprocessed'] = False
-        # Optimize decodes the FULL frame and discards barcodes within
-        # crop_width of the edge (barcode space, not image space). With
-        # adaptive_crop the discarded margin is this FOV's own invalid region
-        # instead of a fixed worst-case border, so the scale factors and the
-        # chromatic samples are fit on valid pixels only.
+        # Optimize decodes the FULL frame and keeps the barcodes whose
+        # centroid lies in the fov's crop region (barcode space, not image
+        # space; ends included): crop_width per edge, and with adaptive_crop
+        # each edge widened to the strip the warp leaves without data, over
+        # the data channels adaptive_crop_channels names -- the region Decode
+        # computes for the same codebook and settings
+        # (decode.task_crop_bounds). The region selects the barcodes that are
+        # stored and that the chromatic samples are measured on; it is
+        # recorded per fov (crop_bounds_<fov>.json, get_crop_record). The
+        # scale factors, backgrounds and barcode counts (extract_refactors)
+        # are taken from every decoded pixel of the frame, as before.
         if 'adaptive_crop' not in self.parameters:
             self.parameters['adaptive_crop'] = True
+        # 'codebook' (the codebook's own bits' data channels, as Decode) or
+        # 'all' (every transformation of the warp task, the region before).
+        if 'adaptive_crop_channels' not in self.parameters:
+            self.parameters['adaptive_crop_channels'] = 'codebook'
+        decode.check_adaptive_crop_channels(
+            self.parameters['adaptive_crop_channels'])
         if 'random_seed' in self.parameters:
             # set the random seed
             # make sure to set a different one for each optimize
@@ -441,6 +458,128 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         #downsample_factor = segmentTask.parameters['downsample_factor'] # not necessary
         return segmentTask._load_mask_image(fovIndex, zIndex)
 
+    # ---- crop region ----
+    def _crop_bounds(self, fov: int):
+        """(rowStart, rowEnd, colStart, colEnd) of fov's crop region under
+        this task's settings, the region Decode computes with the same
+        codebook and settings (decode.task_crop_bounds: the preprocess
+        task's warp task, crop_width per edge, adaptive_crop over the data
+        channels adaptive_crop_channels names). Computed once per fov."""
+        cache = getattr(self, '_cropBoundsCache', None)
+        if cache is None:
+            cache = self._cropBoundsCache = {}
+        if fov not in cache:
+            cache[fov] = tuple(int(b) for b in
+                               decode.task_crop_bounds(self, fov))
+        return cache[fov]
+
+    def _crop_barcodes(self, barcodes: pandas.DataFrame, fov: int
+                       ) -> pandas.DataFrame:
+        """The barcodes whose centroid lies in fov's crop region, ends
+        included: colStart <= x <= colEnd and rowStart <= y <= rowEnd (x a
+        column, y a row; without adaptive_crop this is exactly the
+        crop_width filter of extract_barcodes_with_index)."""
+        r0, r1, c0, c1 = self._crop_bounds(fov)
+        return barcodes[barcodes['x'].between(c0, c1)
+                        & barcodes['y'].between(r0, r1)]
+
+    def _crop_record(self, fov: int) -> dict:
+        """What crop_bounds_<fov>.json holds; see get_crop_record."""
+        h, w = self.dataSet.get_image_dimensions()
+        channels = decode.task_crop_channels(self)
+        margins = decode.task_adaptive_margins(self, fov)
+        bounds = [int(b) for b in self._crop_bounds(fov)]
+        return {
+            'fov': int(fov),
+            'image_shape': [int(h), int(w)],
+            'crop_in_image_space': False,
+            'crop_width': list(decode.crop_widths(
+                self.parameters['crop_width'])),
+            'adaptive_crop': bool(self.parameters['adaptive_crop']),
+            'adaptive_crop_channels':
+                self.parameters['adaptive_crop_channels'],
+            'data_channels': None if channels is None
+            else [int(c) for c in channels],
+            'adaptive_margin': None if margins is None else list(margins),
+            'crop_bounds': bounds,
+            'barcode_filter': list(bounds),
+            'barcode_bounds': list(bounds),
+            'scale_factors_from': 'full_frame',
+            'xy_frame': 'full_frame'}
+
+    def _save_crop_record(self, fov: int) -> None:
+        # one file per fov; fragments that drew the same fov write the same
+        # content
+        self.dataSet.save_json_analysis_result(
+            self._crop_record(fov), decode.CROP_RECORD_NAME, self,
+            resultIndex=fov)
+
+    def get_crop_record(self, fov: int):
+        """The crop region this iteration's fragments of fov used, or None
+        if no fragment of fov ran with the record (or none has run).
+
+        As Decode.get_crop_record, for a full-frame decode: crop_bounds
+        [rowStart, rowEnd, colStart, colEnd] from compute_crop_bounds (each
+        edge max(crop_width [top, bottom, left, right], adaptive_margin over
+        the transformations of data_channels)); the barcodes kept are those
+        with rowStart <= y <= rowEnd and colStart <= x <= colEnd
+        (barcode_filter = barcode_bounds = crop_bounds, ends included).
+        scale_factors_from 'full_frame': the scale factors, backgrounds and
+        barcode counts are taken from every decoded pixel of the frame.
+        """
+        try:
+            return self.dataSet.load_json_analysis_result(
+                decode.CROP_RECORD_NAME, self, resultIndex=fov)
+        except FileNotFoundError:
+            return None
+
+    def get_crop_bounds(self, fov: int):
+        """(rowStart, rowEnd, colStart, colEnd) of fov: the recorded bounds,
+        else those of the current settings."""
+        record = self.get_crop_record(fov)
+        if record is not None:
+            return tuple(int(b) for b in record['crop_bounds'])
+        return self._crop_bounds(fov)
+
+    # ---- chromatic sampling images ----
+    def _chromatic_hot_pixels(self, preprocessTask=None):
+        """The preprocess task's camera hot-pixel correction (its
+        hot_pixel_task), or None when it has none. preprocessTask: that task
+        when already loaded."""
+        if preprocessTask is None:
+            name = self.parameters.get('preprocess_task')
+            if not name:
+                return None
+            preprocessTask = self.dataSet.load_analysis_task(name)
+        getCorrection = getattr(preprocessTask, 'get_hot_pixel_correction',
+                                None)
+        return getCorrection() if getCorrection is not None else None
+
+    def _chromatic_image_set(self, fov: int, zIndex: int, chromaticCorrector,
+                             warpTask=None, hotPixels=None) -> np.ndarray:
+        """The images the chromatic samples are measured on without
+        chromatic_on_preprocessed: every codebook bit's warped raw image
+        (warpTask.get_aligned_image, bit order), with hotPixels (the
+        preprocess task's hot-pixel correction, _chromatic_hot_pixels)
+        replaced in each raw frame first, as the preprocessed images have
+        them. hotPixels None: the warp's images as before."""
+        if warpTask is None:
+            warpTask = self.dataSet.load_analysis_task(
+                self.parameters['warp_task'])
+        if hotPixels is not None and 'hotPixels' not in inspect.signature(
+                warpTask.get_aligned_image).parameters:
+            raise ValueError(
+                'the preprocess task replaces hot pixels, but the warp task '
+                '%s (%s) cannot take hotPixels, so the chromatic samples '
+                'would be measured on uncorrected images'
+                % (self.parameters['warp_task'], type(warpTask).__name__))
+        dataOrganization = self.dataSet.get_data_organization()
+        extra = {} if hotPixels is None else {'hotPixels': hotPixels}
+        return np.array([warpTask.get_aligned_image(
+            fov, dataOrganization.get_data_channel_for_bit(b), int(zIndex),
+            chromaticCorrector, **extra)
+            for b in self.get_codebook().get_bit_names()])
+
     def _run_analysis(self, fragmentIndex):
         preprocessTask = self.dataSet.load_analysis_task(
                 self.parameters['preprocess_task'])
@@ -511,19 +650,12 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
 
         # TODO this saves the barcodes under fragment instead of fov
         # the barcodedb should be made more general
-        cropWidth = self.parameters['crop_width']
-
-        extracted = decoder.extract_barcodes_with_index(
-            di, pm, npt, d, fovIndex,
-            0 if self.parameters['adaptive_crop'] else cropWidth,
-            zIndex, minimumArea=areaThreshold)
-        if self.parameters['adaptive_crop']:
-            r0, r1, c0, c1 = decode.compute_crop_bounds(
-                self.dataSet, self.parameters['warp_task'], fovIndex,
-                cropWidth, True)
-            # x is a column, y is a row
-            extracted = extracted[extracted['x'].between(c0, c1)
-                                  & extracted['y'].between(r0, r1)]
+        # The barcodes in the fov's crop region (_crop_bounds, the region
+        # Decode computes for this codebook), recorded per fov.
+        self._save_crop_record(int(fovIndex))
+        extracted = self._crop_barcodes(decoder.extract_barcodes_with_index(
+            di, pm, npt, d, fovIndex, 0, zIndex, minimumArea=areaThreshold),
+            int(fovIndex))
         self.get_barcode_database().write_barcodes(extracted,
                                                    fov=fragmentIndex)
         
@@ -549,14 +681,11 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             if self.parameters['chromatic_on_preprocessed']:
                 chromaticImages = warpedImages      # already in memory, free
             else:
-                warpTask = self.dataSet.load_analysis_task(
-                    self.parameters['warp_task'])
-                chromaticImages = np.array([warpTask.get_aligned_image(
-                    fovIndex,
-                    self.dataSet.get_data_organization()
-                        .get_data_channel_for_bit(b),
-                    int(zIndex), chromaticCorrector)
-                    for b in codebook.get_bit_names()])
+                # the warped raw images, hot pixels replaced as in the
+                # preprocessed ones when the preprocess task does that
+                chromaticImages = self._chromatic_image_set(
+                    fovIndex, zIndex, chromaticCorrector,
+                    hotPixels=self._chromatic_hot_pixels(preprocessTask))
             self.dataSet.save_pickle_analysis_result(
                 self._measure_chromatic_samples(chromaticImages, ownBarcodes),
                 'chromatic_samples', self.analysisName,
@@ -820,13 +949,13 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
 
             previousCorrector = aberration.RigidChromaticCorrector(
                 previousTransformations, self.get_reference_color())
-            codebook = self.get_codebook()
-            dataOrganization = self.dataSet.get_data_organization()
 
             barcodes = self.get_barcode_database().get_barcodes()
             uniqueFOVs = np.unique(barcodes['fov'])
             warpTask = self.dataSet.load_analysis_task(
                 self.parameters['warp_task'])
+            # loaded once, before any thread asks for it
+            hotPixels = self._chromatic_hot_pixels()
 
             usedColors = self._get_used_colors()
 
@@ -855,10 +984,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
                     currentBarcodes = currentBarcodes.sample(
                         n=maxBC, random_state=int(self.parameters
                                                   .get('random_seed', 0)))
-                warpedImages = np.array([warpTask.get_aligned_image(
-                    fov, dataOrganization.get_data_channel_for_bit(b),
-                    int(z),  previousCorrector)
-                    for b in codebook.get_bit_names()])
+                warpedImages = self._chromatic_image_set(
+                    fov, z, previousCorrector, warpTask, hotPixels)
                 # The same measurement the per-fragment path makes. It returns
                 # (positions, displacements) arrays per colour pair, which is
                 # what the merge below unpacks; the inline copy this replaces
@@ -1235,6 +1362,9 @@ class OptimizeIterationFOV(OptimizeIteration):
         decoder = decoding.PixelBasedDecoder(codebook)
         areaThreshold = self.parameters['area_threshold']
         decoder.refactorAreaThreshold = areaThreshold
+        # extract_refactors reads it; without it this class could not run
+        decoder.barcodesSeenThreshold = \
+            self.parameters['min_barcodes_for_refactoring']
         # is it smart to put distance threshold in optimize?
         di, pm, npt, d = decoder.decode_pixels(
             warpedImages,
@@ -1252,17 +1382,10 @@ class OptimizeIterationFOV(OptimizeIteration):
 
         # TODO this saves the barcodes under fragment instead of fov
         # the barcodedb should be made more general
-        cropWidth = self.parameters['crop_width']
-        extracted = decoder.extract_barcodes_with_index(
-            di, pm, npt, d, fovIndex,
-            0 if self.parameters['adaptive_crop'] else cropWidth,
-            zIndex, minimumArea=areaThreshold)
-        if self.parameters['adaptive_crop']:
-            r0, r1, c0, c1 = decode.compute_crop_bounds(
-                self.dataSet, self.parameters['warp_task'], fovIndex,
-                cropWidth, True)
-            extracted = extracted[extracted['x'].between(c0, c1)
-                                  & extracted['y'].between(r0, r1)]
+        self._save_crop_record(int(fovIndex))
+        extracted = self._crop_barcodes(decoder.extract_barcodes_with_index(
+            di, pm, npt, d, fovIndex, 0, zIndex, minimumArea=areaThreshold),
+            int(fovIndex))
         self.get_barcode_database().write_barcodes(
             extracted, fov=fragmentIndex)
         self.dataSet.save_numpy_analysis_result(
@@ -1280,14 +1403,9 @@ class OptimizeIterationFOV(OptimizeIteration):
             if self.parameters['chromatic_on_preprocessed']:
                 chromaticImages = warpedImages
             else:
-                warpTask = self.dataSet.load_analysis_task(
-                    self.parameters['warp_task'])
-                chromaticImages = np.array([warpTask.get_aligned_image(
-                    fovIndex,
-                    self.dataSet.get_data_organization()
-                        .get_data_channel_for_bit(b),
-                    int(zIndex), chromaticCorrector)
-                    for b in codebook.get_bit_names()])
+                chromaticImages = self._chromatic_image_set(
+                    fovIndex, zIndex, chromaticCorrector,
+                    hotPixels=self._chromatic_hot_pixels(preprocessTask))
             self.dataSet.save_pickle_analysis_result(
                 self._measure_chromatic_samples(chromaticImages, extracted),
                 'chromatic_samples', self.analysisName,
