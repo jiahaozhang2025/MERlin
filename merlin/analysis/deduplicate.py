@@ -39,17 +39,35 @@ z_first_um, z_last_um and area_sum, with:
   and z_last_um: the shallowest and deepest detection depths.
 
 molecule_features:
+- 'summed' (default): over all the molecule's detections, area = area_sum,
+  mean_intensity = area-weighted mean of the detections' mean_intensity (the
+  mean magnitude over all the molecule's pixels) and min_distance =
+  area-weighted mean of the detections' min_distance;
 - 'brightest': all three from the brightest detection (the rule
-  merlin.util.barcodefilters applies after filtering);
-- 'brightest_sum_area': mean_intensity and min_distance from the brightest
-  detection, area = area_sum;
-- 'all_planes': mean_intensity = area-weighted mean of the detections'
-  mean_intensity (the mean magnitude over all the molecule's pixels),
-  min_distance = area-weighted mean of the detections' min_distance,
-  area = area_sum.
+  merlin.util.barcodefilters applies after filtering).
+The former name 'all_planes' is read as 'summed'. 'brightest_sum_area'
+(brightest intensity and distance with the summed area) was removed and is
+refused.
 
 The decode table's area column is 16-bit unsigned; an area_sum above 65535 is
 clipped to 65535 in 'area' (area_sum itself is 32-bit).
+
+Valid box (crop_to_valid_box, off by default). Decode trims each fov to its
+valid region, decode.compute_crop_bounds: crop_width on every edge, widened
+(with adaptive_crop) to the widest strip that any of the warp task's
+transforms leaves without data, over every channel and plane and at the
+turned corners of a rotation. Decode applies that region only when it crops
+in image space (crop_in_image_space); in barcode space it removes just the
+barcodes within crop_width of the frame edge, so detections in the strip
+where some channel has no warped data are kept. With crop_to_valid_box the
+detections whose x, y centroid lies outside the region (the decode task's
+preprocess_task's warp_task, crop_width and adaptive_crop) are dropped before
+linking: x in [colStart, colEnd] and y in [rowStart, rowEnd], inclusive like
+Decode's crop_width filter. In image space the decode's x, y are relative to
+(colStart, rowStart) and are shifted back first, so nothing is dropped there;
+with adaptive_crop off the region is the crop_width box and nothing more is
+dropped either. The region is the same for every codebook decoded with one
+warp task, as it spans all the warp task's channels.
 
 Summed areas run far beyond the 1..area_bins+1 area edges the adaptive
 threshold uses by default (every molecule above that would share the top bin).
@@ -70,7 +88,14 @@ from scipy.spatial import cKDTree
 from merlin.analysis import decode
 from merlin.analysis import filterbarcodes
 
-MOLECULE_FEATURES = ('brightest', 'brightest_sum_area', 'all_planes')
+MOLECULE_FEATURES = ('summed', 'brightest')
+# Former molecule_features names, read as the new one so that an analysis
+# json or a saved task.json that uses them still loads.
+MOLECULE_FEATURE_ALIASES = {'all_planes': 'summed'}
+REMOVED_MOLECULE_FEATURES = {
+    'brightest_sum_area': "molecule_features 'brightest_sum_area' was removed;"
+                          " use 'summed' (summed area, area-weighted mean "
+                          "intensity and distance) or 'brightest'"}
 
 # A link at exactly the radius or the gap is kept; these absorb float rounding.
 XY_TOLERANCE_PX = 1e-6
@@ -84,6 +109,18 @@ MOLECULE_COLUMNS = ('n_detections', 'n_planes', 'z_um', 'z_first_um',
 _CENTROID_COLUMNS = ('x', 'y', 'global_x', 'global_y', 'global_z')
 
 _AREA_MAX = np.iinfo(np.uint16).max
+
+
+def molecule_features_option(value: str) -> str:
+    """The molecule_features name to use for value: an alias is replaced by
+    its new name; a removed or unknown value raises ValueError."""
+    if value in REMOVED_MOLECULE_FEATURES:
+        raise ValueError(REMOVED_MOLECULE_FEATURES[value])
+    value = MOLECULE_FEATURE_ALIASES.get(value, value)
+    if value not in MOLECULE_FEATURES:
+        raise ValueError('molecule_features must be one of %s, not %r'
+                         % (MOLECULE_FEATURES, value))
+    return value
 
 
 def plane_depths_um(zIndex: np.ndarray, zPositions) -> np.ndarray:
@@ -171,9 +208,7 @@ def merge_molecules(barcodes: pandas.DataFrame, labels: np.ndarray,
                     zUm: np.ndarray, moleculeFeatures: str
                     ) -> pandas.DataFrame:
     """One row per label; see the module docstring for every column."""
-    if moleculeFeatures not in MOLECULE_FEATURES:
-        raise ValueError('molecule_features must be one of %s'
-                         % (MOLECULE_FEATURES,))
+    moleculeFeatures = molecule_features_option(moleculeFeatures)
     barcodes = barcodes.reset_index(drop=True)
     n = len(barcodes)
     if n == 0:
@@ -233,12 +268,11 @@ def merge_molecules(barcodes: pandas.DataFrame, labels: np.ndarray,
                                    area, areaSum).astype(
                 barcodes[column].dtype)
 
-    if moleculeFeatures == 'all_planes':
+    if moleculeFeatures == 'summed':
         out['mean_intensity'] = weighted(meanIntensity, area, areaSum).astype(
             barcodes['mean_intensity'].dtype)
         out['min_distance'] = weighted(minDistance, area, areaSum).astype(
             barcodes['min_distance'].dtype)
-    if moleculeFeatures in ('brightest_sum_area', 'all_planes'):
         out['area'] = np.minimum(areaSum, _AREA_MAX).astype(
             _summed_area_dtype(barcodes['area'].dtype))
 
@@ -296,6 +330,55 @@ def deduplicate_barcodes(barcodes: pandas.DataFrame, zPositions,
                        'n_links': links}
 
 
+# The decode task parameters crop_to_valid_box reads.
+_VALID_BOX_PARAMETERS = ('preprocess_task', 'crop_width', 'adaptive_crop',
+                         'crop_in_image_space')
+
+
+def _check_valid_box_parameters(decodeTask) -> Dict:
+    """The decode task's parameters, if it has those crop_to_valid_box
+    reads."""
+    parameters = decodeTask.get_parameters()
+    missing = [k for k in _VALID_BOX_PARAMETERS if k not in parameters]
+    if missing:
+        raise ValueError(
+            'crop_to_valid_box needs a decode task with %s; %s has no %s'
+            % (', '.join(_VALID_BOX_PARAMETERS),
+               decodeTask.get_analysis_name(), ', '.join(missing)))
+    return parameters
+
+
+def decode_valid_box(dataSet, decodeTask, fov: int
+                     ) -> Tuple[int, int, int, int]:
+    """(rowStart, rowEnd, colStart, colEnd) of the decode task's valid region
+    of fov: decode.compute_crop_bounds with the warp task of the decode
+    task's preprocess_task and the decode task's crop_width and
+    adaptive_crop, as Decode itself computes it."""
+    parameters = _check_valid_box_parameters(decodeTask)
+    warpTaskName = dataSet.load_analysis_task(
+        parameters['preprocess_task']).get_parameters()['warp_task']
+    return decode.compute_crop_bounds(dataSet, warpTaskName, fov,
+                                      parameters['crop_width'],
+                                      parameters['adaptive_crop'])
+
+
+def valid_box_mask(barcodes: pandas.DataFrame,
+                   bounds: Tuple[int, int, int, int],
+                   cropInImageSpace: bool) -> np.ndarray:
+    """True for the detections whose x, y centroid lies in bounds
+    (rowStart, rowEnd, colStart, colEnd): colStart <= x <= colEnd and
+    rowStart <= y <= rowEnd. With cropInImageSpace, x and y are relative to
+    (colStart, rowStart), the corner of the image the decode cropped, and are
+    shifted back to the full frame first."""
+    rowStart, rowEnd, colStart, colEnd = (float(b) for b in bounds)
+    x = barcodes['x'].to_numpy(np.float64)
+    y = barcodes['y'].to_numpy(np.float64)
+    if cropInImageSpace:
+        x = x + colStart
+        y = y + rowStart
+    return (x >= colStart) & (x <= colEnd) & (y >= rowStart) & (y <= rowEnd)
+
+
 def area_equal_count_edges(areas: np.ndarray, binCount: int) -> np.ndarray:
     """Integer area bin edges with about equal numbers of molecules per bin.
 
@@ -347,14 +430,22 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         max_z_gap_um (0.75): largest depth difference between linked
             detections; 0 links nothing (every detection is its own
             molecule, with the molecule columns added).
-        molecule_features ('brightest'): 'brightest', 'brightest_sum_area'
-            or 'all_planes', see the module docstring.
+        molecule_features ('summed'): 'summed' or 'brightest', see the
+            module docstring ('all_planes' is read as 'summed').
+        crop_to_valid_box (False): drop the detections outside the decode
+            task's valid region before linking, see the module docstring.
+            Needs a decode task with preprocess_task, crop_width,
+            adaptive_crop and crop_in_image_space (Decode has them).
         distance_threshold, fovs, decode_z_index: the decode task's values
             unless given; GenerateAdaptiveThreshold reads them from its
             decode task.
-    A per-fov 'deduplicate_summary' json (get_summary) holds the detection,
-    molecule and link counts, coding and blank detections per molecule, the
-    n_planes histograms and the read / link + merge / write times.
+    A per-fov 'deduplicate_summary' json (get_summary) holds the counts:
+    n_decoded (rows read), n_detections (rows linked, after the valid-box
+    crop), n_molecules, n_links, coding and blank detections per molecule
+    and the n_planes histograms; with crop_to_valid_box also valid_box
+    (rowStart, rowEnd, colStart, colEnd) and the detections dropped outside
+    it (n_outside_valid_box, coding_ and blank_outside_valid_box); and the
+    read / crop / link + merge / write times.
     """
 
     outputGroup = 'Decode'
@@ -369,10 +460,13 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         if 'max_z_gap_um' not in self.parameters:
             self.parameters['max_z_gap_um'] = 0.75
         if 'molecule_features' not in self.parameters:
-            self.parameters['molecule_features'] = 'brightest'
-        if self.parameters['molecule_features'] not in MOLECULE_FEATURES:
-            raise ValueError('molecule_features must be one of %s'
-                             % (MOLECULE_FEATURES,))
+            self.parameters['molecule_features'] = 'summed'
+        self.parameters['molecule_features'] = molecule_features_option(
+            self.parameters['molecule_features'])
+        if 'crop_to_valid_box' not in self.parameters:
+            self.parameters['crop_to_valid_box'] = False
+        if self.parameters['crop_to_valid_box'] not in (True, False):
+            raise ValueError('crop_to_valid_box must be true or false')
         if 'resumable_z_decoding' not in self.parameters:
             # never resumable: a rerun empties the fov's table first
             self.parameters['resumable_z_decoding'] = False
@@ -387,6 +481,8 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
             for key in inherited:
                 if key not in self.parameters:
                     self.parameters[key] = decodeParameters.get(key)
+        if self.parameters['crop_to_valid_box']:
+            _check_valid_box_parameters(self._decode_task())
 
     def _decode_task(self):
         if getattr(self, '_decodeTask', None) is None:
@@ -428,6 +524,21 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         barcodes = decodeTask.get_barcode_database().get_barcodes(
             fragmentIndex)
         readSeconds = time.time() - start
+        decodedCount = len(barcodes)
+
+        boxSummary = {}
+        if self.parameters['crop_to_valid_box']:
+            start = time.time()
+            bounds = decode_valid_box(self.dataSet, decodeTask, fragmentIndex)
+            inside = valid_box_mask(
+                barcodes, bounds,
+                bool(decodeTask.get_parameters()['crop_in_image_space']))
+            boxSummary = _outside_box_counts(barcodes, inside,
+                                             decodeTask.get_codebook())
+            boxSummary['valid_box'] = [int(b) for b in bounds]
+            if not inside.all():
+                barcodes = barcodes.loc[inside]
+            boxSummary['seconds_crop'] = round(time.time() - start, 3)
 
         start = time.time()
         molecules, stats = deduplicate_barcodes(
@@ -443,22 +554,42 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         writeSeconds = time.time() - start
 
         summary = dict(stats, fov=int(fragmentIndex),
+                       n_decoded=int(decodedCount),
                        xy_radius_px=float(self.parameters['xy_radius_px']),
                        max_z_gap_um=float(self.parameters['max_z_gap_um']),
                        molecule_features=self.parameters['molecule_features'],
+                       crop_to_valid_box=bool(
+                           self.parameters['crop_to_valid_box']),
                        seconds_read=round(readSeconds, 3),
                        seconds_link_merge=round(mergeSeconds, 3),
                        seconds_write=round(writeSeconds, 3))
+        summary.update(boxSummary)
         summary.update(_planes_per_molecule(molecules,
                                             decodeTask.get_codebook()))
         self.dataSet.save_json_analysis_result(
             summary, 'deduplicate_summary', self, resultIndex=fragmentIndex)
-        print('%s fov %d: %d detections -> %d molecules (%d links); read '
+        dropped = ''
+        if boxSummary:
+            dropped = ' (%d of %d outside the valid box %s dropped)' % (
+                boxSummary['n_outside_valid_box'], decodedCount,
+                boxSummary['valid_box'])
+        print('%s fov %d: %d detections%s -> %d molecules (%d links); read '
               '%.1f s, link + merge %.1f s, write %.1f s'
               % (self.get_analysis_name(), fragmentIndex,
-                 stats['n_detections'], stats['n_molecules'],
+                 stats['n_detections'], dropped, stats['n_molecules'],
                  stats['n_links'], readSeconds, mergeSeconds, writeSeconds),
               flush=True)
+
+
+def _outside_box_counts(barcodes: pandas.DataFrame, inside: np.ndarray,
+                        codebook) -> Dict:
+    """Detections outside the valid box: all, coding and blank."""
+    outside = ~np.asarray(inside, dtype=bool)
+    blank = barcodes['barcode_id'].isin(
+        codebook.get_blank_indexes()).to_numpy()
+    return {'n_outside_valid_box': int(outside.sum()),
+            'coding_outside_valid_box': int((outside & ~blank).sum()),
+            'blank_outside_valid_box': int((outside & blank).sum())}
 
 
 def _planes_per_molecule(molecules: pandas.DataFrame, codebook) -> Dict:
