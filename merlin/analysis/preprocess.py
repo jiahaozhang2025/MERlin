@@ -1,5 +1,7 @@
+import inspect
 import os
 import subprocess
+import threading
 import cv2
 import numpy as np
 import scipy as sp
@@ -182,6 +184,26 @@ class DeconvolutionPreprocess(Preprocess):
         self.warpTask = self.dataSet.load_analysis_task(
             self.parameters['warp_task'])
 
+        # hot_pixel_task (off unless set): a HotPixelMap task. Its camera hot
+        # pixels are replaced in every raw frame, in camera space before the
+        # depth blend, the chromatic correction and the warp, through the warp
+        # task's get_aligned_image(..., hotPixels=). The warp task itself and
+        # its transformations are unchanged. Read with .get() and not given a
+        # default here, so task files written before this option existed keep
+        # identical parameters; without it the images are the uncorrected
+        # ones, bit for bit.
+        self._hotPixels = None
+        self._hotPixelLock = threading.Lock()
+        if self.parameters.get('hot_pixel_task'):
+            accepted = inspect.signature(
+                self.warpTask.get_aligned_image).parameters
+            if 'hotPixels' not in accepted:
+                raise ValueError(
+                    'hot_pixel_task needs a warp task whose get_aligned_image '
+                    'takes hotPixels; %s (%s) does not'
+                    % (self.parameters['warp_task'],
+                       type(self.warpTask).__name__))
+
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
 
@@ -192,7 +214,35 @@ class DeconvolutionPreprocess(Preprocess):
         return 5
 
     def get_dependencies(self):
-        return [self.parameters['warp_task']]
+        dependencies = [self.parameters['warp_task']]
+        if self.parameters.get('hot_pixel_task'):
+            dependencies.append(self.parameters['hot_pixel_task'])
+        return dependencies
+
+    def get_hot_pixel_correction(self):
+        """The hot_pixel_task's HotPixelCorrection, or None without one."""
+        name = self.parameters.get('hot_pixel_task')
+        if not name:
+            return None
+        with self._hotPixelLock:
+            if self._hotPixels is None:
+                self._hotPixels = self.dataSet.load_analysis_task(
+                    name).get_correction()
+            return self._hotPixels
+
+    def _aligned_image(self, fov: int, dataChannel: int, zIndex: int,
+                       chromaticCorrector: aberration.ChromaticCorrector = None,
+                       warpTask=None) -> np.ndarray:
+        """The warp task's aligned image, hot-pixel corrected when
+        hot_pixel_task is set (the call is unchanged when it is not)."""
+        warpTask = self.warpTask if warpTask is None else warpTask
+        hotPixels = self.get_hot_pixel_correction()
+        if hotPixels is None:
+            return warpTask.get_aligned_image(fov, dataChannel, zIndex,
+                                              chromaticCorrector)
+        return warpTask.get_aligned_image(fov, dataChannel, zIndex,
+                                          chromaticCorrector,
+                                          hotPixels=hotPixels)
 
     def get_codebook(self) -> codebook.Codebook:
         return self.dataSet.get_codebook(self.parameters['codebook_index'])
@@ -220,6 +270,7 @@ class DeconvolutionPreprocess(Preprocess):
         # workers never race to populate it.
         if self._fftHighPassSigma:
             self._fft_transfer(tuple(self.dataSet.get_image_dimensions()))
+        self.get_hot_pixel_correction()
 
         jobs = [(c, z) for c in channels for z in zIndexes]
         threads = max(1, int(self.parameters['preprocess_threads']))
@@ -242,8 +293,8 @@ class DeconvolutionPreprocess(Preprocess):
             self, fov: int, dataChannel: int, zIndex: int,
             chromaticCorrector: aberration.ChromaticCorrector = None
     ) -> np.ndarray:
-        inputImage = self.warpTask.get_aligned_image(fov, dataChannel, zIndex,
-                                                     chromaticCorrector)
+        inputImage = self._aligned_image(fov, dataChannel, zIndex,
+                                         chromaticCorrector)
         return self._preprocess_image(inputImage)
 
     def _highpass_filter(self, inputImage: np.ndarray) -> np.ndarray:
@@ -382,8 +433,8 @@ class DeconvolutionPreprocess(Preprocess):
                         .get_data_channel_for_bit(b)
 
                 for i in zIndexes:
-                    inputImage = warpTask.get_aligned_image(
-                            fragmentIndex, dataChannel, i)
+                    inputImage = self._aligned_image(
+                            fragmentIndex, dataChannel, i, warpTask=warpTask)
                     if self.parameters['deconvolve_after_highpass']:
                         deconvolvedImage = self._preprocess_image(inputImage)
                     else:
@@ -570,6 +621,12 @@ class DeconvolutionPreprocessDW(Preprocess):
     
     def __init__(self, dataSet, parameters=None, analysisName=None):
             super().__init__(dataSet, parameters, analysisName)
+
+            # this class reads its images without the warp task's
+            # get_aligned_image, so the correction would silently not happen
+            if self.parameters.get('hot_pixel_task'):
+                raise ValueError('hot_pixel_task is not supported by '
+                                 'DeconvolutionPreprocessDW')
 
             if 'codebook_index' not in self.parameters:
                 self.parameters['codebook_index'] = 0

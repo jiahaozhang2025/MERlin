@@ -226,6 +226,23 @@ across the whole field at a cost that does not grow with the filter width. This
 also lets MERlin reproduce filter chains of the form FFT high pass -> spatial
 high pass -> low pass.
 
+**Camera hot pixels (`HotPixelMap`, `hot_pixel_task`)**. A hot pixel is a
+camera defect that reads high at the same camera position in every frame.
+Registration moves each round by its own shift, so the same defect lands at a
+different registered position in each round; where rounds of one codeword have
+nearly the same shift, the defect lights several of its bits at one position
+and decodes as a molecule on every plane. The map is made from the data: per
+channel, the median of raw frames from many FOVs and planes removes the tissue
+and keeps fixed camera features; a pixel more than `excess_threshold` above
+its 5 x 5 median there is a candidate. It is called hot only when it is a
+candidate in at least `min_channels` channels of the same camera, because a
+bright feature of a single channel is not a camera defect. The pixels are
+replaced in each raw frame before anything moves them (depth blend, chromatic
+correction, warp), where they are still single pixels at known positions. The
+correction is a preprocess option, so registration and its saved
+transformations do not change, and without it the images are exactly as
+before.
+
 ## Barcode filtering
 
 **`threshold_solver_method: cumulative_bins`** (default). The adaptive filter

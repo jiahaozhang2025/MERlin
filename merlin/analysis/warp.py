@@ -77,7 +77,8 @@ class Warp(analysistask.ParallelAnalysisTask):
 
     def get_aligned_image(
             self, fov: int, dataChannel: int, zIndex: int,
-            chromaticCorrector: aberration.ChromaticCorrector=None
+            chromaticCorrector: aberration.ChromaticCorrector=None,
+            hotPixels=None
     ) -> np.ndarray:
         """Get the specified transformed image
 
@@ -88,11 +89,17 @@ class Warp(analysistask.ParallelAnalysisTask):
             chromaticCorrector: the ChromaticCorrector to use to chromatically
                 correct the images. If not supplied, no correction is
                 performed.
+            hotPixels: a merlin.util.hotpixel.HotPixelCorrection (anything
+                with correct(image, dataChannel)), applied to the raw frame
+                before the chromatic correction and the warp. If not
+                supplied, the raw frame is used as read.
         Returns:
             a 2-dimensional numpy array containing the specified image
         """
         inputImage = self.dataSet.get_raw_image(
             dataChannel, fov, self.dataSet.z_index_to_position(zIndex))
+        if hotPixels is not None:
+            inputImage = hotPixels.correct(inputImage, dataChannel)
         transformation = self.get_transformation(fov, dataChannel)
 
         if chromaticCorrector is not None:
@@ -526,13 +533,20 @@ class FiducialCorrelationWarp(Warp):
             subdirectory='transformations')
 
     def _resample_to_depth(self, fov: int, dataChannel: int,
-                           newZPosition: float) -> np.ndarray:
+                           newZPosition: float,
+                           hotPixels=None) -> np.ndarray:
+        def read(zPosition):
+            image = self.dataSet.get_raw_image(dataChannel, fov, zPosition)
+            if hotPixels is not None:
+                image = hotPixels.correct(image, dataChannel)
+            return image
+
         zPositions = np.asarray(self.dataSet.get_z_positions(), dtype=float)
         newZPosition = float(np.clip(newZPosition,
                                      zPositions.min(), zPositions.max()))
         if self.parameters['interpolation'] == 'nearest':
             nearest = zPositions[np.abs(zPositions - newZPosition).argmin()]
-            return self.dataSet.get_raw_image(dataChannel, fov, nearest)
+            return read(nearest)
         if self.parameters['interpolation'] != 'weighted':
             raise ValueError('Unknown interpolation: %s'
                              % self.parameters['interpolation'])
@@ -540,27 +554,31 @@ class FiducialCorrelationWarp(Warp):
         nearZ = zPositions[order[:2]]
         distances = np.abs(newZPosition - nearZ)
         if distances.sum() < 1e-10:
-            return self.dataSet.get_raw_image(dataChannel, fov, nearZ[0])
+            return read(nearZ[0])
         weights = 1.0 - distances / distances.sum()
-        first = self.dataSet.get_raw_image(dataChannel, fov, nearZ[0])
-        second = self.dataSet.get_raw_image(dataChannel, fov, nearZ[1])
+        first = read(nearZ[0])
+        second = read(nearZ[1])
         return (first.astype(np.float32) * weights[0]
                 + second.astype(np.float32) * weights[1]).astype(first.dtype)
 
     def get_aligned_image(
             self, fov: int, dataChannel: int, zIndex: int,
-            chromaticCorrector: aberration.ChromaticCorrector=None
+            chromaticCorrector: aberration.ChromaticCorrector=None,
+            hotPixels=None
     ) -> np.ndarray:
+        """hotPixels: as for Warp.get_aligned_image, applied to each raw
+        frame before the depth blend."""
         if not self.parameters['register_3d']:
             return super().get_aligned_image(
-                fov, dataChannel, zIndex, chromaticCorrector)
+                fov, dataChannel, zIndex, chromaticCorrector, hotPixels)
 
         table = self.get_transformation_table(fov)
         zPosition = self.dataSet.z_index_to_position(zIndex)
         row = table[(table['dataChannel'] == dataChannel)
                     & (table['zPos'] == zPosition)].iloc[0]
 
-        inputImage = self._resample_to_depth(fov, dataChannel, row['zPos_new'])
+        inputImage = self._resample_to_depth(fov, dataChannel, row['zPos_new'],
+                                             hotPixels)
         if chromaticCorrector is not None:
             imageColor = self.dataSet.get_data_organization()\
                             .get_data_channel_color(dataChannel)
@@ -2072,10 +2090,16 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
     def get_aligned_image(
             self, fov: int, dataChannel: int, zIndex: int,
-            chromaticCorrector: aberration.ChromaticCorrector = None
+            chromaticCorrector: aberration.ChromaticCorrector = None,
+            hotPixels=None
     ) -> np.ndarray:
         """Get the specified image, resampled to the corrected depth and
-        moved by the fitted xy offset (and angle, with rotation_task)."""
+        moved by the fitted xy offset (and angle, with rotation_task).
+
+        hotPixels: a merlin.util.hotpixel.HotPixelCorrection (anything with
+        correct(image, dataChannel)), applied to each raw frame in camera
+        space, before the depth blend, the chromatic correction and the warp.
+        None (default) uses the raw frames as read."""
         table = self.get_transformation_table(fov)
         row = table[(table['dataChannel'] == dataChannel)
                     & (table['zIndex'] == zIndex)]
@@ -2085,26 +2109,29 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 % (fov, dataChannel, zIndex))
         row = row.iloc[0]
 
+        def read(zPosition):
+            image = self.dataSet.get_raw_image(dataChannel, fov, zPosition)
+            if hotPixels is not None:
+                image = hotPixels.correct(image, dataChannel)
+            return image
+
         zPositions = np.asarray(self.dataSet.get_z_positions(), dtype=float)
         newZPosition = float(np.clip(row['zPos_new'],
                                      zPositions.min(), zPositions.max()))
 
         if self.parameters['interpolation'] == 'nearest':
             nearest = zPositions[np.abs(zPositions - newZPosition).argmin()]
-            inputImage = self.dataSet.get_raw_image(dataChannel, fov, nearest)
+            inputImage = read(nearest)
         elif self.parameters['interpolation'] == 'weighted':
             order = np.abs(zPositions - newZPosition).argsort()
             nearZ = zPositions[order[:2]]
             distances = np.abs(newZPosition - nearZ)
             if distances.sum() < 1e-10:
-                inputImage = self.dataSet.get_raw_image(
-                    dataChannel, fov, nearZ[0])
+                inputImage = read(nearZ[0])
             else:
                 weights = 1.0 - distances / distances.sum()
-                first = self.dataSet.get_raw_image(
-                    dataChannel, fov, nearZ[0])
-                second = self.dataSet.get_raw_image(
-                    dataChannel, fov, nearZ[1])
+                first = read(nearZ[0])
+                second = read(nearZ[1])
                 inputImage = (first.astype(np.float32) * weights[0]
                               + second.astype(np.float32) * weights[1]
                               ).astype(first.dtype)
