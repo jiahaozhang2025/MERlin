@@ -3,26 +3,35 @@
 Hand-built molecules check the linking rule (plane gaps, a second molecule at
 the same xy deeper down, other barcode ids at the same xy, same-plane pairs,
 the radius and gap at their limits, uneven plane spacing) and each
-molecule_features mode. Random tables are compared with a slow reference that
-shares no code with the module: a loop over all pairs, union-find, and
-per-molecule sums written out by hand. The last test runs Decode ->
-DeduplicateBarcodes -> GenerateMoleculeAdaptiveThreshold ->
-AdaptiveFilterBarcodes on a small synthetic dataset.
+molecule_features mode ('summed', 'brightest'; the old name 'all_planes' and
+the removed 'brightest_sum_area'). Random tables are compared with a slow
+reference that shares no code with the module: a loop over all pairs,
+union-find, and per-molecule sums written out by hand. The chain tests run
+Decode -> DeduplicateBarcodes -> GenerateMoleculeAdaptiveThreshold ->
+AdaptiveFilterBarcodes on a small synthetic dataset. The valid-box tests give
+a stand-in decode task Decode's crop parameters and a warp task with known
+shifts and a rotation, and check crop_to_valid_box's region against
+decode.compute_crop_bounds and Decode._crop_bounds, its edges, the
+image-space and adaptive_crop-off cases, and the per-fov counts.
 
 Run with `python -m unittest tests/test_deduplicate.py`.
 """
 import contextlib
 import io
+import json
 import math
+import os
 import tempfile
 import unittest
 
 import numpy as np
 import pandas as pd
+from skimage import transform
 
 from merlin.analysis import decode
 from merlin.analysis import deduplicate
 from merlin.analysis import filterbarcodes
+from merlin.core import analysistask
 from merlin.core import dataset
 
 Z_UNIFORM = [1.0 + 0.5 * k for k in range(12)]
@@ -55,7 +64,7 @@ def detections(rows):
     return out
 
 
-def run(table, xy=2.0, gap=0.75, mode='brightest', zPositions=Z_UNIFORM):
+def run(table, xy=2.0, gap=0.75, mode='summed', zPositions=Z_UNIFORM):
     molecules, _ = deduplicate.deduplicate_barcodes(table, zPositions, xy,
                                                     gap, mode)
     return molecules
@@ -136,10 +145,8 @@ def reference(table, zPositions, xy, gap, mode):
         if mode == 'brightest':
             record.update(mean_intensity=b['mean_intensity'],
                           min_distance=b['min_distance'], area=b['area'])
-        elif mode == 'brightest_sum_area':
-            record.update(mean_intensity=b['mean_intensity'],
-                          min_distance=b['min_distance'], area=areaSum)
         else:
+            assert mode == 'summed', mode
             record.update(
                 mean_intensity=sum(float(rows[i]['area'])
                                    * float(rows[i]['mean_intensity'])
@@ -258,7 +265,7 @@ class LinkingRuleTests(unittest.TestCase):
     def test_empty_table(self):
         table = detections([])
         molecules, stats = deduplicate.deduplicate_barcodes(
-            table, Z_UNIFORM, 2.0, 0.75, 'all_planes')
+            table, Z_UNIFORM, 2.0, 0.75, 'summed')
         self.assertEqual(len(molecules), 0)
         for column in deduplicate.MOLECULE_COLUMNS:
             self.assertIn(column, molecules.columns)
@@ -279,14 +286,8 @@ class FeatureModeTests(unittest.TestCase):
         self.assertEqual(m['area'].tolist(), [5, 6])
         self.assertEqual(m['area_sum'].tolist(), [12, 6])
 
-    def test_brightest_sum_area(self):
-        m = run(self.TABLE, gap=0.5, mode='brightest_sum_area')
-        self.assertEqual(m['mean_intensity'].tolist(), [90.0, 70.0])
-        np.testing.assert_allclose(m['min_distance'], [0.10, 0.25], 1e-6)
-        self.assertEqual(m['area'].tolist(), [12, 6])
-
-    def test_all_planes(self):
-        m = run(self.TABLE, gap=0.5, mode='all_planes')
+    def test_summed(self):
+        m = run(self.TABLE, gap=0.5, mode='summed')
         np.testing.assert_allclose(
             m['mean_intensity'], [(40 * 3 + 90 * 5 + 60 * 4) / 12, 70.0], 1e-6)
         np.testing.assert_allclose(
@@ -294,8 +295,23 @@ class FeatureModeTests(unittest.TestCase):
             [(0.30 * 3 + 0.10 * 5 + 0.20 * 4) / 12, 0.25], 1e-6)
         self.assertEqual(m['area'].tolist(), [12, 6])
 
+    def test_modes(self):
+        self.assertEqual(deduplicate.MOLECULE_FEATURES, ('summed', 'brightest'))
+
+    def test_all_planes_is_summed(self):
+        self.assertEqual(deduplicate.molecule_features_option('all_planes'),
+                         'summed')
+        pd.testing.assert_frame_equal(
+            run(self.TABLE, gap=0.5, mode='all_planes'),
+            run(self.TABLE, gap=0.5, mode='summed'))
+
+    def test_brightest_sum_area_refused(self):
+        with self.assertRaisesRegex(ValueError, "'brightest_sum_area' was "
+                                                "removed; use 'summed'"):
+            run(self.TABLE, gap=0.5, mode='brightest_sum_area')
+
     def test_shared_columns(self):
-        m = run(self.TABLE, gap=0.5, mode='all_planes')
+        m = run(self.TABLE, gap=0.5, mode='summed')
         w = np.array([40 * 3, 90 * 5, 60 * 4], float)
         self.assertEqual(m['z'].tolist(), [3, 4])                 # brightest
         self.assertEqual(m['unique_id'].tolist(), [2, 4])
@@ -321,12 +337,12 @@ class FeatureModeTests(unittest.TestCase):
 
     def test_area_clipped_to_database_range(self):
         rows = [(0, 5, 5, p, 10, 30000, 0.2) for p in range(3)]
-        m = run(detections(rows), gap=0.5, mode='all_planes')
+        m = run(detections(rows), gap=0.5, mode='summed')
         self.assertEqual(int(m['area'][0]), 65535)
         self.assertEqual(int(m['area_sum'][0]), 90000)
 
     def test_bad_mode(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, "must be one of"):
             run(self.TABLE, mode='mean')
 
 
@@ -354,7 +370,7 @@ class ReferenceEqualityTests(unittest.TestCase):
                             atol=1e-5, err_msg='%s %s %s %s'
                             % (seed, (xy, gap), mode, c))
                     checked += 1
-        self.assertEqual(checked, 27)
+        self.assertEqual(checked, 18)
 
 
 # --------------------------------------------------------- pipeline chain
@@ -449,8 +465,7 @@ class ChainTests(unittest.TestCase):
             decodeTask = _SyntheticDecode(ds, {}, 'Decode')
             decodeTask.save()
             dedup = deduplicate.DeduplicateBarcodes(
-                ds, {'decode_task': 'Decode',
-                     'molecule_features': 'all_planes'}, 'Dedup')
+                ds, {'decode_task': 'Decode'}, 'Dedup')
             dedup.save()
             threshold = deduplicate.GenerateMoleculeAdaptiveThreshold(
                 ds, {'decode_task': 'Dedup', 'run_after_task': 'Dedup',
@@ -461,6 +476,11 @@ class ChainTests(unittest.TestCase):
                      'write_filtered_images': False}, 'Filter')
             filterTask.save()
 
+            # defaults
+            self.assertEqual(dedup.parameters['molecule_features'], 'summed')
+            self.assertIs(dedup.parameters['crop_to_valid_box'], False)
+            self.assertEqual(dedup.parameters['xy_radius_px'], 2.0)
+            self.assertEqual(dedup.parameters['max_z_gap_um'], 0.75)
             # the decode parameters the threshold reads are inherited
             self.assertEqual(dedup.parameters['distance_threshold'], 0.65)
             self.assertIsNone(dedup.parameters['fovs'])
@@ -476,13 +496,18 @@ class ChainTests(unittest.TestCase):
                    for f in ds.get_fovs()]
             for fov in ds.get_fovs():
                 again, _ = deduplicate.deduplicate_barcodes(
-                    raw[fov], Z_UNIFORM, 2.0, 0.75, 'all_planes')
+                    raw[fov], Z_UNIFORM, 2.0, 0.75, 'summed')
                 self.assertEqual(len(molecules[fov]), len(again))
                 self.assertEqual(int(molecules[fov]['n_detections'].sum()),
                                  len(raw[fov]))
                 self.assertLess(len(molecules[fov]), len(raw[fov]))
                 summary = dedup.get_summary(fov)
                 self.assertEqual(summary['n_molecules'], len(again))
+                self.assertEqual(summary['n_decoded'], len(raw[fov]))
+                self.assertEqual(summary['n_detections'], len(raw[fov]))
+                self.assertEqual(summary['molecule_features'], 'summed')
+                self.assertIs(summary['crop_to_valid_box'], False)
+                self.assertNotIn('n_outside_valid_box', summary)
                 self.assertGreater(
                     summary['coding_detections'] / summary['coding_molecules'],
                     summary['blank_detections'] / summary['blank_molecules'])
@@ -529,6 +554,345 @@ class ChainTests(unittest.TestCase):
             threshold.run()
             np.testing.assert_array_equal(threshold.get_area_bins(),
                                           np.arange(1, 14))
+
+
+class OptionTests(unittest.TestCase):
+    """molecule_features names on the task, and a task saved with an old
+    name still loading and regenerating."""
+
+    def test_alias_and_removed_names(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = _DataSet(root)
+            _SyntheticDecode(ds, {}, 'Decode').save()
+            for given, used in (('all_planes', 'summed'),
+                                ('summed', 'summed'),
+                                ('brightest', 'brightest')):
+                task = deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode',
+                         'molecule_features': given}, 'Dedup')
+                self.assertEqual(task.parameters['molecule_features'], used)
+            with self.assertRaisesRegex(ValueError, "'brightest_sum_area' "
+                                                    "was removed"):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode',
+                         'molecule_features': 'brightest_sum_area'}, 'Dedup')
+            with self.assertRaisesRegex(ValueError, 'must be one of'):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode',
+                         'molecule_features': 'mean'}, 'Dedup')
+            with self.assertRaisesRegex(ValueError, 'true or false'):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode',
+                         'crop_to_valid_box': 'yes'}, 'Dedup')
+
+    def test_task_saved_with_old_name_loads_and_regenerates(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = _DataSet(root)
+            _SyntheticDecode(ds, {}, 'Decode').save()
+            deduplicate.DeduplicateBarcodes(
+                ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
+                     'molecule_features': 'all_planes'}, 'Dedup').save()
+            # rewrite task.json as an older version saved it: the old name,
+            # no crop_to_valid_box
+            path = os.path.join(ds.get_task_subdirectory('Dedup'),
+                                'task.json')
+            with open(path) as f:
+                saved = json.load(f)
+            saved['molecule_features'] = 'all_planes'
+            del saved['crop_to_valid_box']
+            with open(path, 'w') as f:
+                json.dump(saved, f)
+
+            loaded = ds.load_analysis_task('Dedup')
+            self.assertEqual(loaded.parameters['molecule_features'], 'summed')
+            self.assertIs(loaded.parameters['crop_to_valid_box'], False)
+            # regenerating from an analysis json with either name is accepted
+            for name in ('all_planes', 'summed'):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
+                         'molecule_features': name}, 'Dedup').save()
+            # ... a different setting is not
+            with self.assertRaises(analysistask.AnalysisAlreadyExistsException):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
+                         'molecule_features': 'brightest'}, 'Dedup').save()
+
+
+# ------------------------------------------------------------- valid box
+
+FRAME = 64
+CENTRE = (FRAME - 1) / 2
+
+
+def translation(tx, ty):
+    return [[1, 0, tx], [0, 1, ty], [0, 0, 1]]
+
+
+def rotation_about_centre(theta):
+    c, s = math.cos(theta), math.sin(theta)
+    return [[c, -s, CENTRE - c * CENTRE + s * CENTRE],
+            [s, c, CENTRE - s * CENTRE - c * CENTRE],
+            [0, 0, 1]]
+
+
+class _Warp(analysistask.AnalysisTask):
+    """get_transformation(fov): one transform per matrix in MATRICES[fov]."""
+
+    # fov 0: shifts only. With crop_width 4: left max(2, 4), right 6, top 7,
+    # bottom 9 -> rows 7..55, columns 4..58.
+    # fov 1: a 0.2 rad turn about the frame centre moves the corners by up to
+    # 6.886 px in x and y -> 7 on every edge -> rows and columns 7..57.
+    MATRICES = {0: [translation(0, 0), translation(6, -7),
+                    translation(-2, 9)],
+                1: [translation(0, 0), rotation_about_centre(0.2)]}
+    EXPECTED = {0: (7, 55, 4, 58), 1: (7, 57, 7, 57)}
+
+    def get_estimated_memory(self):
+        return 1
+
+    def get_estimated_time(self):
+        return 1
+
+    def get_dependencies(self):
+        return []
+
+    def _run_analysis(self):
+        pass
+
+    def get_transformation(self, fov, dataChannel=None):
+        return [transform.AffineTransform(matrix=np.asarray(m, dtype=float))
+                for m in self.MATRICES[fov]]
+
+
+class _Preprocess(analysistask.AnalysisTask):
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+        self.parameters.setdefault('warp_task', 'Warp')
+
+    def get_estimated_memory(self):
+        return 1
+
+    def get_estimated_time(self):
+        return 1
+
+    def get_dependencies(self):
+        return []
+
+    def _run_analysis(self):
+        pass
+
+
+class _BoxDecode(_SyntheticDecode):
+    """A decode task with Decode's crop parameters, writing ROWS[fov]
+    (in the frame its crop_in_image_space implies)."""
+
+    # (barcode_id, x, y, z, mean_intensity, area, min_distance); ids 8, 9 blank
+    ROWS = {
+        0: [(0, 30.0, 30.0, 2, 50, 4, 0.2),     # inside, linked to the next
+            (0, 30.5, 30.0, 3, 60, 4, 0.2),
+            (1, 4.0, 20.0, 1, 50, 4, 0.2),      # x = colStart: kept
+            (1, 3.99, 20.0, 2, 50, 4, 0.2),     # x < colStart: dropped
+            (2, 58.0, 40.0, 5, 50, 4, 0.2),     # x = colEnd: kept
+            (2, 58.01, 40.0, 6, 50, 4, 0.2),    # x > colEnd: dropped
+            (8, 20.0, 6.5, 4, 30, 3, 0.4),      # y < rowStart: dropped
+            (8, 20.0, 55.0, 4, 30, 3, 0.4),     # y = rowEnd: kept
+            (3, 61.0, 61.0, 0, 50, 4, 0.2),     # dropped
+            (9, 50.0, 56.0, 7, 30, 3, 0.4)],    # y > rowEnd: dropped
+        1: [(0, 5.5, 30.0, 1, 50, 4, 0.2),      # inside crop_width only
+            (0, 32.0, 32.0, 1, 50, 4, 0.2),
+            (4, 32.0, 57.0, 2, 50, 4, 0.2),     # y = rowEnd: kept
+            (4, 32.0, 58.5, 3, 50, 4, 0.2)]}    # dropped
+    INSIDE = {0: [True, True, True, False, True, False, False, True, False,
+                  False],
+              1: [False, True, True, False]}
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+        self.parameters.setdefault('preprocess_task', 'Pre')
+        self.parameters.setdefault('crop_width', 4)
+        self.parameters.setdefault('adaptive_crop', True)
+        self.parameters.setdefault('crop_in_image_space', False)
+        self.cropWidth = self.parameters['crop_width']   # Decode._crop_bounds
+
+    def _run_analysis(self, fragmentIndex):
+        table = detections(self.ROWS[fragmentIndex])
+        table['fov'] = fragmentIndex
+        self.get_barcode_database().write_barcodes(table, fov=fragmentIndex)
+
+
+class _ImageSpaceBoxDecode(_BoxDecode):
+    """Rows in the cropped image's frame: fov 0's image is 54 x 48 px
+    (x 0..53, y 0..47), fov 1's 50 x 50 px; corners and inner points."""
+
+    ROWS = {0: [(0, 0.0, 0.0, 0, 50, 4, 0.2),
+                (0, 53.0, 47.0, 1, 50, 4, 0.2),
+                (1, 20.0, 30.0, 2, 50, 4, 0.2)],
+            1: [(0, 0.0, 49.0, 0, 50, 4, 0.2),
+                (0, 49.0, 0.0, 1, 50, 4, 0.2),
+                (8, 25.0, 25.0, 2, 30, 3, 0.4)]}
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+        self.parameters['crop_in_image_space'] = True
+
+
+def corner_margins(matrices):
+    """Independent of compute_crop_bounds: each corner moved by each
+    transform, written out; (left, right, top, bottom) invalid margins."""
+    left = right = top = bottom = 0.0
+    for m in matrices:
+        for cx, cy in ((0, 0), (FRAME - 1, 0), (0, FRAME - 1),
+                       (FRAME - 1, FRAME - 1)):
+            dx = m[0][0] * cx + m[0][1] * cy + m[0][2] - cx
+            dy = m[1][0] * cx + m[1][1] * cy + m[1][2] - cy
+            left, right = max(left, -dx), max(right, dx)
+            top, bottom = max(top, -dy), max(bottom, dy)
+    return tuple(int(math.ceil(v)) for v in (left, right, top, bottom))
+
+
+class ValidBoxTests(unittest.TestCase):
+
+    def _dataset(self, root, decodeClass=None, **decodeParameters):
+        ds = _DataSet(root)
+        _Warp(ds, {}, 'Warp').save()
+        _Preprocess(ds, {}, 'Pre').save()
+        decodeTask = (decodeClass or _BoxDecode)(ds, decodeParameters,
+                                                 'BoxDecode')
+        decodeTask.save()
+        return ds, decodeTask
+
+    def test_region_is_decodes(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds, decodeTask = self._dataset(root)
+            for fov in ds.get_fovs():
+                box = deduplicate.decode_valid_box(ds, decodeTask, fov)
+                self.assertEqual(tuple(box), _Warp.EXPECTED[fov])
+                self.assertEqual(tuple(box), tuple(decode.compute_crop_bounds(
+                    ds, 'Warp', fov, 4, True)))
+                self.assertEqual(tuple(box), tuple(
+                    decode.Decode._crop_bounds(decodeTask, fov)))
+                left, right, top, bottom = corner_margins(
+                    _Warp.MATRICES[fov])
+                self.assertEqual(tuple(box), (
+                    max(top, 4), FRAME - max(bottom, 4),
+                    max(left, 4), FRAME - max(right, 4)))
+
+    def test_edges_inclusive(self):
+        for fov, rows in _BoxDecode.ROWS.items():
+            mask = deduplicate.valid_box_mask(
+                detections(rows), _Warp.EXPECTED[fov], False)
+            self.assertEqual(mask.tolist(), _BoxDecode.INSIDE[fov])
+
+    def test_image_space_coordinates_are_shifted(self):
+        rowStart, rowEnd, colStart, colEnd = _Warp.EXPECTED[0]
+        # the cropped image's pixels: x 0 .. colEnd - colStart - 1
+        rows = [(0, 0.0, 0.0, 0, 50, 4, 0.2),
+                (0, colEnd - colStart - 1, rowEnd - rowStart - 1, 1,
+                 50, 4, 0.2),
+                (0, colEnd - colStart + 0.5, 10.0, 2, 50, 4, 0.2),
+                (0, -0.5, 10.0, 3, 50, 4, 0.2)]
+        mask = deduplicate.valid_box_mask(detections(rows),
+                                          _Warp.EXPECTED[0], True)
+        self.assertEqual(mask.tolist(), [True, True, False, False])
+
+    def test_adaptive_crop_off_is_the_crop_width_filter(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds, decodeTask = self._dataset(root, adaptive_crop=False)
+            box = deduplicate.decode_valid_box(ds, decodeTask, 0)
+            self.assertEqual(tuple(box), (4, 60, 4, 60))
+            rng = np.random.default_rng(5)
+            table = detections([(0, x, y, 0, 50, 4, 0.2) for x, y in
+                                rng.uniform(0, FRAME, (400, 2))]
+                               + [(0, 4.0, 60.0, 0, 50, 4, 0.2),
+                                  (0, 60.0, 4.0, 0, 50, 4, 0.2)])
+            # Decode's barcode-space crop_width filter
+            decodeFilter = (table['x'].between(4, FRAME - 4)
+                            & table['y'].between(4, FRAME - 4)).to_numpy()
+            np.testing.assert_array_equal(
+                deduplicate.valid_box_mask(table, box, False), decodeFilter)
+
+    def test_needs_decode_crop_parameters(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = _DataSet(root)
+            _SyntheticDecode(ds, {}, 'Decode').save()
+            with self.assertRaisesRegex(ValueError,
+                                        'Decode has no preprocess_task'):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode',
+                         'crop_to_valid_box': True}, 'Dedup')
+
+    def test_task_drops_outside_before_linking(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds, decodeTask = self._dataset(root)
+            cropped = deduplicate.DeduplicateBarcodes(
+                ds, {'decode_task': 'BoxDecode', 'crop_to_valid_box': True,
+                     'xy_radius_px': 2.0, 'max_z_gap_um': 0.75}, 'Cropped')
+            cropped.save()
+            whole = deduplicate.DeduplicateBarcodes(
+                ds, {'decode_task': 'BoxDecode', 'xy_radius_px': 2.0,
+                     'max_z_gap_um': 0.75}, 'Whole')
+            whole.save()
+            for fov in ds.get_fovs():
+                decodeTask.run(fov)
+                cropped.run(fov)
+                whole.run(fov)
+
+            raw = decodeTask.get_barcode_database().get_barcodes(0)
+            inside = np.array(_BoxDecode.INSIDE[0])
+            got = cropped.get_barcode_database().get_barcodes(0)
+            want, _ = deduplicate.deduplicate_barcodes(
+                raw[inside], Z_UNIFORM, 2.0, 0.75, 'summed')
+            self.assertEqual(len(got), len(want))
+            np.testing.assert_array_equal(got['unique_id'], want['unique_id'])
+            # the pair at x 4.0 / 3.99 and the pair at x 58.0 / 58.01 would
+            # link; cropped first, each keeps one detection
+            self.assertEqual(sorted(got['n_detections'].tolist()),
+                             [1, 1, 1, 2])
+            self.assertEqual(
+                len(whole.get_barcode_database().get_barcodes(0)), 7)
+
+            summary = cropped.get_summary(0)
+            self.assertIs(summary['crop_to_valid_box'], True)
+            self.assertEqual(summary['valid_box'], [7, 55, 4, 58])
+            self.assertEqual(summary['n_decoded'], 10)
+            self.assertEqual(summary['n_detections'], 5)
+            self.assertEqual(summary['n_outside_valid_box'], 5)
+            self.assertEqual(summary['coding_outside_valid_box'], 3)
+            self.assertEqual(summary['blank_outside_valid_box'], 2)
+            summary = cropped.get_summary(1)
+            self.assertEqual(summary['valid_box'], [7, 57, 7, 57])
+            self.assertEqual((summary['n_decoded'], summary['n_detections'],
+                              summary['n_outside_valid_box']), (4, 2, 2))
+            summary = whole.get_summary(0)
+            self.assertEqual((summary['n_decoded'], summary['n_detections']),
+                             (10, 10))
+            self.assertNotIn('n_outside_valid_box', summary)
+
+    def test_image_space_decode_drops_nothing(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds, decodeTask = self._dataset(root, _ImageSpaceBoxDecode)
+            self.assertIs(decodeTask.parameters['crop_in_image_space'], True)
+            cropped = deduplicate.DeduplicateBarcodes(
+                ds, {'decode_task': 'BoxDecode', 'crop_to_valid_box': True},
+                'Cropped')
+            cropped.save()
+            for fov in ds.get_fovs():
+                decodeTask.run(fov)
+                cropped.run(fov)
+                summary = cropped.get_summary(fov)
+                self.assertEqual(summary['valid_box'],
+                                 list(_Warp.EXPECTED[fov]))
+                self.assertEqual(
+                    (summary['n_decoded'], summary['n_detections'],
+                     summary['n_outside_valid_box']), (3, 3, 0))
 
 
 class AreaEdgeTests(unittest.TestCase):

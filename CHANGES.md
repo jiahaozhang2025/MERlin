@@ -69,8 +69,11 @@ major change was made.
 - `DeduplicateBarcodes`: New task between Decode and the adaptive threshold.
   It merges a molecule's detections on nearby z planes (same barcode,
   `xy_radius_px`, `max_z_gap_um`) into one row, so the misidentification
-  target holds per molecule; `molecule_features` sets how a molecule's
-  intensity, distance and area are formed.
+  target holds per molecule; `molecule_features` (`summed`, the default, or
+  `brightest`) sets how a molecule's intensity, distance and area are formed.
+- `crop_to_valid_box` (`DeduplicateBarcodes`, off by default): Drops the
+  detections outside the decode task's valid region (`compute_crop_bounds`),
+  which Decode itself applies only with `crop_in_image_space`.
 - `GenerateMoleculeAdaptiveThreshold`: The adaptive threshold with area bin
   edges taken from the molecules' areas (`area_bin_edges`), as summed areas
   run past the default edges.
