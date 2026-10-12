@@ -77,8 +77,33 @@ misidentification rate and all of `Segment`.
 - `per_z_slice_num_threads` x `stack_num_threads` should stay near the number
   of allocated cores.
 
+## Preprocess
+
+- Camera hot pixels: add a `HotPixelMap` task and set `hot_pixel_task` to its
+  name in `Preprocess`; the pixels are then replaced in every raw frame before
+  the warp (the registration is unchanged):
+
+      {"task": "HotPixelMap", "module": "merlin.analysis.hotpixel",
+       "analysis_name": "HotPixels", "parameters": {}}
+
+  With more than one camera, list each camera's colours in `camera_colors`.
+  `hot_pixels.csv` lists the pixels found.
+
 ## Decode
 
+- `crop_in_image_space` with `crop_width` 50 (the default; was 100) and
+  `adaptive_crop`: only each FOV's crop region is decoded, the fixed crop
+  widened on edges where the warp leaves missing data, and x, y stay in the
+  full frame. At 50 px, neighbouring FOVs' decoded regions overlap by more
+  than a cell at the usual ~10 % FOV overlap; keep `crop_width` at most
+  (overlap - cell diameter) / 2.
+- `adaptive_crop_channels` `codebook` (the default): with two libraries
+  registered by one `PolyWarp`, each decode is cropped by its own bits'
+  channels only.
+- Give every `Optimize` task the same `crop_width`, `adaptive_crop`,
+  `adaptive_crop_channels` and `adaptive_edge_margin` as `Decode`; the scale
+  factors are then measured on the pixels Decode decodes
+  (`scale_factor_region` `crop`, the default).
 - `per_z_slice_num_threads` is the setting that scales, because z planes are
   independent. Leave `torch_num_threads` null so torch is pinned to one thread
   per plane while planes run in parallel.
@@ -95,3 +120,23 @@ model suited to the tissue.
 `AdaptiveFilterBarcodes` targets a blank-based misidentification rate. The blank
 rate also falls when calls concentrate on a few abundant genes, so check the
 share of the top genes before reading a low rate as good decoding.
+
+A deep stack images most molecules on several planes, and `Decode` calls each
+of them once per plane. For the target to hold per molecule, merge those
+detections before the threshold:
+
+    Decode ─> Dedup ─> MoleculeThreshold ─> FilterBarcodes
+
+    {"task": "DeduplicateBarcodes", "module": "merlin.analysis.deduplicate",
+     "analysis_name": "Dedup", "parameters": {"decode_task": "Decode"}}
+    {"task": "GenerateMoleculeAdaptiveThreshold",
+     "module": "merlin.analysis.deduplicate",
+     "analysis_name": "MoleculeThreshold",
+     "parameters": {"decode_task": "Dedup", "run_after_task": "Dedup", ...}}
+
+`MoleculeThreshold` takes `AdaptiveThreshold`'s settings, and
+`FilterBarcodes` takes `"decode_task": "Dedup"` and
+`"adaptive_task": "MoleculeThreshold"`. Set `remove_z_duplicated_barcodes`
+false in `Decode` (it would delete detections before they are merged).
+`max_z_gap_um` (default 0.75) must be at least the plane spacing; at twice
+the spacing or more, a molecule also bridges one plane it was not called on.

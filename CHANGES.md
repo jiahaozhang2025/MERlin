@@ -15,6 +15,15 @@ major change was made.
   matrix multiplication to control memory use.
 - `softmax_temperature`: Controls optional softmax top-1 probabilities for
   machine-learning and confidence-based workflows.
+- `crop_in_image_space` (default true): Cuts each FOV to its crop region before
+  decoding, so pixels outside are never decoded; barcode x, y are written in
+  the full frame (the crop corner is added back). Off: the whole frame is
+  decoded and only `crop_width` is filtered.
+- `crop_width`: One integer for every edge or `[top, bottom, left, right]`;
+  each edge is cropped by max(its `crop_width`, its adaptive margin). Default
+  50 px (was 100), so neighbouring FOVs' decoded regions overlap by more than a
+  cell; datasets generated with the old default must pin 100 before
+  regenerating.
 - `adaptive_crop`: Defaults to excluding each FOV's unaligned warp margins so
   invalid image regions do not contaminate barcode extraction; the margins come
   from the warp's corner displacements, so rotated transforms are covered.
@@ -25,17 +34,34 @@ major change was made.
   that distance of an edge whose crop the adaptive margin set (missing data
   just outside), where the cut leaves molecule fragments; edges set by the
   fixed `crop_width` are left alone.
+- `crop_bounds_<fov>.json`: Decode records each FOV's crop (bounds, fixed and
+  adaptive margins, channels, the edge margin and the kept barcode bounds);
+  read with `get_crop_record`, `get_crop_bounds` or `get_crop_bounds_table`.
+- Decode tasks saved before `adaptive_crop_channels` and `adaptive_edge_margin`
+  load with their defaults, so a fragment rerun uses the new region; an
+  analysis that must match an older decode sets `all` and 0.
 
 ### Registration (`merlin/analysis/warp.py`)
 
 - `FiducialPolynomialWarp3D` (replaces `FiducialCorrelationWarp3D`): Measures
   each round's z and xy drift plane by plane on the fiducial bead stack and fits
   them as polynomials in depth.
+- `FiducialRoundRotation` (new task): One in-plane angle per imaging round,
+  shared by all FOVs, for PolyWarp's `rotation_task`; the only rotation
+  estimate. Per FOV and fiducial stack, a rigid angle on one shallow bead plane
+  (`measure_plane`): coarse shift, depth match, snr-weighted tile fit
+  (`rotation_tiles`, `rotation_tile_min_snr`, `rotation_min_tiles`),
+  `refine_passes` residual passes; angles beyond `rotation_max_degrees` are
+  untrusted, and a scale is recorded as a diagnostic only. `finalize()` takes
+  the median over trusted FOVs and flags FOVs that are untrusted or deviate
+  (`deviation_min_degrees`, `deviation_robust_sd`): `round_rotation.csv`,
+  `fov_rotation.csv`, `first_plane_rotation_<fov>.csv`.
 - `CrossFOVCompositeWarp` (from Lida Cheng): Fills the margins that stage drift
   moved out of a FOV's frame with the same tissue imaged by the neighbouring FOV.
   `fill_threshold` (planes shifted by at most this are not filled) defaults to
   the decode `crop_width` default, 50 (was 100); keep it at most the
-  `crop_width` of the tasks that decode the warp's images.
+  `crop_width` of the tasks that decode the warp's images. A PolyWarp with
+  `rotation_task` is refused.
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
@@ -53,6 +79,13 @@ major change was made.
   backgrounds from the preprocessed images alone, without decoding.
 - Per-bit bias freeze (`bias_freeze_reference`): Rolls back a bit's scale-factor
   update when it moves the bit's gene-abundance bias further from a reference.
+- `scale_factor_region` (default `crop`): The scale factors, backgrounds,
+  barcode counts, stored barcodes and chromatic samples come only from the
+  decoded pixels inside each FOV's crop region, as an image-space Decode keeps
+  them. `full_frame` is the previous behaviour (every decoded pixel; barcodes
+  kept by centroid, ends included, 1 px wider than Decode's region). Tasks
+  saved before the option load as `crop`, so rerun fragments of an older run
+  would mix the two; an analysis that must match one pins `full_frame`.
 
 ### Preprocess (`merlin/analysis/preprocess.py`)
 
@@ -89,13 +122,17 @@ major change was made.
   `xy_radius_px`, `max_z_gap_um`) into one row, so the misidentification
   target holds per molecule; `molecule_features` (`summed`, the default, or
   `brightest`) sets how a molecule's intensity, distance and area are formed.
+  The row keeps the brightest detection's barcode and plane and adds
+  `n_detections`, `n_planes`, `area_sum` and depths in um (`z_um`, the
+  centroid; `z_first_um` to `z_last_um`, the span).
 - `crop_to_valid_box` (`DeduplicateBarcodes`, off by default): Drops the
   detections outside the decode task's recorded per-codebook region
   (`Decode.get_crop_bounds`), which Decode itself applies only with
   `crop_in_image_space`.
 - `GenerateMoleculeAdaptiveThreshold`: The adaptive threshold with area bin
-  edges taken from the molecules' areas (`area_bin_edges`), as summed areas
-  run past the default edges.
+  edges taken from the molecules' areas, as summed areas run past the default
+  edges: `area_bin_edges` `equal_count` (default; about equal molecule counts
+  per bin, `area_bins` bins kept) or `unit` (the base edges).
 
 ### Example images (Preprocess, Decode, adaptive filters; `merlin/util/imagesample.py`)
 
@@ -130,7 +167,9 @@ major change was made.
 ### Decode (`merlin/analysis/decode.py`, `merlin/util/decoding.py`)
 
 - `tiling_factor`: Divides large images into overlapping tiles to reduce peak
-  decoding memory.
+  decoding memory. With `crop_in_image_space` the tiled path keeps every
+  barcode and adds the crop corner, as the untiled path does (it filtered
+  `crop_width` again and offset the global coordinates by `crop_width`).
 - `tiling_overlap`: Preserves barcodes crossing tile boundaries and supports
   overlap-duplicate removal.
 - `tiling_num_threads`: Decodes the tiles of one z plane concurrently.
@@ -146,16 +185,6 @@ major change was made.
 - `write_unique_id_images`: Writes decoded images with globally unique barcode
   labels.
 - `write_decoded_z`: Selects z planes for decoded-image output.
-- `crop_in_image_space`: Crops each FOV to its crop bounds before decoding, so
-  pixels outside are never decoded; barcode x, y are written in the full frame.
-- `crop_width`: One integer for every edge or `[top, bottom, left, right]`;
-  each edge is cropped by max(its `crop_width`, its adaptive margin). Default
-  50 px (was 100), so neighbouring FOVs' decoded regions overlap by more than a
-  cell; datasets generated with the old default must pin 100 before
-  regenerating.
-- `crop_bounds_<fov>.json`: Decode records each FOV's crop (bounds, fixed and
-  adaptive margins, channels, the edge margin and the kept barcode bounds);
-  read with `get_crop_record`, `get_crop_bounds` or `get_crop_bounds_table`.
 - `crop_offset`: The crop corner `(colStart, rowStart)`, added to x, y and the
   global coordinates after the edge filter.
 - Edge filter: Compares x with the image width and y with its height (they were
@@ -170,15 +199,10 @@ major change was made.
 ### Optimize (`merlin/analysis/optimize.py`)
 
 - `adaptive_crop`, `adaptive_crop_channels` (default `codebook`), `crop_width`
-  (default 50, was 100; per edge): The FOV's crop region, the same
-  per-codebook region Decode computes; recorded per FOV
+  (default 50, was 100; per edge), `adaptive_edge_margin` (default 2): The
+  FOV's crop region for `scale_factor_region`, computed as Decode computes it
+  (give both tasks the same values); recorded per FOV
   (`crop_bounds_<fov>.json`).
-- `scale_factor_region` (default `crop`): The scale factors, backgrounds,
-  barcode counts, stored barcodes and chromatic samples come only from the
-  decoded pixels inside that region, as an image-space Decode keeps them
-  (`adaptive_edge_margin`, default 2, as Decode's). `full_frame` is the
-  previous behaviour (every decoded pixel; barcodes kept by centroid, ends
-  included, 1 px wider than Decode's region); pin it to reproduce older runs.
 - Chromatic samples on raw-warped images (`chromatic_on_preprocessed` off):
   Get the preprocess task's camera hot-pixel correction (`hot_pixel_task`).
 - `OptimizeIterationFOV`: No longer fails in `extract_refactors`
@@ -302,15 +326,6 @@ major change was made.
     QC outputs.
   - `stack_num_threads`, `per_z_slice_num_threads`, `plane_cache_size`:
     Concurrency and memory.
-- `FiducialRoundRotation` (new task): One in-plane angle per round, shared by
-  all FOVs, for `rotation_task`. Per FOV and fiducial stack, a rigid angle on
-  one shallow bead plane (`measure_plane`): coarse shift, depth match,
-  snr-weighted tile fit (`rotation_tiles`, `rotation_tile_min_snr`,
-  `rotation_min_tiles`), `refine_passes` residual passes; a scale is recorded
-  as a diagnostic only. `finalize()` takes the median over trusted FOVs and
-  flags FOVs that are untrusted or deviate (`deviation_min_degrees`,
-  `deviation_robust_sd`): `round_rotation.csv`, `fov_rotation.csv`,
-  `first_plane_rotation_<fov>.csv`.
 
 ### Segmentation (`merlin/analysis/segment.py`, `merlin/util/spatialfeature.py`)
 
@@ -368,6 +383,8 @@ major change was made.
   applies their angle) but refuses to run.
 - Removed: PolyWarp's `affine_correction` (per-FOV linear part) and its
   `affine_*` options; a task.json carrying `affine_*` keys is no longer supported.
+- More tests: molecule deduplication and its area bins, camera hot pixels, the
+  image-space and tiled decode crops, and Optimize's crop region.
 - `-i`: Accepts a fragment range (`0-25`) or list (`3,8,11`), run in one process.
 - snakemake: Imported only when running a whole analysis with snakemake; an
   optional extra.
