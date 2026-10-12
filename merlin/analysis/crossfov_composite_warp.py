@@ -17,7 +17,8 @@ CrossFOVCompositeWarp is a warp task layered on top of a finished PolyWarp task:
   * get_aligned_image(fov, ch, z): the PolyWarp own-FOV aligned plane, with the
     pixels the own warp could not sample (outside the raw frame) replaced by the
     neighbour's own-registered plane, shifted by the link (xy) and resampled by
-    the link dz. Rounds whose shift is inside the fixed crop_width are left alone.
+    the link dz. Planes whose shift is at most fill_threshold (default: the decode
+    tasks' default crop_width, so inside their fixed crop) are left alone.
   * get_transformation(fov, ...): the transforms Decode's adaptive crop reads,
     reduced to the margins that could NOT be filled (no neighbour / failed link),
     so decoding covers everything the composite covers and nothing more.
@@ -38,6 +39,7 @@ import numpy as np
 import pandas as pd
 from skimage import transform
 
+from merlin.analysis import decode
 from merlin.analysis import warp
 from merlin.util import aberration
 
@@ -65,8 +67,17 @@ class CrossFOVCompositeWarp(warp.FiducialPolynomialWarp3D):
         p.setdefault('min_link_snr', 15.0)
         p.setdefault('max_link_spread', 3.0)      # px, IQR of per-plane offsets
         p.setdefault('max_link_dz_spread', 1.0)   # um
-        # margins at or below this (px) are handled by crop_width anyway: no fill
-        p.setdefault('fill_threshold', 100)
+        # px: planes whose shift (and so missing-data margin) is at most this
+        # are not filled. Such a margin lies inside the fixed crop_width of
+        # the decode and optimize tasks reading this warp only when
+        # fill_threshold <= their crop_width; a larger value leaves margins
+        # between the two unfilled, and the adaptive crop then cuts them
+        # (nothing invalid is decoded, but the tissue there is lost). A warp
+        # cannot see the tasks that read it, so the default follows their
+        # crop_width default (decode.DEFAULT_CROP_WIDTH, 50; was 100 with
+        # crop_width 100): set it to the smallest crop_width edge of those
+        # tasks when they set crop_width.
+        p.setdefault('fill_threshold', decode.DEFAULT_CROP_WIDTH)
         # neighbour frames closer than this fraction of a frame are candidates
         p.setdefault('neighbor_search_frames', 1.6)
         p.setdefault('write_composite_fovs', [])

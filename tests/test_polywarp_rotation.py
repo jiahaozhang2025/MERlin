@@ -24,6 +24,7 @@ from skimage import transform
 
 from merlin.analysis.warp import FiducialPolynomialWarp3D
 from merlin.analysis.decode import compute_crop_bounds
+from merlin.analysis.decode import DEFAULT_CROP_WIDTH
 from merlin.analysis.crossfov_composite_warp import CrossFOVCompositeWarp
 
 SHAPE = (512, 512)
@@ -411,6 +412,47 @@ class CompositeWarpRefusalTests(unittest.TestCase):
             self.composite(rotation_task='RoundRot')._polywarp()
         with self.assertRaises(ValueError):
             self.composite(rotation_correction=True)._polywarp()
+
+
+class CompositeFillThresholdTests(unittest.TestCase):
+    """fill_threshold defaults to the decode tasks' default crop_width:
+    margins at or below it are left to the fixed crop, wider ones are filled
+    (and so not cropped) when a neighbour covers that side."""
+
+    def composite(self, **parameters):
+        dataSet = _DataSet()
+        make(dataSet)
+        task = CrossFOVCompositeWarp(
+            dataSet, dict({'polywarp_task': 'PolyWarp'}, **parameters),
+            'Composite')
+        # an OK link fills the right side; no diagonal neighbour
+        task._fill_sides = lambda fov: ({'right': True, 'left': False,
+                                         'bottom': False, 'top': False},
+                                        set())
+        return task
+
+    def test_default_follows_crop_width(self):
+        task = self.composite()
+        self.assertEqual(task.parameters['fill_threshold'],
+                         DEFAULT_CROP_WIDTH)
+        self.assertEqual(DEFAULT_CROP_WIDTH, 50)
+        self.assertEqual(self.composite(fill_threshold=100)
+                         .parameters['fill_threshold'], 100)
+
+    def test_margins_beyond_the_crop_are_filled(self):
+        # a 60 px right margin: wider than the default 50 px crop, so it is
+        # filled and drops out of the adaptive crop; with the old default
+        # 100 it was left to the adaptive crop, which cut 60 px instead of 50
+        self.assertEqual(self.composite()._residual_margins(0, 0.0, 60.0),
+                         (0.0, 0.0))
+        self.assertEqual(self.composite(fill_threshold=100)
+                         ._residual_margins(0, 0.0, 60.0), (0.0, 60.0))
+        # at or below the threshold nothing is filled
+        self.assertEqual(self.composite()._residual_margins(0, 0.0, 50.0),
+                         (0.0, 50.0))
+        # a side no neighbour covers keeps its margin
+        self.assertEqual(self.composite()._residual_margins(0, 0.0, -60.0),
+                         (0.0, -60.0))
 
 
 if __name__ == '__main__':
