@@ -21,6 +21,13 @@ from merlin.util import aberration
 from merlin.data.codebook import Codebook
 
 
+# scale_factor_region: where an iteration takes its scale factors,
+# backgrounds, barcode counts and stored barcodes from. 'crop' = the fov's
+# crop region, as an image-space Decode decodes it; 'full_frame' = the whole
+# decoded frame (the behaviour before). See OptimizeIteration.__init__.
+SCALE_FACTOR_REGIONS = ('crop', 'full_frame')
+
+
 class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
 
     """
@@ -53,7 +60,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         # fixed crop as Decode's crop_width (default 50, was 100; see the note
         # there).
         if 'crop_width' not in self.parameters:
-            self.parameters['crop_width'] = 50
+            self.parameters['crop_width'] = decode.DEFAULT_CROP_WIDTH
         decode.crop_widths(self.parameters['crop_width'])  # refuse a bad value
         # See the matching note in decode.Decode: all image filtering is done by
         # the preprocess task, so Optimize decodes exactly the pixels Decode
@@ -110,17 +117,12 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         # centroids.
         if 'chromatic_on_preprocessed' not in self.parameters:
             self.parameters['chromatic_on_preprocessed'] = False
-        # Optimize decodes the FULL frame and keeps the barcodes whose
-        # centroid lies in the fov's crop region (barcode space, not image
-        # space; ends included): crop_width per edge, and with adaptive_crop
+        # The fov's crop region: crop_width per edge, and with adaptive_crop
         # each edge widened to the strip the warp leaves without data, over
-        # the data channels adaptive_crop_channels names -- the region Decode
-        # computes for the same codebook and settings
-        # (decode.task_crop_bounds). The region selects the barcodes that are
-        # stored and that the chromatic samples are measured on; it is
-        # recorded per fov (crop_bounds_<fov>.json, get_crop_record). The
-        # scale factors, backgrounds and barcode counts (extract_refactors)
-        # are taken from every decoded pixel of the frame, as before.
+        # the data channels adaptive_crop_channels names -- the region an
+        # image-space Decode (crop_in_image_space, its default) computes for
+        # the same codebook and settings (decode.task_crop_bounds). Recorded
+        # per fov (crop_bounds_<fov>.json, get_crop_record).
         if 'adaptive_crop' not in self.parameters:
             self.parameters['adaptive_crop'] = True
         # 'codebook' (the codebook's own bits' data channels, as Decode) or
@@ -129,6 +131,39 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             self.parameters['adaptive_crop_channels'] = 'codebook'
         decode.check_adaptive_crop_channels(
             self.parameters['adaptive_crop_channels'])
+        # What the region restricts. The frame is always decoded whole and the
+        # decoded images stay full-frame.
+        # 'crop' (default): the scale factors, backgrounds and barcode counts
+        #   (extract_refactors), the stored barcodes and the chromatic samples
+        #   measured on them all come from the decoded pixels inside the
+        #   region only (rows rowStart .. rowEnd - 1, cols colStart ..
+        #   colEnd - 1, the slice Decode cuts), labelled inside it as Decode
+        #   labels its cropped image, so a molecule cut by the edge keeps its
+        #   inside part; adaptive_edge_margin then drops the components whose
+        #   centroid lies near an edge the adaptive margin set, from all of
+        #   them. A pixel's call depends on its own trace only, so this is
+        #   what decoding the region alone gives. Without it the strip the
+        #   warp leaves without data, where a pixel's trace lacks some bits,
+        #   fed the scale factors although Decode never decodes it.
+        # 'full_frame' (the behaviour before): extract_refactors on every
+        #   decoded pixel of the frame, the strip included; the stored barcodes
+        #   are the whole-frame components whose centroid lies in the region,
+        #   ends included (1 px wider than Decode's at the bottom and right).
+        #   Pin it to reproduce an optimize run before the option existed.
+        if 'scale_factor_region' not in self.parameters:
+            self.parameters['scale_factor_region'] = 'crop'
+        if self.parameters['scale_factor_region'] not in SCALE_FACTOR_REGIONS:
+            raise ValueError('scale_factor_region must be one of %s; got %r'
+                             % (SCALE_FACTOR_REGIONS,
+                                self.parameters['scale_factor_region']))
+        # As Decode's adaptive_edge_margin (same default), for
+        # scale_factor_region 'crop': the components whose centroid lies less
+        # than this many px from an edge whose bound the adaptive margin set
+        # (decode.margin_set_edges) are left out. 0 = off; unused with
+        # 'full_frame'.
+        if 'adaptive_edge_margin' not in self.parameters:
+            self.parameters['adaptive_edge_margin'] = 2
+        decode.check_edge_margin(self.parameters['adaptive_edge_margin'])
         if 'random_seed' in self.parameters:
             # set the random seed
             # make sure to set a different one for each optimize
@@ -475,13 +510,79 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
 
     def _crop_barcodes(self, barcodes: pandas.DataFrame, fov: int
                        ) -> pandas.DataFrame:
-        """The barcodes whose centroid lies in fov's crop region, ends
-        included: colStart <= x <= colEnd and rowStart <= y <= rowEnd (x a
-        column, y a row; without adaptive_crop this is exactly the
-        crop_width filter of extract_barcodes_with_index)."""
+        """scale_factor_region 'full_frame': the barcodes whose centroid lies
+        in fov's crop region, ends included: colStart <= x <= colEnd and
+        rowStart <= y <= rowEnd (x a column, y a row; without adaptive_crop
+        this is exactly the crop_width filter of
+        extract_barcodes_with_index)."""
         r0, r1, c0, c1 = self._crop_bounds(fov)
         return barcodes[barcodes['x'].between(c0, c1)
                         & barcodes['y'].between(r0, r1)]
+
+    def _edge_margin_edges(self, fov: int):
+        """(top, bottom, left, right) edges of fov's region where
+        adaptive_edge_margin applies: with scale_factor_region 'crop', those
+        whose bound the adaptive margin set (decode.margin_set_edges, as an
+        image-space Decode); none with 'full_frame' or a margin of 0."""
+        if self.parameters['scale_factor_region'] != 'crop' \
+                or not self.parameters['adaptive_edge_margin']:
+            return (False, False, False, False)
+        return decode.margin_set_edges(
+            self.parameters['crop_width'],
+            decode.task_adaptive_margins(self, fov))
+
+    def _refactors_and_barcodes(self, decoder, di, pm, npt, d, fov: int,
+                                zIndex: int, areaThreshold):
+        """(refactors, backgrounds, barcodesSeen, barcodes) of one decoded
+        frame (di, pm, npt, d: the full-frame outputs of decode_pixels) under
+        scale_factor_region.
+
+        'full_frame': extract_refactors on the whole frame; the barcodes are
+        the whole-frame components with centroid in the region, ends
+        included (_crop_barcodes). The previous code, unchanged.
+
+        'crop': both from the decoded pixels in [rowStart:rowEnd,
+        colStart:colEnd] only, labelled inside that window (as Decode's
+        image-space crop), x, y full-frame; the components adaptive_edge_margin
+        drops (by centroid, decode.edge_margin_mask) are removed from the
+        barcodes and set to undecoded (-1) in the window extract_refactors
+        reads, so they count nowhere. di itself is never modified.
+        """
+        extractBackgrounds = self.parameters['optimize_background']
+        if self.parameters['scale_factor_region'] == 'full_frame':
+            refactors, backgrounds, barcodesSeen = decoder.extract_refactors(
+                di, pm, npt, extractBackgrounds=extractBackgrounds)
+            barcodes = self._crop_barcodes(decoder.extract_barcodes_with_index(
+                di, pm, npt, d, fov, 0, zIndex, minimumArea=areaThreshold),
+                fov)
+            return refactors, backgrounds, barcodesSeen, barcodes
+        r0, r1, c0, c1 = self._crop_bounds(fov)
+        if r1 <= r0 or c1 <= c0:
+            raise ValueError(
+                'fov %d: nothing left to optimize on, crop bounds (rowStart, '
+                'rowEnd, colStart, colEnd) = %s' % (fov, (r0, r1, c0, c1)))
+        windowDi = di[r0:r1, c0:c1]
+        windowPm = pm[r0:r1, c0:c1]
+        windowNpt = npt[:, r0:r1, c0:c1]
+        barcodes, labels = decoder.extract_barcodes_with_index(
+            windowDi, windowPm, windowNpt, d[r0:r1, c0:c1], fov, 0, zIndex,
+            minimumArea=areaThreshold, outputLabels=True,
+            crop_offset=(c0, r0))
+        edges = self._edge_margin_edges(fov)
+        if len(barcodes) and any(edges):
+            keep = decode.edge_margin_mask(
+                barcodes['x'].to_numpy(), barcodes['y'].to_numpy(),
+                (r0, r1, c0, c1), edges,
+                self.parameters['adaptive_edge_margin'])
+            if not keep.all():
+                dropped = barcodes['unique_id'].to_numpy()[~keep]
+                windowDi = windowDi.copy()      # a view of di: never write it
+                windowDi[np.isin(labels, dropped)] = -1
+                barcodes = barcodes[keep]
+        refactors, backgrounds, barcodesSeen = decoder.extract_refactors(
+            windowDi, windowPm, windowNpt,
+            extractBackgrounds=extractBackgrounds)
+        return refactors, backgrounds, barcodesSeen, barcodes
 
     def _crop_record(self, fov: int) -> dict:
         """What crop_bounds_<fov>.json holds; see get_crop_record."""
@@ -489,7 +590,7 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         channels = decode.task_crop_channels(self)
         margins = decode.task_adaptive_margins(self, fov)
         bounds = [int(b) for b in self._crop_bounds(fov)]
-        return {
+        record = {
             'fov': int(fov),
             'image_shape': [int(h), int(w)],
             'crop_in_image_space': False,
@@ -501,11 +602,27 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
             'data_channels': None if channels is None
             else [int(c) for c in channels],
             'adaptive_margin': None if margins is None else list(margins),
-            'crop_bounds': bounds,
-            'barcode_filter': list(bounds),
-            'barcode_bounds': list(bounds),
-            'scale_factors_from': 'full_frame',
-            'xy_frame': 'full_frame'}
+            'crop_bounds': bounds}
+        if self.parameters['scale_factor_region'] == 'full_frame':
+            # the record of the previous code, key for key
+            record.update({
+                'barcode_filter': list(bounds),
+                'barcode_bounds': list(bounds),
+                'scale_factors_from': 'full_frame',
+                'xy_frame': 'full_frame'})
+            return record
+        edges = self._edge_margin_edges(fov)
+        record.update({
+            'crop_in_image_space': True,
+            'barcode_filter': None,
+            'adaptive_edge_margin': int(
+                self.parameters['adaptive_edge_margin']),
+            'edge_margin_edges': [bool(e) for e in edges],
+            'barcode_bounds': [int(b) for b in decode.edge_margin_bounds(
+                bounds, edges, self.parameters['adaptive_edge_margin'])],
+            'scale_factors_from': 'crop',
+            'xy_frame': 'full_frame'})
+        return record
 
     def _save_crop_record(self, fov: int) -> None:
         # one file per fov; fragments that drew the same fov write the same
@@ -518,14 +635,26 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         """The crop region this iteration's fragments of fov used, or None
         if no fragment of fov ran with the record (or none has run).
 
-        As Decode.get_crop_record, for a full-frame decode: crop_bounds
-        [rowStart, rowEnd, colStart, colEnd] from compute_crop_bounds (each
-        edge max(crop_width [top, bottom, left, right], adaptive_margin over
-        the transformations of data_channels)); the barcodes kept are those
-        with rowStart <= y <= rowEnd and colStart <= x <= colEnd
-        (barcode_filter = barcode_bounds = crop_bounds, ends included).
-        scale_factors_from 'full_frame': the scale factors, backgrounds and
-        barcode counts are taken from every decoded pixel of the frame.
+        As Decode.get_crop_record: crop_bounds [rowStart, rowEnd, colStart,
+        colEnd] from compute_crop_bounds (each edge max(crop_width [top,
+        bottom, left, right], adaptive_margin over the transformations of
+        data_channels)); x, y full-frame (xy_frame).
+
+        scale_factors_from 'crop' (scale_factor_region 'crop'): as an
+        image-space Decode record (crop_in_image_space true, barcode_filter
+        null): the scale factors, backgrounds, barcode counts and stored
+        barcodes come from the decoded pixels rows rowStart .. rowEnd - 1,
+        cols colStart .. colEnd - 1, less the components within
+        adaptive_edge_margin px of the edges edge_margin_edges flags; the
+        stored barcodes have rowMin <= y <= rowMax and colMin <= x <= colMax
+        (barcode_bounds).
+
+        scale_factors_from 'full_frame' (the record of the code before the
+        option, crop_in_image_space false): the scale factors, backgrounds
+        and barcode counts are taken from every decoded pixel of the frame;
+        the barcodes kept are the whole-frame components with rowStart <= y
+        <= rowEnd and colStart <= x <= colEnd (barcode_filter =
+        barcode_bounds = crop_bounds, ends included).
         """
         try:
             return self.dataSet.load_json_analysis_result(
@@ -641,24 +770,21 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         
         t2 = time.time()
 
-        refactors, backgrounds, barcodesSeen = \
-            decoder.extract_refactors(
-                di, pm, npt, extractBackgrounds=self.parameters[
-                    'optimize_background'])
+        # The refactor inputs and the barcodes, from the fov's crop region
+        # (_crop_bounds, the region Decode computes for this codebook) or the
+        # whole frame, as scale_factor_region says; recorded per fov.
+        self._save_crop_record(int(fovIndex))
+        refactors, backgrounds, barcodesSeen, extracted = \
+            self._refactors_and_barcodes(decoder, di, pm, npt, d,
+                                         int(fovIndex), zIndex, areaThreshold)
 
         t3 = time.time()
 
         # TODO this saves the barcodes under fragment instead of fov
         # the barcodedb should be made more general
-        # The barcodes in the fov's crop region (_crop_bounds, the region
-        # Decode computes for this codebook), recorded per fov.
-        self._save_crop_record(int(fovIndex))
-        extracted = self._crop_barcodes(decoder.extract_barcodes_with_index(
-            di, pm, npt, d, fovIndex, 0, zIndex, minimumArea=areaThreshold),
-            int(fovIndex))
         self.get_barcode_database().write_barcodes(extracted,
                                                    fov=fragmentIndex)
-        
+
         t4 = time.time()
 
         self.dataSet.save_numpy_analysis_result(
@@ -705,8 +831,8 @@ class OptimizeIteration(decode.BarcodeSavingParallelAnalysisTask):
         print(f'optimize fragment {fragmentIndex} fov {fovIndex} zIndex {zIndex}')
         print(f'time fetching images: {t1-t0}')
         print(f'time decoding images: {t2-t1}')
-        print(f'time extracting refactors: {t3-t2}')
-        print(f'time extracing barcodes: {t4-t3}')
+        print(f'time extracting refactors and barcodes: {t3-t2}')
+        print(f'time writing barcodes: {t4-t3}')
         print(f'total time in optimize{fragmentIndex}: {t4-t0}')
 
     def _get_used_colors(self) -> List[str]:
@@ -1315,7 +1441,7 @@ class OptimizeIterationFOV(OptimizeIteration):
         if 'optimize_chromatic_correction' not in self.parameters:
             self.parameters['optimize_chromatic_correction'] = False
         if 'crop_width' not in self.parameters:
-            self.parameters['crop_width'] = 50
+            self.parameters['crop_width'] = decode.DEFAULT_CROP_WIDTH
         if 'distance_threshold' not in self.parameters:
             self.parameters['distance_threshold'] = 0.5176 # this is the default of decoder
             # maybe should make it bigger?
@@ -1375,17 +1501,15 @@ class OptimizeIterationFOV(OptimizeIteration):
             distanceThreshold=self.parameters['distance_threshold'],
             distanceMetric=self.parameters['distance_metric'])
 
-        refactors, backgrounds, barcodesSeen = \
-            decoder.extract_refactors(
-                di, pm, npt, extractBackgrounds=self.parameters[
-                    'optimize_background'])
+        # as OptimizeIteration: the crop region or the whole frame
+        # (scale_factor_region), recorded per fov
+        self._save_crop_record(int(fovIndex))
+        refactors, backgrounds, barcodesSeen, extracted = \
+            self._refactors_and_barcodes(decoder, di, pm, npt, d,
+                                         int(fovIndex), zIndex, areaThreshold)
 
         # TODO this saves the barcodes under fragment instead of fov
         # the barcodedb should be made more general
-        self._save_crop_record(int(fovIndex))
-        extracted = self._crop_barcodes(decoder.extract_barcodes_with_index(
-            di, pm, npt, d, fovIndex, 0, zIndex, minimumArea=areaThreshold),
-            int(fovIndex))
         self.get_barcode_database().write_barcodes(
             extracted, fov=fragmentIndex)
         self.dataSet.save_numpy_analysis_result(

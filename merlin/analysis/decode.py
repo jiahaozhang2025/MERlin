@@ -36,6 +36,11 @@ CROP_RECORD_NAME = 'crop_bounds'
 # (top, bottom, left, right) from crop_width: one integer or four.
 crop_widths = decoding.crop_widths
 
+# crop_width default (px per edge) of Decode and OptimizeIteration; see the
+# crop_width note in Decode.__init__. CrossFOVCompositeWarp's fill_threshold
+# defaults to it too.
+DEFAULT_CROP_WIDTH = 50
+
 
 def codebook_data_channels(dataSet, codebook) -> List[int]:
     """Data channels of a codebook's bits (looked up by readout name), in
@@ -306,7 +311,7 @@ class Decode(BarcodeSavingParallelAnalysisTask):
         # with 100 px on a 2048 px frame and the usual ~10 % overlap the two
         # decoded regions barely meet and seam cells are cut in both.
         if 'crop_width' not in self.parameters:
-            self.parameters['crop_width'] = 50
+            self.parameters['crop_width'] = DEFAULT_CROP_WIDTH
         crop_widths(self.parameters['crop_width'])     # refuse a bad value
         if 'crop_in_image_space' not in self.parameters:
             # When True, the image is cropped to the fov's crop bounds

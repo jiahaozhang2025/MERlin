@@ -182,7 +182,12 @@ instead. Per-FOV registration can only mark that strip invalid, so its molecules
 are lost even though the pixels exist. This task links each FOV to its
 neighbours through their round-0 beads, measured with a self-test. It fills the
 invalid strip with the neighbour's registered image and tells Decode to crop
-only what still could not be filled.
+only what still could not be filled. Planes shifted by at most `fill_threshold`
+are not filled, since the fixed crop removes such a margin anyway; that only
+holds while `fill_threshold` is no larger than the decode's `crop_width`, so it
+defaults to the decode default (50 px). The warp cannot read the crop of the
+tasks that use it, so a different `crop_width` needs the matching
+`fill_threshold`.
 
 ## Optimize
 
@@ -206,12 +211,24 @@ faster, but not equivalent: preprocessing clips negative values, which shifts
 spot centroids slightly. It is therefore off by default. The warped images it
 loads instead get the preprocess task's hot-pixel correction, if it has one.
 
-**Crop region**. Optimize decodes the whole frame and keeps the barcodes whose
-centroid lies in the FOV's crop region, the same per-codebook region (fixed
-crop per edge, widened by the adaptive margin) that Decode uses. These
-barcodes are the chromatic samples and the stored table. The scale factors,
-backgrounds and barcode counts are measured on every decoded pixel of the
-frame.
+**Crop region** (`scale_factor_region` `crop`). Decode applies the scale
+factors only inside each FOV's crop region, the per-codebook region (fixed
+crop per edge, widened by the adaptive margin) it decodes. Optimize now
+measures them on exactly those pixels. It still decodes the whole frame, but
+it cuts the decoded image to the region and labels the molecules inside it,
+as an image-space Decode does: a molecule on the edge keeps only its inside
+part, and molecules within `adaptive_edge_margin` of an edge the adaptive
+margin set are left out. The scale factors, backgrounds and barcode counts,
+the stored barcodes and the chromatic samples measured on them all come from
+what is left.
+
+Before, only the stored barcodes were taken from the region (by centroid,
+whole molecules, the last row and column included), and the scale factors,
+backgrounds and counts came from every decoded pixel of the frame. That
+included the strip the warp leaves without data, where a pixel's trace lacks
+at least one bit and Decode never looks. How much of that strip entered the
+estimate depended on each FOV's drift, not on the signal. `full_frame` keeps
+that behaviour, so older runs can be reproduced.
 
 **`chromatic_threads`**. When `chromatic_from_fragments` is off and the
 correction is fitted in one job, this parallelises that job over FOV/z planes.

@@ -33,6 +33,9 @@ major change was made.
   them as polynomials in depth.
 - `CrossFOVCompositeWarp` (from Lida Cheng): Fills the margins that stage drift
   moved out of a FOV's frame with the same tissue imaged by the neighbouring FOV.
+  `fill_threshold` (planes shifted by at most this are not filled) defaults to
+  the decode `crop_width` default, 50 (was 100); keep it at most the
+  `crop_width` of the tasks that decode the warp's images.
 
 ### Optimize (`merlin/analysis/optimize.py`)
 
@@ -167,10 +170,15 @@ major change was made.
 ### Optimize (`merlin/analysis/optimize.py`)
 
 - `adaptive_crop`, `adaptive_crop_channels` (default `codebook`), `crop_width`
-  (default 50, was 100; per edge): The barcodes kept, and the chromatic samples
-  measured on them, are those in the FOV's crop region, the same per-codebook
-  region Decode computes; recorded per FOV (`crop_bounds_<fov>.json`). The
-  scale factors, backgrounds and barcode counts use every decoded pixel.
+  (default 50, was 100; per edge): The FOV's crop region, the same
+  per-codebook region Decode computes; recorded per FOV
+  (`crop_bounds_<fov>.json`).
+- `scale_factor_region` (default `crop`): The scale factors, backgrounds,
+  barcode counts, stored barcodes and chromatic samples come only from the
+  decoded pixels inside that region, as an image-space Decode keeps them
+  (`adaptive_edge_margin`, default 2, as Decode's). `full_frame` is the
+  previous behaviour (every decoded pixel; barcodes kept by centroid, ends
+  included, 1 px wider than Decode's region); pin it to reproduce older runs.
 - Chromatic samples on raw-warped images (`chromatic_on_preprocessed` off):
   Get the preprocess task's camera hot-pixel correction (`hot_pixel_task`).
 - `OptimizeIterationFOV`: No longer fails in `extract_refactors`
