@@ -8,7 +8,7 @@
     "CombineBoundaries -> RefineCells feeding Partition.",
     "Dependencies are by analysis_name, so rename a task and its dependents too.",
     "Only the PolyWarp settings here were measured on the dataset this came from;",
-    "the rest are working defaults to adapt. See README.md."
+    "the rest are working defaults to adapt. See thick_tissue_confocal.md."
   ],
   "analysis_tasks": [
     {
@@ -22,7 +22,7 @@
       "task": "FiducialPolynomialWarp3D",
       "module": "merlin.analysis.warp",
       "analysis_name": "PolyWarp",
-      "_comment": "Registration. Registers EVERY channel the dataorganization describes, so a protein channel on a late round needs only a row of its own -- no standalone offset script. See README for what each rigid_* setting is for.",
+      "_comment": "Registration. Registers EVERY channel the dataorganization describes, so a protein channel on a late round needs only a row of its own -- no standalone offset script. See thick_tissue_confocal.md for what each rigid_* setting is for.",
       "parameters": {
         "highpass_sigma": 3,
         "median_filter": true,
@@ -83,7 +83,7 @@
         "fov_per_iteration": 50,
         "area_threshold": 4,
         "distance_threshold": 0.5176,
-        "crop_width": 100,
+        "crop_width": 50,
         "adaptive_crop": true,
         "optimize_background": false,
         "optimize_chromatic_correction": false,
@@ -103,7 +103,7 @@
         "fov_per_iteration": 50,
         "area_threshold": 4,
         "distance_threshold": 0.5176,
-        "crop_width": 100,
+        "crop_width": 50,
         "adaptive_crop": true,
         "optimize_background": false,
         "optimize_chromatic_correction": false,
@@ -124,7 +124,7 @@
         "fov_per_iteration": 50,
         "area_threshold": 4,
         "distance_threshold": 0.5176,
-        "crop_width": 100,
+        "crop_width": 50,
         "adaptive_crop": true,
         "optimize_background": false,
         "optimize_chromatic_correction": false,
@@ -143,7 +143,7 @@
         "preprocess_task": "Preprocess",
         "optimize_task": "Optimize3",
         "global_align_task": "GlobalAlign",
-        "crop_width": 100,
+        "crop_width": 50,
         "crop_in_image_space": true,
         "adaptive_crop": true,
         "distance_threshold": 0.5167,

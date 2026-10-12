@@ -1,7 +1,8 @@
 # Detailed walkthrough of the major changes
 
 Why each major change in [CHANGES.md](CHANGES.md) was made, compared with the
-`gpu_decoding` baseline. Minor changes are self-explanatory and listed there only.
+`gpu_decoding` baseline, and how related options work together. Minor changes
+are self-explanatory and listed there only.
 
 ## Decode
 
@@ -32,7 +33,9 @@ FOV, which is too little where the shift is large (empty pixels get decoded) and
 too much where it is small (valid pixels are thrown away). `adaptive_crop`
 reads each FOV's own transformations and excludes exactly its invalid region.
 Each edge is cropped by the larger of the fixed `crop_width` and that edge's
-invalid margin, not their sum, and `crop_width` can differ per edge.
+invalid margin, not their sum, and `crop_width` can differ per edge. The
+margin is taken from how far the warp moves the frame's four corners, so a
+registration with a rotation is covered as well as a pure shift.
 
 Only the decode codebook's own bits enter a pixel's call, so only their
 missing data can corrupt it: the margin is taken over that codebook's data
@@ -41,14 +44,28 @@ library or a stain uses can drift further; counting them would cut pixels
 where every bit of this codebook is valid. Two libraries registered with one
 warp task therefore get different crops.
 
-With `crop_in_image_space` the image is cut to that region before decoding,
-so the invalid strip is never decoded. (Without it the whole frame is decoded
-and only `crop_width` is filtered afterwards, so barcodes from the strip are
-kept.) Barcode x, y are written in the full frame (the crop
-corner is added back), the same frame as segmentation and the stage
-positions, and each FOV's crop is saved (`crop_bounds_<fov>.json`) for
-downstream steps that need to know which part of the FOV was decoded. A
-molecule cut by the crop edge keeps only its inside part.
+With `crop_in_image_space` (default on) the image is cut to that region
+before decoding, so the invalid strip is never decoded. (Without it the whole
+frame is decoded and only `crop_width` is filtered afterwards, so barcodes
+from the strip are kept.) Barcode x, y are written in the full frame (the
+crop corner is added back), the same frame as segmentation and the stage
+positions, by the tiled and the untiled decode alike. A molecule cut by the
+crop edge keeps only its inside part.
+
+**Crop records** (`crop_bounds_<fov>.json`). Each FOV's crop is saved when
+the FOV is decoded: its bounds, the fixed crop and the adaptive margin of each
+edge, the channels the margin was taken over, and the bounds of the barcodes
+kept. Steps that need to know which part of a FOV was decoded read the record
+(`get_crop_record`, `get_crop_bounds`, `get_crop_bounds_table`) instead of
+recomputing the crop from settings or transformations that may have changed
+since. `DeduplicateBarcodes` uses it to drop a barcode-space decode's
+detections outside the valid region (`crop_to_valid_box`), and Optimize
+writes the same record for the region it measured its scale factors on.
+Cell assignment pools the barcodes of overlapping FOVs, and neighbouring
+FOVs' decoded regions overlap (next paragraph), so a molecule in the shared
+strip is in both FOVs' barcode tables; the records give each FOV's decoded
+region, so a step that pools neighbouring FOVs can tell where those regions
+overlap.
 
 **`crop_width` default 50** (was 100). Neighbouring FOVs share a strip of
 tissue. A cell in that strip is decoded whole by at least one of the two FOVs
@@ -57,7 +74,9 @@ With 100 px on each edge of a 2048 px frame and the usual ~10 % overlap, the
 two decoded regions barely meet, so seam cells are cut in both copies. 50 px
 leaves room for cells up to about 100 px at that overlap. Edges where the
 warp leaves missing data are still cut at the adaptive margin, which can be
-wider than the overlap; there the seam keeps a gap.
+wider than the overlap; there the seam keeps a gap. Optimize uses the same
+default, and so does `CrossFOVCompositeWarp`'s `fill_threshold` (see
+Registration).
 
 **`adaptive_edge_margin`** (default 2 px). Where the adaptive margin sets an
 edge, the pixels just outside have no data in at least one bit. The image is
@@ -79,9 +98,10 @@ The new task measures the z offset plane by plane by correlating the bead
 stacks, fits it as a polynomial in depth, then measures xy at each corrected
 depth and fits that as a polynomial too. Plain cross-correlation is used
 throughout, with searches bounded around the expected answer. The rigid offset
-is refined through the stack, and fits with large residuals are flagged. When a
-stack has too few usable bead samples, it borrows the curve of the same round
-from neighbouring FOVs instead of fitting noise.
+can be refined through the stack (`rigid_plane_search`), and fits with large
+residuals are flagged. When a stack has too few usable bead samples, it
+borrows the curve of the same round from neighbouring FOVs instead of fitting
+noise.
 
 *In-plane rotation, one angle per round (`FiducialRoundRotation` with
 `rotation_task`, off by default).* The sample can also turn slightly about the
@@ -90,8 +110,9 @@ and leaves the corners off by the angle times the distance from the centre,
 which a per-plane xy offset cannot remove. The design takes the turn to come
 from the stage: the whole sample turns as one rigid body, so every FOV of a
 round turns by the same angle, while the translation differs from FOV to FOV
-because the stage does not return to exactly the same place. The angle is therefore measured once per
-round, not per stack.
+because the stage does not return to exactly the same place. The angle is
+therefore measured once per round, not per stack, and this round angle is the
+only rotation MERlin estimates.
 
 The round task measures, in every FOV and for every fiducial stack, a rigid
 angle on one shallow plane of the 3D bead stack: the first plane the z samples
@@ -115,37 +136,31 @@ resampling. Without `rotation_task` nothing is turned and the tables have no
 rotation columns. A FOV whose bead field deforms with depth (stretch or shear
 of the gel) is not described by the round angle, which is the rigid part only.
 
-The angle is taken from the bead stack, not from the 2D coverglass frame.
-When the two were compared, the frame's angle disagreed with the bead-stack
-angle in late rounds: single FOVs were off by up to about 0.03 deg (about
-0.7 px at the corner of a 2048 px frame), and the round medians were biased by
-about 0.01 deg. The 2D frame is also imaged at one depth only. Lida Cheng's
+The angle is taken from the bead stack, not from the 2D coverglass frame: the
+frame is imaged at one depth only, and in late rounds its angle disagreed with
+the bead stack's, FOV by FOV and in the round median. Lida Cheng's
 `rotation_correction`, which fits one angle per FOV on the 2D frame, was the
 starting point.
+
+The angle is measured on one shallow plane, not through the whole stack.
+Angles fitted per stack through its whole depth scattered more than the turn
+of a rigid sample allows, mostly at the edges of the sample, and where a FOV
+deviated, the deviation came from the deeper planes; on the shallowest bead
+plane it agreed with the rest. A bead field that changes with depth is
+therefore treated as deformation of the gel, not as a turn of its own, and no
+per-stack angle is fitted. (Task files written with the removed per-stack
+option, `rotation_correction` without `rotation_task`, are read as CHANGES.md
+says.)
 
 In the transformation table, `xshift`/`yshift` remain the displacement of the
 frame centre, and the angle and its centre go in their own columns. A reader
 that ignores the new columns is therefore still right at the centre and off
 only by the turn towards the corners. If the table held the shift applied
 before the rotation instead, that reader would also be off at the centre, by
-about the angle (in radians) times the shift: about 0.1 px for a 140 px shift
-at 0.035 deg, and 0.7-0.8 px for a 410 px shift at 0.09-0.1 deg. The rigid
-transforms in `offsets_<fov>.npy` and the fiducial QC images include the
-angle. A `rigid_only_channels` channel gets the round angle too, with its
-rigid offset measured on turned-back frames.
-
-An earlier version measured a separate angle for every stack through its whole
-depth, and replaced an edge FOV's angle that failed or scattered with its
-neighbours' median in `finalize()`, measuring that stack's xy again. Those
-per-stack angles scattered more than the turn of a rigid sample allows, mostly
-at the edges of the sample, and where they deviated, the deviation came from
-the deeper planes; on the shallowest bead plane those FOVs agreed with the
-rest. It was removed: the stage's turn is taken to be one rigid rotation per
-round, and a FOV's bead field that changes with depth is treated as deformation
-of the gel, not as a turn of its own. The round angle is now the only way an
-angle is estimated (the removed option is
-`rotation_correction` without `rotation_task`; CHANGES.md says how old task
-files are read).
+about the angle (in radians) times the shift, 0.7 px for a 400 px shift at
+0.1 deg. The rigid transforms in `offsets_<fov>.npy` and the fiducial QC
+images include the angle. A `rigid_only_channels` channel gets the round angle
+too, with its rigid offset measured on turned-back frames.
 
 *Confirming the rigid walk (`rigid_walk_confirm`, off by default).* The walk
 searches its first plane wide, about zero, so that it can overrule a 2D frame
@@ -187,7 +202,8 @@ are not filled, since the fixed crop removes such a margin anyway; that only
 holds while `fill_threshold` is no larger than the decode's `crop_width`, so it
 defaults to the decode default (50 px). The warp cannot read the crop of the
 tasks that use it, so a different `crop_width` needs the matching
-`fill_threshold`.
+`fill_threshold`. The margins and the fill read the registration as a pure
+translation, so a `PolyWarp` with `rotation_task` is refused.
 
 ## Optimize
 
@@ -220,7 +236,8 @@ as an image-space Decode does: a molecule on the edge keeps only its inside
 part, and molecules within `adaptive_edge_margin` of an edge the adaptive
 margin set are left out. The scale factors, backgrounds and barcode counts,
 the stored barcodes and the chromatic samples measured on them all come from
-what is left.
+what is left. A pixel's call depends on its own trace only, so this is what
+decoding the region alone would give.
 
 Before, only the stored barcodes were taken from the region (by centroid,
 whole molecules, the last row and column included), and the scale factors,
@@ -229,6 +246,13 @@ included the strip the warp leaves without data, where a pixel's trace lacks
 at least one bit and Decode never looks. How much of that strip entered the
 estimate depended on each FOV's drift, not on the signal. `full_frame` keeps
 that behaviour, so older runs can be reproduced.
+
+Optimize runs before Decode and cannot read its settings, so it computes the
+region from its own `crop_width`, `adaptive_crop`, `adaptive_crop_channels`
+and `adaptive_edge_margin`. Their defaults are Decode's; the two tasks should
+keep the same values, or the factors are measured on a different region from
+the one they are applied to. Each FOV's region is recorded as Decode records
+its own (`crop_bounds_<fov>.json`).
 
 **`chromatic_threads`**. When `chromatic_from_fragments` is off and the
 correction is fitted in one job, this parallelises that job over FOV/z planes.
@@ -280,11 +304,11 @@ and keeps fixed camera features; a pixel more than `excess_threshold` above
 its 5 x 5 median there is a candidate. It is called hot only when it is a
 candidate in at least `min_channels` channels of the same camera, because a
 bright feature of a single channel is not a camera defect. The pixels are
-replaced in each raw frame before anything moves them (depth blend, chromatic
-correction, warp), where they are still single pixels at known positions. The
-correction is a preprocess option, so registration and its saved
-transformations do not change, and without it the images are exactly as
-before.
+replaced, by the median of their non-hot 3 x 3 neighbours, in each raw frame
+before anything moves them (depth blend, chromatic correction, warp), where
+they are still single pixels at known positions. The correction is a
+preprocess option, so registration and its saved transformations do not
+change, and without it the images are exactly as before.
 
 ## Barcode filtering
 
@@ -315,6 +339,79 @@ the blank-probability cut that meets the target misidentification rate. It is a
 smooth model with three coefficients instead of a histogram with thousands of
 bins, so it does not depend on bins being well populated. It needs no separate
 threshold task. `l2_regularization` and `max_iterations` control the fit.
+
+## Molecule deduplication
+
+**`DeduplicateBarcodes`**. Decode works plane by plane, so a molecule in focus
+over several planes is called once on each of them. The adaptive threshold
+counts what it is given: fitted on those per-plane detections, it meets its
+misidentification target per detection. Real molecules repeat across planes
+far more often than blank calls do, so once the repeats are collapsed (the
+filter's `remove_z_duplicated_barcodes` keeps the brightest of them) the rate
+per molecule is above the target. Merging the detections first, on the raw
+decode, makes the target hold per molecule:
+
+    Decode -> DeduplicateBarcodes -> GenerateMoleculeAdaptiveThreshold
+           -> AdaptiveFilterBarcodes
+
+The threshold and the filter take the deduplication task as their
+`decode_task`: it has the barcode table, codebook and decode settings they
+read. Detections are linked when they have the same barcode, lie within
+`xy_radius_px` of each other and sit on different planes at most
+`max_z_gap_um` apart; a molecule is a connected group of links, so it can span
+more than the gap. The gap is a depth in um, read from the dataset's z
+positions, so one setting means the same physical gap at any plane spacing; it
+must be at least the plane spacing for adjacent planes to link. Each molecule
+keeps the barcode, plane and `unique_id` of its brightest detection, so
+per-plane consumers (the filtered images, partition by plane) find it on a
+plane where it was detected, and it records how many planes it was seen on and
+the depths it spans.
+
+`molecule_features` sets the three numbers the threshold bins. `summed`
+(default) uses the whole molecule: the area summed over its planes, and its
+detections' intensity and distance averaged with their areas as weights (the
+intensity is then the mean over all its pixels). `brightest` takes all
+three from the brightest plane, the detection `remove_z_duplicated_barcodes`
+keeps. Two deduplication tasks can read one decode, one with each.
+
+Leave `remove_z_duplicated_barcodes` off in Decode and in the filter of this
+chain: in Decode it deletes detections before they can be merged, and after
+the merge every row is already a molecule.
+
+**`GenerateMoleculeAdaptiveThreshold`**. A molecule's summed area is several
+planes' worth, while the base threshold's area bins are the unit edges 1 to
+`area_bins` + 1, so most molecules would share the top bin and area would stop
+separating good calls from bad ones. This threshold sets the edges from the
+molecules' own areas, with about equal numbers of molecules per bin. Most
+molecules share a few small areas, so a heavily tied area gets a bin of its
+own and the remaining bins are shared out over the rest; the requested number
+of bins is kept unless there are fewer distinct areas. The edges are saved and
+reused on a rerun.
+
+**`crop_to_valid_box`** (off by default). A barcode-space decode
+(`crop_in_image_space` off) decodes the whole frame and filters only
+`crop_width`, so its detections in the strip the warp leaves without data
+reach the threshold. With the option on they are dropped before linking,
+using the region the decode recorded for the FOV. An image-space decode has
+nothing outside that region to drop.
+
+## Settings that must agree
+
+These tasks do not check each other's settings, so a few values have to be
+kept equal by hand:
+
+- Optimize and Decode: the same `crop_width`, `adaptive_crop`,
+  `adaptive_crop_channels` and `adaptive_edge_margin` (the defaults agree),
+  so the scale factors are measured on the pixels they are applied to.
+- `CrossFOVCompositeWarp`: `fill_threshold` at most the smallest `crop_width`
+  edge of the tasks that decode its images.
+- `FiducialRoundRotation` and the `PolyWarp` that names it in `rotation_task`:
+  the same filter, rigid-walk and z-gate settings, since the round task runs
+  the registration's own measurement code.
+- The deduplicated chain: `GenerateMoleculeAdaptiveThreshold` and
+  `AdaptiveFilterBarcodes` take the `DeduplicateBarcodes` task as
+  `decode_task`, with `remove_z_duplicated_barcodes` off in Decode and the
+  filter.
 
 ## Example images
 
