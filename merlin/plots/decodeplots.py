@@ -217,8 +217,8 @@ class DecodedBarcodesMetadata(PlotMetadata):
                 'intensity_by_area',
                 np.zeros((len(self.areaBins)-1, len(self.intensityBins)-1)))
             self.binsDetermined = True
-
-        self.binsDetermined = False
+        else:
+            self.binsDetermined = False
         self.queuedBarcodeData = []
 
     def _determine_bins(self):
@@ -250,8 +250,10 @@ class DecodedBarcodesMetadata(PlotMetadata):
                                         bins=self.areaBins)[0]
         self.intensityCounts += np.histogram(
             np.log10(barcodes['mean_intensity']), bins=self.intensityBins)[0]
+        # distanceBins are linear (min..max of min_distance), and the plot is
+        # drawn on a linear axis; log10 of distances < 1 fell outside every bin
         self.distanceCounts += np.histogram(
-            np.log10(barcodes['min_distance']), bins=self.distanceBins)[0]
+            barcodes['min_distance'], bins=self.distanceBins)[0]
 
         for i, currentArea in enumerate(self.areaBins[:-1]):
             self.intensityCountsByArea[i, :] += np.histogram(

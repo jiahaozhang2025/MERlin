@@ -37,7 +37,10 @@ class PlotEngine:
                 tasks to use for plotting results.
         """
         self.taskDict = taskDict
-        availablePlots = [x(plotTask) for x in get_available_plots()]
+        exclude = set(getattr(plotTask, 'parameters', {}).get(
+            'exclude_plots', []) or [])
+        availablePlots = [x(plotTask) for x in get_available_plots()
+                          if x.__name__ not in exclude]
         self.plotList = [x for x in availablePlots if x.is_relevant(taskDict)]
 
         requiredMetadata = \

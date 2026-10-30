@@ -365,6 +365,23 @@ major change was made.
 - `ModelRestorePreprocess`: Adds joint restoration of all MERFISH bit channels
   with a trained soft-decoding model.
 
+### Plots (`merlin/plots/`, `merlin/analysis/plotperformance.py`)
+
+- `BlankFractionFOVDistributionPlot`: Blank fraction by position within the
+  FOV, pooled over FOVs, as a coarse map and a radial profile.
+- Radial barcode density: Computed with vectorised numpy instead of a per-row
+  `iterrows` loop (0.5 s per FOV at 37k barcodes -> ~1 ms; same counts); each
+  codeword's colours are read through the bit's data channel, so the single /
+  multi colour split no longer depends on the data organization row order.
+- Minimum-distance distribution: Counted on the linear bins it is plotted
+  with; it histogrammed log10 distances into linear bins and stayed empty. Bins
+  loaded on resume are no longer discarded.
+- `PlotPerformance`: `poll_interval` (default 30 s) between passes while input
+  tasks are still running, instead of an unbroken polling loop;
+  `exclude_plots` now defaults to an empty list and is honoured.
+- `default.mplstyle`: Arial when installed, otherwise another sans-serif font
+  without a `findfont` warning for every text element.
+
 ### Pipeline and compatibility
 
 - Python 3.12 / numpy 2 / pandas 3: `setup_merlin_env.sh` builds the `merlin`

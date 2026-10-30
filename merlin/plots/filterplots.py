@@ -154,6 +154,67 @@ class BlankBarcodeFOVDistributionPlot(AbstractPlot):
         return fig
 
 
+class BlankFractionFOVDistributionPlot(AbstractPlot):
+
+    """Blank fraction by position within the FOV, pooled over FOVs: a map on
+    a coarse grid (the 1% count grid summed in 5 x 5 blocks, so each cell has
+    enough barcodes for a fraction) and a radial profile. Shows whether
+    barcodes in some part of the field (e.g. the edges) decode worse."""
+
+    def __init__(self, analysisTask):
+        super().__init__(analysisTask)
+
+    def get_required_tasks(self):
+        return {'filter_task': 'all'}
+
+    def get_required_metadata(self):
+        return [FOVSpatialDistributionMetadata]
+
+    def _generate_plot(self, inputTasks, inputMetadata):
+        spatialMetadata = inputMetadata[
+            'filterplots/FOVSpatialDistributionMetadata']
+        coding = np.asarray(spatialMetadata.spatialCodingCounts, float)
+        blank = np.asarray(spatialMetadata.spatialBlankCounts, float)
+        k = 5
+        nx, ny = (coding.shape[0] // k) * k, (coding.shape[1] // k) * k
+
+        def coarse(a):
+            return a[:nx, :ny].reshape(nx // k, k, ny // k, k).sum(axis=(1, 3))
+
+        total, blanks = coarse(coding + blank), coarse(blank)
+        fraction = np.where(total > 0, blanks / np.maximum(total, 1), np.nan)
+        xBins, yBins = spatialMetadata.spatialXBins, spatialMetadata.spatialYBins
+
+        fig = plt.figure(figsize=(14, 6))
+        plt.subplot(1, 2, 1)
+        # counts are indexed [x, y]; transpose so y runs down the image
+        plt.imshow(fraction.T, extent=(xBins[0], xBins[nx], yBins[ny], yBins[0]),
+                   cmap='magma')
+        cbar = plt.colorbar()
+        cbar.set_label('Blank fraction', rotation=270, labelpad=12)
+        plt.xlabel('X position (pixels)')
+        plt.ylabel('Y position (pixels)')
+        plt.title('Blank fraction within FOV (overall %.4f)'
+                  % (blank.sum() / max(coding.sum() + blank.sum(), 1)))
+
+        plt.subplot(1, 2, 2)
+        xc = 0.5 * (xBins[1:] + xBins[:-1])[:coding.shape[0]]
+        yc = 0.5 * (yBins[1:] + yBins[:-1])[:coding.shape[1]]
+        radius = np.hypot(xc[:, None] - 0.5 * (xBins[0] + xBins[-1]),
+                          yc[None, :] - 0.5 * (yBins[0] + yBins[-1]))
+        edges = np.linspace(0, radius.max() + 1e-9, 21)
+        rTotal = np.histogram(radius, edges, weights=coding + blank)[0]
+        rBlank = np.histogram(radius, edges, weights=blank)[0]
+        plt.plot(0.5 * (edges[1:] + edges[:-1]),
+                 np.where(rTotal > 0, rBlank / np.maximum(rTotal, 1), np.nan),
+                 'o-')
+        plt.xlabel('Distance from FOV centre (pixels)')
+        plt.ylabel('Blank fraction')
+        plt.title('Blank fraction vs radius')
+
+        return fig
+
+
 class FilteredBarcodeAbundancePlot(AbstractPlot):
 
     def __init__(self, analysisTask):
@@ -372,12 +433,17 @@ class FOVSpatialDistributionMetadata(PlotMetadata):
             'spatial_blank_counts',
             np.zeros((len(self.spatialXBins)-1, len(self.spatialYBins)-1)))
 
-        bitColors = dataSet.get_data_organization().data['color']
-        bcSet = self.filterTask.get_codebook().get_barcodes()
+        # colours per codebook bit, looked up through the bit's data channel
+        # (data organization rows need not be in codebook order)
+        org = dataSet.get_data_organization()
+        codebook = self.filterTask.get_codebook()
+        bitColors = np.array([str(org.get_data_channel_color(
+            org.get_data_channel_for_bit(b))) for b in codebook.get_bit_names()])
+        bcSet = codebook.get_barcodes()
         self.singleColorBarcodes = [i for i, b in enumerate(bcSet) if
-                                    bitColors[np.where(b)[0]].nunique() == 1]
+                                    len(set(bitColors[np.where(b)[0]])) == 1]
         self.multiColorBarcodes = [i for i, b in enumerate(bcSet) if
-                                   bitColors[np.where(b)[0]].nunique() > 1]
+                                   len(set(bitColors[np.where(b)[0]])) > 1]
 
     def get_spatial_extents(self) -> List[float]:
         return [self.spatialXBins[0], self.spatialXBins[-1],
@@ -390,8 +456,9 @@ class FOVSpatialDistributionMetadata(PlotMetadata):
     def _radial_distribution(self, inputBarcodes, barcodeIDs):
         selectBarcodes = inputBarcodes[
                 inputBarcodes['barcode_id'].isin(barcodeIDs)]
-        radialDistances = [self._radial_distance(r['x'], r['y'])
-                           for i, r in selectBarcodes.iterrows()]
+        radialDistances = self._radial_distance(
+            selectBarcodes['x'].to_numpy(float),
+            selectBarcodes['y'].to_numpy(float))
         return np.histogram(radialDistances, bins=self.radialBins)[0]
 
     def _spatial_distribution(self, inputBarcodes, barcodeIDs):

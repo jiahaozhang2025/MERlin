@@ -26,8 +26,10 @@ class PlotPerformance(analysistask.AnalysisTask):
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
 
-        if 'exclude_plots' in self.parameters:
-            self.parameters['exclude_plots'] = []
+        # exclude_plots (plot class names to skip, default none) and
+        # poll_interval (seconds between passes while input tasks still run,
+        # default 30) are read with .get(), so task files written without
+        # them keep identical parameters.
 
         self.taskTypes = ['decode_task', 'filter_task', 'optimize_task',
                           'segment_task', 'sum_task', 'partition_task',
@@ -47,4 +49,6 @@ class PlotPerformance(analysistask.AnalysisTask):
                     for t in self.taskTypes if t in self.parameters}
         plotEngine = plots.PlotEngine(self, taskDict)
         while not plotEngine.take_step():
-            pass
+            # each pass re-checks every fragment of every input task on disk;
+            # without a pause this loop spins on the filesystem until they finish
+            time.sleep(self.parameters.get('poll_interval', 30))
