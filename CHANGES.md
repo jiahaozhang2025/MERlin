@@ -173,6 +173,7 @@ major change was made.
   `'z'` writes `mosaic_z<i>.tif` per z slice (every channel), `'channel'`/`true`
   writes `mosaic_z<i>_<channel>.tif` (was `mosaic_<channel>_<i>.tif`); `zmax` for the projection.
 - `channel_names` renames output channels; `tiff_compression` (default none), e.g. `'zlib'` (lossless).
+
 ### Stitched decoding (`merlin/analysis/stitched.py`, `merlin/util/stitched/`) (from Lida Cheng)
 
 - `StitchedInitialize`, `StitchedStage`, `StitchedFragments`: Decode a whole
