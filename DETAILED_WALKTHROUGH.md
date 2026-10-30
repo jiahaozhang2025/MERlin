@@ -457,6 +457,15 @@ small, too thin, have too few barcodes, or have too low a barcode density. It
 saves a before/after mask and a per-object status table, so every removal can
 be checked. Final partitioning then uses the kept cells.
 
+**`CellPoseSegmentBitComposite3D`**. Some runs image no cell stain (no polyT or
+DAPI), but the MERFISH bit images themselves outline cells: mRNA is dense in the
+cytoplasm and sparse between cells. Blurring each bit turns its spots into a
+smooth density, stretching each bit to the same range keeps a bright bit from
+dominating, and averaging the bits of each colour gives a three-channel image
+that cellpose can read like a stain. Off-the-shelf models do not recognise
+cells in this image well, so the task is meant for a model finetuned on the
+same composite against stained segmentations from a related run.
+
 ## Stitched decoding (from Lida Cheng)
 
 Decoding FOV by FOV loses or duplicates molecules near FOV edges: a spot cut by

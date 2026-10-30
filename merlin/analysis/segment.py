@@ -405,6 +405,64 @@ class CellPoseSegmentTwoChannel3D(CellPoseSegmentSingleChannel3D):
         return np.stack(stacks, axis=3), 3
 
 
+class CellPoseSegmentBitComposite3D(CellPoseSegmentSingleChannel3D):
+
+    """
+    CellPoseSegmentSingleChannel3D on a composite of the MERFISH bit images,
+    for datasets without a cell stain (no polyT or DAPI). Each output channel
+    is one colour of `composite_colors`: every data channel whose name starts
+    with `bit_channel_prefix` and was imaged in that colour is blurred
+    (gaussian, `blur_sigma` px), stretched between its `stretch_percentiles`
+    to 0..1 (per plane), and the bits of the colour are averaged. The
+    RNA-dense cytoplasm then reads as a cell body. Use with a model trained on
+    the same composite (`path_to_user_model`).
+    """
+
+    def __init__(self, dataSet, parameters=None, analysisName=None):
+        super().__init__(dataSet, parameters, analysisName)
+
+        if 'bit_channel_prefix' not in self.parameters:
+            self.parameters['bit_channel_prefix'] = 'bit'
+        if 'composite_colors' not in self.parameters:
+            self.parameters['composite_colors'] = ['750', '650', '560']
+        if 'blur_sigma' not in self.parameters:
+            self.parameters['blur_sigma'] = 3
+        if 'stretch_percentiles' not in self.parameters:
+            self.parameters['stretch_percentiles'] = [1, 99.8]
+
+    def get_estimated_memory(self):
+        return 16384
+
+    def _segmentation_images(self, fov):
+        dataOrganization = self.dataSet.get_data_organization()
+        prefix = self.parameters['bit_channel_prefix'].lower()
+        bits = [c for c in dataOrganization.get_data_channels()
+                if dataOrganization.get_data_channel_name(c).lower()
+                .startswith(prefix)]
+        # colours read as '750' or '750.0' in data organizations
+        colors = np.array([str(dataOrganization.get_data_channel_color(b))
+                           .split('.')[0] for b in bits])
+        lo, hi = self.parameters['stretch_percentiles']
+        stacks = []
+        for color in self.parameters['composite_colors']:
+            selected = [b for b, c in zip(bits, colors) if c == str(color)]
+            if not selected:
+                raise ValueError('no %s* channel in colour %s' % (prefix, color))
+            total = 0
+            for b in selected:
+                stack = scipy.ndimage.gaussian_filter(
+                    self._read_image_stack(fov, b).astype(np.float32),
+                    (0, self.parameters['blur_sigma'],
+                     self.parameters['blur_sigma']))
+                for plane in stack:
+                    low, high = np.percentile(plane, [lo, hi])
+                    plane -= low
+                    plane /= max(high - low, 1e-6)
+                total = total + np.clip(stack, 0, 1)
+            stacks.append(total / len(selected))
+        return np.stack(stacks, axis=3), 3
+
+
 class CleanCellBoundaries(analysistask.ParallelAnalysisTask):
     '''
     A task to construct a network graph where each cell is a node, and overlaps

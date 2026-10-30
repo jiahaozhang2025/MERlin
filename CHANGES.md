@@ -154,6 +154,9 @@ major change was made.
 - `z_index`: Segments one z plane and repeats its outlines on every plane.
 - `FilterCells`: New task that removes non-cell objects after a provisional
   partition, by footprint area, width, barcode count and barcode density.
+- `CellPoseSegmentBitComposite3D`: New task for datasets without a cell stain;
+  segments a per-colour composite of the blurred, stretched bit images
+  (`bit_channel_prefix`, `composite_colors`, `blur_sigma`, `stretch_percentiles`).
 
 ### Stitched decoding (`merlin/analysis/stitched.py`, `merlin/util/stitched/`) (from Lida Cheng)
 
