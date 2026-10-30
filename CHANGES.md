@@ -158,6 +158,21 @@ major change was made.
   segments a per-colour composite of the blurred, stretched bit images
   (`bit_channel_prefix`, `composite_colors`, `blur_sigma`, `stretch_percentiles`).
 
+### Mosaic (`merlin/analysis/generatemosaic.py`)
+
+- `frame_channels`: Mosaic channels made from listed frames of a data channel's
+  image file (e.g. a 545 label frame of the 473/DAPI movie), registered with that
+  channel's transformation and max-projected; `data_channels` may name them to set the order.
+- Fovs are downsampled by area averaging before placement and overlaps are
+  averaged with float accumulators (was: bilinear warp of the full-resolution
+  image and a uint16 add-then-halve).
+- `flat_field` (off by default): divides each channel by a smoothed per-pixel
+  median over up to `flat_field_fovs` fovs. Also `fovs`, `num_threads` and
+  `write_preview` (8-bit per-channel and composite PNGs per z slice in the task's images folder).
+- `z_index` takes a list (indexes and/or `maximum_projection`). `separate_files`:
+  `'z'` writes `mosaic_z<i>.tif` per z slice (every channel), `'channel'`/`true`
+  writes `mosaic_z<i>_<channel>.tif` (was `mosaic_<channel>_<i>.tif`); `zmax` for the projection.
+- `channel_names` renames output channels; `tiff_compression` (default none), e.g. `'zlib'` (lossless).
 ### Stitched decoding (`merlin/analysis/stitched.py`, `merlin/util/stitched/`) (from Lida Cheng)
 
 - `StitchedInitialize`, `StitchedStage`, `StitchedFragments`: Decode a whole
