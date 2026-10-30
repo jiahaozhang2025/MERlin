@@ -28,7 +28,15 @@ of spatial features and barcode data.
 See [CHANGES.md](CHANGES.md) for a concise list of major and minor changes from
 the `gpu_decoding` baseline, and [DETAILED_WALKTHROUGH.md](DETAILED_WALKTHROUGH.md)
 for why each major change was made. Example analysis files are in
-[docs/analysis](docs/analysis).
+[docs/analysis](docs/analysis):
+
+- [thick_tissue_confocal](docs/analysis/thick_tissue_confocal.md): a complete
+  analysis for a thick-tissue confocal acquisition.
+- [stitched_decoding](docs/analysis/stitched_decoding.md): the whole sample
+  registered and decoded as one stitched volume (from Lida Cheng).
+- [bit_alignment](docs/analysis/bit_alignment.md): optional tasks that measure
+  each bit's residual offset from the decoded molecules and decode again
+  without it. Off unless an analysis lists them.
 
 ## Installation
 

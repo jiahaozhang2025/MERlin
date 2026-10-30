@@ -285,6 +285,40 @@ or under-called against the reference. If an update made a bit's bias worse, it
 is rolled back for that bit only. Bits that are still improving keep updating,
 and bits that have turned are held in place.
 
+## Per-bit alignment
+
+Registration aligns each round by its fiducial beads, and the chromatic map
+aligns each colour to the reference colour once for the whole dataset. The RNA
+signal of one bit can still sit a fraction of a pixel away from another's.
+Pixel-based decoding compares one pixel across all bits, so such an offset
+lowers a molecule's magnitude and raises its distance, and the filter then
+loses real molecules.
+
+The molecules measure the offset themselves. A confidently decoded molecule
+appears in several bits, and its localized position in two of its ON bits
+differs by the two bits' relative offset. Over many molecules a robust
+least-squares fit gives one xy shift per bit. Only differences are observed,
+so the shifts are fixed to mean zero. `OptimizeBitAlignment` fits each
+(fov, z) on its own, because the offsets differ between fields.
+
+- **Held-out validation**: the shifts are fitted on the molecules they are then
+  judged on. Splitting the plane into checkerboard tiles, fitting on one set
+  and validating on the other, tests whether they generalize. A plane whose
+  held-out error does not fall keeps zero shift, so a poor fit cannot make a
+  plane worse than registration alone.
+- **One resampling**: `BitAlignedWarp` composes the shift into the base
+  transformation instead of shifting the registered image again, which would
+  interpolate twice.
+- **Frozen calibration**: molecule selection and decoding must use the same
+  chromatic map, scale factors and backgrounds. `OptimizeRawCalibration` stores
+  them once with a checksum, and the alignment results carry it, so shifts are
+  never applied under a different calibration. Scale factors are not refitted
+  after alignment.
+- **Depth-independent base warp only**: the aligned sampler reads each plane at
+  its own z with one transformation per channel. A base warp that resamples
+  depth or moves xy with depth would lose that correction, so it is refused
+  rather than flattened.
+
 ## Preprocess
 
 **`fft_highpass_sigma`**. A high-pass filter applied in the frequency domain,

@@ -59,6 +59,10 @@ def warp_transformations(warpTask, fov: int, dataChannels=None) -> list:
     lists them in the table's row order; the other warp tasks have one per
     data channel, indexed by the channel.
     """
+    # Opt-in warps can expose z-aware/full chromatic sampling support without
+    # changing the sampling transformations returned to image consumers.
+    if hasattr(warpTask, 'get_crop_transformations'):
+        return list(warpTask.get_crop_transformations(fov, dataChannels))
     transforms = list(warpTask.get_transformation(fov))
     if dataChannels is None:
         return transforms

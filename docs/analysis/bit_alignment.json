@@ -1,0 +1,77 @@
+{
+  "_comment": [
+    "Per-bit alignment from the MERFISH signal, added to a full analysis whose",
+    "registration is the same on every plane: FiducialCorrelationWarp without",
+    "register_3d, or FiducialPolynomialWarp3D with xy_polynomial_order 0,",
+    "z_polynomial_order 0 and z_search_range 0. Warp, Preprocess, Optimize and",
+    "Decode are the base analysis's tasks; Optimize must set",
+    "normalize_scale_factors false. BitPreprocess, BitDecode, BitThreshold and",
+    "BitFilter list only what differs from Preprocess, Decode and its threshold",
+    "and filter: copy their other parameters. See bit_alignment.md."
+  ],
+  "analysis_tasks": [
+    {
+      "task": "OptimizeRawCalibration",
+      "module": "merlin.analysis.rawcalibration",
+      "analysis_name": "BitCalibration",
+      "parameters": {
+        "bootstrap_task": "Optimize",
+        "preprocess_task": "Preprocess",
+        "max_iterations": 0
+      }
+    },
+    {
+      "task": "OptimizeBitAlignment",
+      "module": "merlin.analysis.rawcalibration",
+      "analysis_name": "BitAlignment",
+      "parameters": {
+        "calibration_task": "BitCalibration",
+        "preprocess_task": "Preprocess"
+      }
+    },
+    {
+      "task": "BitAlignedWarp",
+      "module": "merlin.analysis.rawcalibration",
+      "analysis_name": "BitWarp",
+      "parameters": {
+        "warp_task": "Warp",
+        "bit_alignment_task": "BitAlignment"
+      }
+    },
+    {
+      "task": "DeconvolutionPreprocess",
+      "module": "merlin.analysis.preprocess",
+      "analysis_name": "BitPreprocess",
+      "parameters": {
+        "warp_task": "BitWarp"
+      }
+    },
+    {
+      "task": "Decode",
+      "module": "merlin.analysis.decode",
+      "analysis_name": "BitDecode",
+      "parameters": {
+        "preprocess_task": "BitPreprocess",
+        "optimize_task": "BitCalibration"
+      }
+    },
+    {
+      "task": "GenerateAdaptiveThreshold",
+      "module": "merlin.analysis.filterbarcodes",
+      "analysis_name": "BitThreshold",
+      "parameters": {
+        "decode_task": "BitDecode",
+        "run_after_task": "BitDecode"
+      }
+    },
+    {
+      "task": "AdaptiveFilterBarcodes",
+      "module": "merlin.analysis.filterbarcodes",
+      "analysis_name": "BitFilter",
+      "parameters": {
+        "decode_task": "BitDecode",
+        "adaptive_task": "BitThreshold"
+      }
+    }
+  ]
+}

@@ -87,6 +87,25 @@ major change was made.
   saved before the option load as `crop`, so rerun fragments of an older run
   would mix the two; an analysis that must match one pins `full_frame`.
 
+### Per-bit alignment (`merlin/analysis/rawcalibration.py`, `merlin/util/bitregistration.py`)
+
+Opt-in tasks; nothing changes unless an analysis lists them
+([docs/analysis/bit_alignment.md](docs/analysis/bit_alignment.md)).
+
+- `OptimizeBitAlignment`: Fits one xy shift per bit for each (fov, z) from the
+  decoded molecules' positions in their ON bits; a plane whose shifts do not
+  lower the held-out (checkerboard tile) error gets none.
+- `BitAlignedWarp`: The base warp with those shifts composed into the codebook
+  channels' transformations (still one resampling); refuses a base warp that
+  moves with depth. `apply_bit_alignment`, `common_support_with_bit_alignment`.
+- `OptimizeRawCalibration`: Freezes an Optimize run's chromatic map, absolute
+  scale factors and backgrounds (checksummed) for the two tasks above and the
+  aligned Decode; needs `normalize_scale_factors` false.
+- `PooledRawHistogram`: Adaptive threshold that bins only after every selected
+  fov has decoded.
+- Decode takes its adaptive crop from a warp's `get_crop_transformations` when
+  it has one (only `BitAlignedWarp`).
+
 ### Preprocess (`merlin/analysis/preprocess.py`)
 
 - `fft_highpass_sigma`: Applies FFT-space high-pass filtering to remove broad
