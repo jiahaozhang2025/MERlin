@@ -256,7 +256,9 @@ major change was made.
 - `report_bracketing_thresholds`: Reports the available adaptive thresholds
   around the requested misidentification rate for diagnostics.
 - `intensity_bins`, `distance_bins`, `area_bins`: The adaptive-threshold
-  histogram bin counts, previously fixed.
+  histogram bin counts, previously fixed. Default 20 each (was 199 / 66 / 33,
+  which overfits the blank fraction); datasets generated with the old defaults
+  must pin those values in their analysis json before regenerating.
 - `fovs`, `bin_sample_fovs`: Let the adaptive threshold run on a subset of FOVs.
 - `poll_interval`: Seconds between checks while decode fragments are still
   arriving.

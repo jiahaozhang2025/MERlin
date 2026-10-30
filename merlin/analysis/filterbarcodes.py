@@ -356,12 +356,18 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
             self.parameters['tolerance'] = 0.001
         # ensure decode_task is specified
         decodeTask = self.parameters['decode_task']
+        # 20 x 20 x 20 bins (was 199 x 66 x 33). The fine grid fits the blank
+        # fraction to noise: fit on half the FOVs and applied to the other
+        # half, its misidentification overshoots the target far more than a
+        # coarse grid's. Areas past the last bin are pooled
+        # into it. Datasets generated with the old defaults must pin 199 / 66 /
+        # 33 in their analysis json before regenerating.
         if 'intensity_bins' not in self.parameters:
-            self.parameters['intensity_bins'] = 199
+            self.parameters['intensity_bins'] = 20
         if 'distance_bins' not in self.parameters:
-            self.parameters['distance_bins'] = 66
+            self.parameters['distance_bins'] = 20
         if 'area_bins' not in self.parameters:
-            self.parameters['area_bins'] = 33
+            self.parameters['area_bins'] = 20
         if 'threshold_solver_method' not in self.parameters:
             self.parameters['threshold_solver_method'] = 'cumulative_bins'
         if 'intensity_transform' not in self.parameters:
@@ -1095,12 +1101,13 @@ class GenerateAdaptiveThresholdLocal(analysistask.ParallelAnalysisTask):
 
         if 'neighbors' not in self.parameters:
             self.parameters['neighbors'] = 15
+        # same 20 x 20 x 20 default as GenerateAdaptiveThreshold
         if 'intensity_bins' not in self.parameters:
-            self.parameters['intensity_bins'] = 199
+            self.parameters['intensity_bins'] = 20
         if 'area_bins' not in self.parameters:
-            self.parameters['area_bins'] = 33
+            self.parameters['area_bins'] = 20
         if 'distance_bins' not in self.parameters:
-            self.parameters['distance_bins'] = 66
+            self.parameters['distance_bins'] = 20
         if 'threshold_solver_method' not in self.parameters:
             self.parameters['threshold_solver_method'] = 'cumulative_bins'
         if 'intensity_transform' not in self.parameters:
