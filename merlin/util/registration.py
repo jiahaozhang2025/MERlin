@@ -149,3 +149,59 @@ def refine_position(image, x, y, cropSize=4) -> Tuple[float, float]:
     subImage = image[int(y + 2 - cropSize):int(y + cropSize),
                      int(x - cropSize + 2):int(x + cropSize)]
     return radial_center(subImage)
+
+
+def windowed_phase_cross_correlation(
+        referenceImage: np.ndarray, movingImage: np.ndarray,
+        center: Tuple[float, float], window: float,
+        upsampleFactor: int = 100) -> Tuple[np.ndarray, float, float]:
+    """skimage.registration.phase_cross_correlation (normalization 'phase')
+    with the peak search restricted to shifts within +-window of center.
+
+    The whitened cross-correlation of sparse bead images can have a stronger
+    spurious peak far from the true shift; when the expected shift is known
+    (e.g. the median over all fovs of the same round), searching only near it
+    recovers the true peak. The integer peak is then refined exactly as
+    skimage does (upsampled DFT around it), so a window that contains the
+    global maximum returns skimage's own result.
+
+    Args:
+        referenceImage, movingImage: 2D images of equal shape.
+        center: expected (y, x) shift, in skimage's convention (the shift
+            that registers movingImage onto referenceImage).
+        window: half-width of the square search window, in pixels.
+        upsampleFactor: sub-pixel upsampling factor, as in skimage.
+    Returns:
+        (shift, error, phasediff) as phase_cross_correlation returns them.
+    """
+    from skimage.registration._phase_cross_correlation import (
+        _upsampled_dft, _compute_error, _compute_phasediff)
+
+    srcFreq = np.fft.fftn(referenceImage)
+    targetFreq = np.fft.fftn(movingImage)
+    shape = np.array(srcFreq.shape)
+    imageProduct = srcFreq * targetFreq.conj()
+    eps = np.finfo(imageProduct.real.dtype).eps
+    imageProduct /= np.maximum(np.abs(imageProduct), 100 * eps)
+    crossCorrelation = np.abs(np.fft.ifftn(imageProduct))
+
+    # candidate integer shifts within the window, wrapped onto array indices
+    axes = [np.arange(int(np.floor(c - window)), int(np.ceil(c + window)) + 1)
+            for c in center]
+    sub = crossCorrelation[np.ix_(axes[0] % shape[0], axes[1] % shape[1])]
+    i, j = np.unravel_index(np.argmax(sub), sub.shape)
+    shift = np.array([axes[0][i], axes[1][j]], dtype=float)
+
+    upsample = float(upsampleFactor)
+    shift = np.round(shift * upsample) / upsample
+    regionSize = np.ceil(upsample * 1.5)
+    dftShift = np.fix(regionSize / 2.0)
+    upsampled = _upsampled_dft(imageProduct.conj(), regionSize, upsample,
+                               dftShift - shift * upsample).conj()
+    maxima = np.unravel_index(np.argmax(np.abs(upsampled)), upsampled.shape)
+    ccMax = upsampled[maxima]
+    shift += (np.stack(maxima).astype(float) - dftShift) / upsample
+    srcAmp = np.sum(np.real(srcFreq * srcFreq.conj()))
+    targetAmp = np.sum(np.real(targetFreq * targetFreq.conj()))
+    return shift, _compute_error(ccMax, srcAmp, targetAmp), \
+        _compute_phasediff(ccMax)

@@ -15,6 +15,7 @@ from skimage import morphology
 import cv2
 
 from merlin.core import analysistask
+from merlin.util import registration as merlin_registration
 from merlin.util import aberration
 
 
@@ -313,6 +314,12 @@ class FiducialCorrelationWarp(Warp):
             #edge_width_to_remove
         if 'sparse_bead_fix' not in self.parameters:
             self.parameters['sparse_bead_fix'] = False
+        # search_window_px (off unless set) + window_reference_task: restrict
+        # the phase-correlation peak search to +-search_window_px around each
+        # channel's median shift over all fovs, taken from the (completed)
+        # reference warp task -- see _window_centers. Read with .get() and
+        # not given a default here, so task files written before this option
+        # existed keep identical parameters.
 
         # xingjie parameters to add
         if 'percentile_pixel_to_keep' not in self.parameters:
@@ -351,7 +358,8 @@ class FiducialCorrelationWarp(Warp):
         return 5
 
     def get_dependencies(self):
-        return []
+        reference = self.parameters.get('window_reference_task')
+        return [reference] if reference else []
 
     def _filter(self, inputImage: np.ndarray) -> np.ndarray:
         highPassSigma = self.parameters['highpass_sigma']
@@ -399,10 +407,50 @@ class FiducialCorrelationWarp(Warp):
         fixedImage = self._filter(self.dataSet.get_fiducial_image(0, fov))
         dataChannels = list(
             self.dataSet.get_data_organization().get_data_channels())
-        results = [registration.phase_cross_correlation(
-            fixedImage, self._filter(self.dataSet.get_fiducial_image(ch, fov)),
-            upsample_factor=100) for ch in dataChannels]
+        window = self.parameters.get('search_window_px')
+        centers = self._window_centers() if window else None
+        results, self._windowInfo = [], []
+        for ch in dataChannels:
+            moving = self._filter(self.dataSet.get_fiducial_image(ch, fov))
+            result = registration.phase_cross_correlation(
+                fixedImage, moving, upsample_factor=100)
+            info = {'global_shift_y': float(result[0][0]),
+                    'global_shift_x': float(result[0][1]), 'windowed': False}
+            if window and ch in centers:
+                center = centers[ch]
+                if np.max(np.abs(np.asarray(result[0]) - center)) > window:
+                    result = merlin_registration.windowed_phase_cross_correlation(
+                        fixedImage, moving, center, window, 100)
+                    info['windowed'] = True
+            results.append(result)
+            self._windowInfo.append(info)
         return dataChannels, results
+
+    def _window_centers(self):
+        """{data channel: median (y, x) shift over all fovs} from the task
+        named by window_reference_task, the centre of the search window.
+
+        The whitened phase correlation of sparse bead images can put its
+        highest peak hundreds of pixels from the true shift on a few fovs,
+        while the true shift varies little between fovs of the same round
+        (stage repeatability), so the median over fovs is a robust centre. A
+        fov whose own peak lies within search_window_px of it keeps the
+        unrestricted result unchanged; the others are re-measured with the
+        peak search confined to the window.
+        """
+        if getattr(self, '_centers', None) is None:
+            reference = self.dataSet.load_analysis_task(
+                self.parameters['window_reference_task'])
+            frames = [self.dataSet.load_dataframe_from_csv(
+                'metrics', reference, resultIndex=f,
+                subdirectory='transformations')
+                for f in self.dataSet.get_fovs()]
+            allMetrics = pd.concat(frames)
+            medians = allMetrics.groupby('channel')[['shift_y', 'shift_x']]\
+                .median()
+            self._centers = {int(ch): np.array([r.shift_y, r.shift_x])
+                             for ch, r in medians.iterrows()}
+        return self._centers
 
     # ==================================================================
     # 3D registration, only used when register_3d is set
@@ -622,6 +670,9 @@ class FiducialCorrelationWarp(Warp):
             "error":   [float(e) for e in errors],
             "phasediff": [float(p) for p in phases],
         })
+        if self.parameters.get('search_window_px'):
+            for key in ('global_shift_y', 'global_shift_x', 'windowed'):
+                df_metrics[key] = [i[key] for i in self._windowInfo]
 
         self.dataSet.save_dataframe_to_csv(
             df_metrics,

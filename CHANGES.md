@@ -271,6 +271,14 @@ major change was made.
 
 - `median_filter` (default true): The fiducial hot-pixel median filter, always
   applied before, can be turned off.
+- `search_window_px` + `window_reference_task` (FiducialCorrelationWarp, off by
+  default): Each channel's median shift over all FOVs is taken from a completed
+  first-pass warp task; a FOV whose own phase-correlation peak lies further than
+  `search_window_px` from it is re-measured with the peak search confined to
+  that window (same sub-pixel refinement as skimage), so a stronger spurious
+  peak hundreds of pixels away no longer wins. FOVs within the window keep the
+  unrestricted result unchanged. The metrics table gains `global_shift_y/x` and
+  `windowed`.
 - `register_3d`: `FiducialCorrelationWarp` option that applies one 3D bead
   correlation per round through depth (the model of the removed
   `FiducialCorrelationWarp3D`); `interpolation` sets the depth resampling.
@@ -401,7 +409,7 @@ major change was made.
 - Option names are lowercase (e.g. `write_decoded_FOVs` -> `write_decoded_fovs`,
   `z_duplicate_zPlane_threshold` -> `z_duplicate_z_threshold`); old names are still read.
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
-  synthetic spots, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
+  synthetic spots, windowed fiducial peak search, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
   PolyWarp round angle (`rotation_task`), round rotation
   (`FiducialRoundRotation`).
 - Removed: PolyWarp's per-stack in-plane angle (`rotation_correction` without
