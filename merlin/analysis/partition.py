@@ -2,6 +2,7 @@ import pandas
 import numpy as np
 
 from merlin.core import analysistask
+from merlin.util import decoding
 from merlin.util import spatialfeature
 
 class PartitionBarcodes(analysistask.ParallelAnalysisTask):
@@ -55,7 +56,83 @@ class PartitionBarcodes(analysistask.ParallelAnalysisTask):
         counts.index = counts.index.astype(str)
         return counts
 
+    def _decoded_region(self, fov, filterTask, alignTask):
+        """Global (xmin, ymin, xmax, ymax) of the region of fov whose barcodes
+        its decode kept. Image space: the crop bounds (only those pixels are
+        decoded). Barcode space: the barcode filter, crop_width only -- the
+        whole frame is decoded and the adaptive margin removes no barcodes,
+        so the crop bounds would undercount the region wherever a shift
+        exceeds crop_width. Taken from the decode's crop record when it has
+        one, else from its parameters."""
+        decodeTask = self.dataSet.load_analysis_task(
+            filterTask.parameters['decode_task'])
+        record = decodeTask.get_crop_record(fov) \
+            if hasattr(decodeTask, 'get_crop_record') else None
+        if record is not None:
+            if record.get('barcode_filter') is not None:
+                rowStart, rowEnd, colStart, colEnd = record['barcode_filter']
+            else:
+                rowStart, rowEnd, colStart, colEnd = record['crop_bounds']
+        elif not decodeTask.parameters.get('crop_in_image_space', True):
+            top, bottom, left, right = decoding.crop_widths(
+                decodeTask.parameters['crop_width'])
+            rows, cols = self.dataSet.get_image_dimensions()
+            rowStart, rowEnd, colStart, colEnd = \
+                top, rows - bottom, left, cols - right
+        else:
+            rowStart, rowEnd, colStart, colEnd = decodeTask._crop_bounds(fov)
+        x0, y0 = alignTask.fov_coordinates_to_global(fov, (colStart, rowStart))
+        x1, y1 = alignTask.fov_coordinates_to_global(fov, (colEnd, rowEnd))
+        return min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1)
+
+    def _pooled_barcodes(self, fragmentIndex, fovIntersections, filterTask,
+                         alignTask) -> pandas.DataFrame:
+        """Barcodes of this fov plus those of overlapping fovs, each location
+        taken from exactly one fov.
+
+        Overlapping fovs decode the same molecules in their shared strip;
+        pooling every overlapping fov's barcodes (as before) counted those
+        molecules once per fov in cells there. This fov's own barcodes are all
+        kept; a neighbour's are kept only outside the decoded regions of this
+        fov and of the neighbours already taken (ascending fov order), so its
+        barcodes only fill in what was not already covered. `fovs` (optional)
+        restricts the neighbours to that list.
+        """
+        bcDB = filterTask.get_barcode_database()
+        fovs = self.parameters.get('fovs')
+        allowed = None if fovs is None else set(int(f) for f in fovs)
+        order = [fragmentIndex] + [f for f in fovIntersections
+                                   if f != fragmentIndex
+                                   and (allowed is None or f in allowed)]
+        covered, parts = [], []
+        for fi in order:
+            partialBC = bcDB.get_barcodes(fi)
+            if len(partialBC) and covered:
+                gx = partialBC['global_x'].to_numpy(float)
+                gy = partialBC['global_y'].to_numpy(float)
+                outside = np.ones(len(partialBC), bool)
+                for xmin, ymin, xmax, ymax in covered:
+                    outside &= ~((gx >= xmin) & (gx <= xmax)
+                                 & (gy >= ymin) & (gy <= ymax))
+                partialBC = partialBC[outside]
+            parts.append(partialBC)
+            covered.append(self._decoded_region(fi, filterTask, alignTask))
+        return pandas.concat(parts, axis=0).reset_index().copy(deep=True)
+
     def _run_analysis(self, fragmentIndex):
+        fovs = self.parameters.get('fovs')
+        if fovs is not None and fragmentIndex not in set(int(f) for f in fovs):
+            # an excluded fov: no cells, nothing counted
+            filterTask = self.dataSet.load_analysis_task(
+                self.parameters['filter_task'])
+            codebook = filterTask.get_codebook()
+            empty = pandas.DataFrame(
+                columns=[codebook.get_name_for_barcode_index(x)
+                         for x in range(codebook.get_barcode_count())])
+            self.dataSet.save_dataframe_to_csv(
+                empty, 'counts_per_cell', self.get_analysis_name(),
+                fragmentIndex)
+            return
         if self.parameters['boundary_correction_buffer_size'] == 0:
             self._run_analysis_traditional(fragmentIndex)
         else:
@@ -76,16 +153,8 @@ class PartitionBarcodes(analysistask.ParallelAnalysisTask):
         codebook = filterTask.get_codebook()
         barcodeCount = codebook.get_barcode_count()
 
-        bcDB = filterTask.get_barcode_database()
-        for fi in fovIntersections:
-            partialBC = bcDB.get_barcodes(fi)
-            if fi == fovIntersections[0]:
-                currentFOVBarcodes = partialBC.copy(deep=True)
-            else:
-                currentFOVBarcodes = pandas.concat(
-                    [currentFOVBarcodes, partialBC], axis = 0) # pandas > 2
-
-        currentFOVBarcodes = currentFOVBarcodes.reset_index().copy(deep=True)
+        currentFOVBarcodes = self._pooled_barcodes(
+            fragmentIndex, fovIntersections, filterTask, alignTask)
 
         sDB = assignmentTask.get_feature_database()
         currentCells = sDB.read_features(fragmentIndex)
@@ -217,16 +286,8 @@ class PartitionBarcodes(analysistask.ParallelAnalysisTask):
         codebook = filterTask.get_codebook()
         barcodeCount = codebook.get_barcode_count()
 
-        bcDB = filterTask.get_barcode_database()
-        for fi in fovIntersections:
-            partialBC = bcDB.get_barcodes(fi)
-            if fi == fovIntersections[0]:
-                currentFOVBarcodes = partialBC.copy(deep=True)
-            else:
-                currentFOVBarcodes = pandas.concat(
-                    [currentFOVBarcodes, partialBC], axis = 0) # pandas > 2
-
-        currentFOVBarcodes = currentFOVBarcodes.reset_index().copy(deep=True)
+        currentFOVBarcodes = self._pooled_barcodes(
+            fragmentIndex, fovIntersections, filterTask, alignTask)
 
         sDB = assignmentTask.get_feature_database()
         currentCells = sDB.read_features(fragmentIndex)

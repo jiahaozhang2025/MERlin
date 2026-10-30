@@ -161,8 +161,12 @@ class SimpleGlobalAlignment(GlobalAlignment):
             a list of four floats, representing the xmin, xmax, ymin, ymax
         """
 
+        # the image size, not a fixed 2048 x 2048 (inherited): with 3200-px
+        # frames the boxes were 2/3 of the fov, neighbouring boxes did not
+        # intersect, and cell cleaning / partition never saw the overlaps
+        fovSize = self.dataSet.get_image_dimensions()
         return [x for y in (self.fov_coordinates_to_global(fov, (0, 0)),
-                            self.fov_coordinates_to_global(fov, (2048, 2048)))
+                            self.fov_coordinates_to_global(fov, fovSize))
                 for x in y]
 
     def global_coordinates_to_fov(self, fov, globalCoordinates):

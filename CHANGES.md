@@ -346,6 +346,18 @@ major change was made.
   integers.
 - `contains_positions`: No longer writes into its input array (read-only under
   pandas >= 3).
+- FOV boxes (`GlobalAlignment.fov_global_extent`, used by cell cleaning and
+  partition): Sized from the microscope's `image_dimensions` instead of a fixed
+  2048 x 2048 px. With 3200-px frames the boxes were two thirds of the FOV,
+  neighbouring FOVs never overlapped, and cross-FOV duplicate cells were kept.
+- `PartitionBarcodes`: Barcodes from overlapping FOVs are taken only outside the
+  decoded regions (decode crop bounds) of the current FOV and of neighbours
+  already taken, so a molecule decoded by two FOVs in their shared strip is
+  counted once.
+- `fovs` (cellpose Segment and `PartitionBarcodes`, optional): FOVs outside the
+  list get no cells and are not pooled into neighbours' partitions, so excluded
+  FOVs (e.g. poor registration or imaging) are used nowhere downstream.
+- `FilterCells`: A FOV without labels no longer crashes when writing its mask.
 
 ### Barcode database (`merlin/util/barcodedb.py`)
 

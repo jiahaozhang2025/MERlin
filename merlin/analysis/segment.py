@@ -333,6 +333,20 @@ class CellPoseSegmentSingleChannel3D(FeatureSavingAnalysisTask):
     def _run_analysis(self, fragmentIndex):
         globalTask = self.dataSet.load_analysis_task(
                 self.parameters['global_align_task'])
+        # fovs (optional, read with .get() so older task files keep their
+        # parameters): a fov outside the list gets no cells -- an empty
+        # feature database, an all-zero mask and an empty label table -- so
+        # cleaning, partition and cell filtering run over it without using it
+        fovs = self.parameters.get('fovs')
+        if fovs is not None and fragmentIndex not in set(int(f) for f in fovs):
+            h, w = self.dataSet.get_image_dimensions()
+            masks = np.zeros((len(self.dataSet.get_z_positions()), h, w),
+                             dtype=np.uint32)
+            if self.parameters['dump_segmented_masks'] and fragmentIndex in self.parameters['dump_segmented_fovs']:
+                self._save_tiff_images(fragmentIndex, 'segmented_mask', masks)
+            self._save_feature_labels(fragmentIndex, [], [])
+            self.get_feature_database().write_features([], fragmentIndex)
+            return
         images, channelAxis = self._segmentation_images(fragmentIndex)
         model = self._load_cellpose_model()
 
@@ -648,7 +662,8 @@ class FilterCells(FeatureSavingAnalysisTask):
 
         if self.parameters['write_masks']:
             keep = np.zeros(masks.max() + 1, bool)
-            keep[qc.label[kept].values] = True
+            # astype: a fov without labels gives an empty, untyped column
+            keep[qc.label[kept].values.astype(np.int64)] = True
             tifffile.imwrite(
                 self.dataSet._analysis_image_name(
                     self, 'filtered_mask', fragmentIndex),
