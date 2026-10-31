@@ -3,8 +3,10 @@
 Hand-built molecules check the linking rule (plane gaps, a second molecule at
 the same xy deeper down, other barcode ids at the same xy, same-plane pairs,
 the radius and gap at their limits, uneven plane spacing) and each
-molecule_features mode ('summed', 'brightest'; the old name 'all_planes' and
-the removed 'brightest_sum_area'). Random tables are compared with a slow
+molecule_features mode ('sum', 'average', 'brightest'; the old names 'summed'
+and 'all_planes', read as 'sum', and the removed 'brightest_sum_area'), with
+every column of a 'sum' and an 'average' table worked out by hand. Random
+tables are compared with a slow
 reference that shares no code with the module: a loop over all pairs,
 union-find, and per-molecule sums written out by hand. The chain tests run
 Decode -> DeduplicateBarcodes -> GenerateMoleculeAdaptiveThreshold ->
@@ -64,7 +66,7 @@ def detections(rows):
     return out
 
 
-def run(table, xy=2.0, gap=0.75, mode='summed', zPositions=Z_UNIFORM):
+def run(table, xy=2.0, gap=0.75, mode='sum', zPositions=Z_UNIFORM):
     molecules, _ = deduplicate.deduplicate_barcodes(table, zPositions, xy,
                                                     gap, mode)
     return molecules
@@ -145,8 +147,16 @@ def reference(table, zPositions, xy, gap, mode):
         if mode == 'brightest':
             record.update(mean_intensity=b['mean_intensity'],
                           min_distance=b['min_distance'], area=b['area'])
+        elif mode == 'average':
+            k = len(group)
+            record.update(
+                mean_intensity=sum(float(rows[i]['mean_intensity'])
+                                   for i in group) / k,
+                min_distance=sum(float(rows[i]['min_distance'])
+                                 for i in group) / k,
+                area=math.floor(areaSum / k))
         else:
-            assert mode == 'summed', mode
+            assert mode == 'sum', mode
             record.update(
                 mean_intensity=sum(float(rows[i]['area'])
                                    * float(rows[i]['mean_intensity'])
@@ -265,7 +275,7 @@ class LinkingRuleTests(unittest.TestCase):
     def test_empty_table(self):
         table = detections([])
         molecules, stats = deduplicate.deduplicate_barcodes(
-            table, Z_UNIFORM, 2.0, 0.75, 'summed')
+            table, Z_UNIFORM, 2.0, 0.75, 'sum')
         self.assertEqual(len(molecules), 0)
         for column in deduplicate.MOLECULE_COLUMNS:
             self.assertIn(column, molecules.columns)
@@ -286,8 +296,8 @@ class FeatureModeTests(unittest.TestCase):
         self.assertEqual(m['area'].tolist(), [5, 6])
         self.assertEqual(m['area_sum'].tolist(), [12, 6])
 
-    def test_summed(self):
-        m = run(self.TABLE, gap=0.5, mode='summed')
+    def test_sum(self):
+        m = run(self.TABLE, gap=0.5, mode='sum')
         np.testing.assert_allclose(
             m['mean_intensity'], [(40 * 3 + 90 * 5 + 60 * 4) / 12, 70.0], 1e-6)
         np.testing.assert_allclose(
@@ -295,23 +305,33 @@ class FeatureModeTests(unittest.TestCase):
             [(0.30 * 3 + 0.10 * 5 + 0.20 * 4) / 12, 0.25], 1e-6)
         self.assertEqual(m['area'].tolist(), [12, 6])
 
-    def test_modes(self):
-        self.assertEqual(deduplicate.MOLECULE_FEATURES, ('summed', 'brightest'))
+    def test_average(self):
+        m = run(self.TABLE, gap=0.5, mode='average')
+        np.testing.assert_allclose(
+            m['mean_intensity'], [(40 + 90 + 60) / 3, 70.0], 1e-6)
+        np.testing.assert_allclose(
+            m['min_distance'], [(0.30 + 0.10 + 0.20) / 3, 0.25], 1e-6)
+        self.assertEqual(m['area'].tolist(), [4, 6])          # 12 / 3, 6 / 1
+        self.assertEqual(m['area_sum'].tolist(), [12, 6])
 
-    def test_all_planes_is_summed(self):
-        self.assertEqual(deduplicate.molecule_features_option('all_planes'),
-                         'summed')
-        pd.testing.assert_frame_equal(
-            run(self.TABLE, gap=0.5, mode='all_planes'),
-            run(self.TABLE, gap=0.5, mode='summed'))
+    def test_modes(self):
+        self.assertEqual(deduplicate.MOLECULE_FEATURES,
+                         ('sum', 'average', 'brightest'))
+
+    def test_old_names_are_sum(self):
+        for old in ('summed', 'all_planes'):
+            self.assertEqual(deduplicate.molecule_features_option(old), 'sum')
+            pd.testing.assert_frame_equal(
+                run(self.TABLE, gap=0.5, mode=old),
+                run(self.TABLE, gap=0.5, mode='sum'), check_exact=True)
 
     def test_brightest_sum_area_refused(self):
         with self.assertRaisesRegex(ValueError, "'brightest_sum_area' was "
-                                                "removed; use 'summed'"):
+                                                "removed; use 'sum'"):
             run(self.TABLE, gap=0.5, mode='brightest_sum_area')
 
     def test_shared_columns(self):
-        m = run(self.TABLE, gap=0.5, mode='summed')
+        m = run(self.TABLE, gap=0.5, mode='sum')
         w = np.array([40 * 3, 90 * 5, 60 * 4], float)
         self.assertEqual(m['z'].tolist(), [3, 4])                 # brightest
         self.assertEqual(m['unique_id'].tolist(), [2, 4])
@@ -337,13 +357,151 @@ class FeatureModeTests(unittest.TestCase):
 
     def test_area_clipped_to_database_range(self):
         rows = [(0, 5, 5, p, 10, 30000, 0.2) for p in range(3)]
-        m = run(detections(rows), gap=0.5, mode='summed')
+        m = run(detections(rows), gap=0.5, mode='sum')
         self.assertEqual(int(m['area'][0]), 65535)
         self.assertEqual(int(m['area_sum'][0]), 90000)
 
     def test_bad_mode(self):
-        with self.assertRaisesRegex(ValueError, "must be one of"):
-            run(self.TABLE, mode='mean')
+        for bad in ('mean', 'Sum', 'averaged', 'sums', '', None):
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                run(self.TABLE, mode=bad)
+            with self.assertRaisesRegex(ValueError, "must be one of"):
+                deduplicate.molecule_features_option(bad)
+
+
+class HandWorkedTests(unittest.TestCase):
+    """Every column of the 'sum' and 'average' molecule tables of one small
+    multi-plane table, worked out by hand. 'sum' is the former 'summed'
+    (the last commit with that name): same values, same dtypes, same column
+    order."""
+
+    # (barcode_id, x, y, z, mean_intensity, area, min_distance); plane depth
+    # 1.0 + 0.5 z um, gap 0.5 um links neighbouring planes only.
+    # A: rows 0-2, planes 1-3, areas 2, 4, 8 (rows 1 and 2 tie on intensity:
+    #    the lower plane, row 1, is the brightest);
+    # B: row 3, one detection;
+    # C: rows 4-5, both zero magnitude (centroids fall back to area weights),
+    #    areas 2, 7.
+    TABLE = detections([(7, 20.0, 20.0, 1, 50.0, 2, 0.40),
+                        (7, 20.5, 20.0, 2, 80.0, 4, 0.20),
+                        (7, 20.0, 21.0, 3, 80.0, 8, 0.30),
+                        (2, 40.0, 40.0, 5, 30.0, 3, 0.50),
+                        (5, 60.0, 60.0, 4, 0.0, 2, 0.60),
+                        (5, 60.0, 61.0, 5, 0.0, 7, 0.20)])
+
+    # the former merge_molecules' output for this table
+    COLUMNS = ['unique_id', 'barcode_id', 'area', 'mean_intensity',
+               'max_intensity', 'mean_distance', 'min_distance', 'x', 'y',
+               'z', 'fov', 'cell_index', 'global_z', 'global_x', 'global_y',
+               'intensity_0', 'n_detections', 'n_planes', 'z_um',
+               'z_first_um', 'z_last_um', 'area_sum']
+    DTYPES = {'unique_id': np.int32, 'barcode_id': np.int32,
+              'area': np.uint16, 'mean_intensity': np.float32,
+              'max_intensity': np.float32, 'mean_distance': np.float32,
+              'min_distance': np.float32, 'x': np.float32, 'y': np.float32,
+              'z': np.float32, 'fov': np.int32, 'cell_index': np.int32,
+              'global_z': np.float32, 'global_x': np.float32,
+              'global_y': np.float32, 'intensity_0': np.float32,
+              'n_detections': np.int32, 'n_planes': np.int16,
+              'z_um': np.float32, 'z_first_um': np.float32,
+              'z_last_um': np.float32, 'area_sum': np.int32}
+
+    # Columns that do not depend on molecule_features. Magnitude weights
+    # (mean_intensity x area): A 100, 320, 640 (sum 1060); C has none, so
+    # its centroid weights are the areas 2, 7 (sum 9).
+    SHARED = {
+        'unique_id': [2, 4, 5],
+        'barcode_id': [7, 2, 5],
+        'max_intensity': [80 * 1.5, 30 * 1.5, 0.0],
+        'mean_distance': [(0.45 * 2 + 0.25 * 4 + 0.35 * 8) / 14, 0.55,
+                          (0.65 * 2 + 0.25 * 7) / 9],
+        'x': [(100 * 20 + 320 * 20.5 + 640 * 20) / 1060, 40.0, 60.0],
+        'y': [(100 * 20 + 320 * 20 + 640 * 21) / 1060, 40.0,
+              (2 * 60 + 7 * 61) / 9],
+        'z': [2, 5, 4],
+        'fov': [0, 0, 0],
+        'cell_index': [-1, -1, -1],
+        'global_z': [(100 * 1 + 320 * 2 + 640 * 3) / 1060, 5.0,
+                     (2 * 4 + 7 * 5) / 9],
+        'global_x': [100 + 0.14625 * (100 * 20 + 320 * 20.5 + 640 * 20) / 1060,
+                     100 + 0.14625 * 40, 100 + 0.14625 * 60],
+        'global_y': [-50 + 0.14625 * (100 * 20 + 320 * 20 + 640 * 21) / 1060,
+                     -50 + 0.14625 * 40,
+                     -50 + 0.14625 * (2 * 60 + 7 * 61) / 9],
+        'intensity_0': [(15 * 2 + 24 * 4 + 24 * 8) / 14, 9.0, 0.0],
+        'n_detections': [3, 1, 2],
+        'n_planes': [3, 1, 2],
+        'z_um': [1 + 0.5 * (100 * 1 + 320 * 2 + 640 * 3) / 1060, 3.5,
+                 1 + 0.5 * (2 * 4 + 7 * 5) / 9],
+        'z_first_um': [1.5, 3.5, 3.0],
+        'z_last_um': [2.5, 3.5, 3.5],
+        'area_sum': [14, 3, 9]}
+
+    # sum: area-weighted means and the summed area
+    SUM = {'mean_intensity': [(50 * 2 + 80 * 4 + 80 * 8) / 14, 30.0, 0.0],
+           'min_distance': [(0.40 * 2 + 0.20 * 4 + 0.30 * 8) / 14, 0.50,
+                            (0.60 * 2 + 0.20 * 7) / 9],
+           'area': [14, 3, 9]}
+
+    # average: plain means over the detections; area = floor(area_sum / n):
+    # A 14 / 3 = 4.67 -> 4 (not rounded to 5), C 9 / 2 = 4.5 -> 4
+    AVERAGE = {'mean_intensity': [(50 + 80 + 80) / 3, 30.0, 0.0],
+               'min_distance': [(0.40 + 0.20 + 0.30) / 3, 0.50,
+                                (0.60 + 0.20) / 2],
+               'area': [4, 3, 4]}
+
+    def check(self, m, features):
+        self.assertEqual(list(m.columns), self.COLUMNS)
+        self.assertEqual({c: m[c].dtype for c in m.columns},
+                         {c: np.dtype(t) for c, t in self.DTYPES.items()})
+        want = dict(self.SHARED, **features)
+        for column in self.COLUMNS:
+            if m[column].dtype.kind in 'iu':
+                self.assertEqual(m[column].tolist(), want[column], column)
+            else:
+                np.testing.assert_allclose(
+                    m[column].to_numpy(np.float64), want[column], rtol=1e-6,
+                    atol=1e-6, err_msg=column)
+
+    def test_sum_and_old_names(self):
+        m = run(self.TABLE, gap=0.5, mode='sum')
+        self.check(m, self.SUM)
+        for old in ('summed', 'all_planes'):
+            pd.testing.assert_frame_equal(run(self.TABLE, gap=0.5, mode=old),
+                                          m, check_exact=True)
+
+    def test_average(self):
+        m = run(self.TABLE, gap=0.5, mode='average')
+        self.check(m, self.AVERAGE)
+        # the plain and the area-weighted means differ on A and C
+        s = run(self.TABLE, gap=0.5, mode='sum')
+        for column in ('mean_intensity', 'min_distance'):
+            self.assertNotAlmostEqual(float(m[column][0]),
+                                      float(s[column][0]), places=3)
+        self.assertNotAlmostEqual(float(m['min_distance'][2]),
+                                  float(s['min_distance'][2]), places=3)
+        # every column but the three features is the same as with 'sum'
+        others = [c for c in self.COLUMNS
+                  if c not in ('mean_intensity', 'min_distance', 'area')]
+        pd.testing.assert_frame_equal(m[others], s[others], check_exact=True)
+        # the exact mean area is in the table
+        np.testing.assert_allclose(m['area_sum'] / m['n_detections'],
+                                   [14 / 3, 3.0, 4.5])
+
+    def test_average_area_stays_in_database_range(self):
+        rows = [(0, 5, 5, p, 10, a, 0.2)
+                for p, a in enumerate((30000, 32767, 32766))]
+        m = run(detections(rows), gap=0.5, mode='average')
+        self.assertEqual(m['area'].dtype, np.uint16)
+        self.assertEqual(int(m['area'][0]), (30000 + 32767 + 32766) // 3)
+        self.assertEqual(int(m['area_sum'][0]), 30000 + 32767 + 32766)
+
+    def test_float_area_input(self):
+        table = self.TABLE.copy()
+        table['area'] = table['area'].astype(np.float32)
+        m = run(table, gap=0.5, mode='average')
+        self.assertEqual(m['area'].dtype, np.float32)
+        self.assertEqual(m['area'].tolist(), [4.0, 3.0, 4.0])
 
 
 class ReferenceEqualityTests(unittest.TestCase):
@@ -370,7 +528,7 @@ class ReferenceEqualityTests(unittest.TestCase):
                             atol=1e-5, err_msg='%s %s %s %s'
                             % (seed, (xy, gap), mode, c))
                     checked += 1
-        self.assertEqual(checked, 18)
+        self.assertEqual(checked, 27)
 
 
 # --------------------------------------------------------- pipeline chain
@@ -477,7 +635,7 @@ class ChainTests(unittest.TestCase):
             filterTask.save()
 
             # defaults
-            self.assertEqual(dedup.parameters['molecule_features'], 'summed')
+            self.assertEqual(dedup.parameters['molecule_features'], 'sum')
             self.assertIs(dedup.parameters['crop_to_valid_box'], False)
             self.assertEqual(dedup.parameters['xy_radius_px'], 2.0)
             self.assertEqual(dedup.parameters['max_z_gap_um'], 0.75)
@@ -496,7 +654,7 @@ class ChainTests(unittest.TestCase):
                    for f in ds.get_fovs()]
             for fov in ds.get_fovs():
                 again, _ = deduplicate.deduplicate_barcodes(
-                    raw[fov], Z_UNIFORM, 2.0, 0.75, 'summed')
+                    raw[fov], Z_UNIFORM, 2.0, 0.75, 'sum')
                 self.assertEqual(len(molecules[fov]), len(again))
                 self.assertEqual(int(molecules[fov]['n_detections'].sum()),
                                  len(raw[fov]))
@@ -505,7 +663,7 @@ class ChainTests(unittest.TestCase):
                 self.assertEqual(summary['n_molecules'], len(again))
                 self.assertEqual(summary['n_decoded'], len(raw[fov]))
                 self.assertEqual(summary['n_detections'], len(raw[fov]))
-                self.assertEqual(summary['molecule_features'], 'summed')
+                self.assertEqual(summary['molecule_features'], 'sum')
                 self.assertIs(summary['crop_to_valid_box'], False)
                 self.assertNotIn('n_outside_valid_box', summary)
                 self.assertGreater(
@@ -533,6 +691,72 @@ class ChainTests(unittest.TestCase):
                     set(molecules[fov]['unique_id'])))
                 for column in deduplicate.MOLECULE_COLUMNS:
                     self.assertIn(column, kept.columns)
+
+    def test_average_through_threshold_and_filter(self):
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = _DataSet(root)
+            decodeTask = _SyntheticDecode(ds, {}, 'Decode')
+            decodeTask.save()
+            dedup = deduplicate.DeduplicateBarcodes(
+                ds, {'decode_task': 'Decode', 'molecule_features': 'average'},
+                'Dedup')
+            dedup.save()
+            threshold = deduplicate.GenerateMoleculeAdaptiveThreshold(
+                ds, {'decode_task': 'Dedup', 'run_after_task': 'Dedup',
+                     'poll_interval': 0, 'area_bins': 20}, 'Thresh')
+            threshold.save()
+            filterTask = filterbarcodes.AdaptiveFilterBarcodes(
+                ds, {'decode_task': 'Dedup', 'adaptive_task': 'Thresh',
+                     'write_filtered_images': False}, 'Filter')
+            filterTask.save()
+            for fov in ds.get_fovs():
+                decodeTask.run(fov)
+                dedup.run(fov)
+            molecules = [dedup.get_barcode_database().get_barcodes(f)
+                         for f in ds.get_fovs()]
+            for fov in ds.get_fovs():
+                raw = decodeTask.get_barcode_database().get_barcodes(fov)
+                m = molecules[fov]
+                self.assertEqual(dedup.get_summary(fov)['molecule_features'],
+                                 'average')
+                # as written to and read back from the barcode database
+                self.assertEqual(m['area'].dtype, np.uint16)
+                np.testing.assert_array_equal(
+                    m['area'].to_numpy(np.int64),
+                    m['area_sum'].to_numpy(np.int64)
+                    // m['n_detections'].to_numpy(np.int64))
+                self.assertTrue(np.any(m['area_sum'] % m['n_detections']))
+                same, _ = deduplicate.deduplicate_barcodes(
+                    raw, Z_UNIFORM, 2.0, 0.75, 'average')
+                for column in m.columns:
+                    np.testing.assert_array_equal(
+                        m[column].to_numpy(),
+                        same[column].to_numpy().astype(m[column].dtype),
+                        err_msg=column)
+                # only the three features differ from 'sum'
+                summed, _ = deduplicate.deduplicate_barcodes(
+                    raw, Z_UNIFORM, 2.0, 0.75, 'sum')
+                for column in same.columns:
+                    if column in ('mean_intensity', 'min_distance', 'area'):
+                        continue
+                    np.testing.assert_array_equal(same[column],
+                                                  summed[column], column)
+            threshold.run()
+            allAreas = np.concatenate([m['area'].to_numpy()
+                                       for m in molecules])
+            areaBins = threshold.get_area_bins()
+            self.assertEqual(areaBins[0], allAreas.min())
+            self.assertEqual(areaBins[-1], allAreas.max() + 1)
+            self.assertEqual(threshold.get_total_count_histogram().sum(),
+                             sum(len(m) for m in molecules))
+            for fov in ds.get_fovs():
+                filterTask.run(fov)
+                kept = filterTask.get_barcode_database().get_barcodes(fov)
+                self.assertGreater(len(kept), 0)
+                self.assertLess(len(kept), len(molecules[fov]))
+                self.assertTrue(set(kept['unique_id']).issubset(
+                    set(molecules[fov]['unique_id'])))
 
     def test_unit_area_edges(self):
         with tempfile.TemporaryDirectory() as root, \
@@ -565,8 +789,10 @@ class OptionTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()):
             ds = _DataSet(root)
             _SyntheticDecode(ds, {}, 'Decode').save()
-            for given, used in (('all_planes', 'summed'),
-                                ('summed', 'summed'),
+            for given, used in (('all_planes', 'sum'),
+                                ('summed', 'sum'),
+                                ('sum', 'sum'),
+                                ('average', 'average'),
                                 ('brightest', 'brightest')):
                 task = deduplicate.DeduplicateBarcodes(
                     ds, {'decode_task': 'Decode',
@@ -577,47 +803,97 @@ class OptionTests(unittest.TestCase):
                 deduplicate.DeduplicateBarcodes(
                     ds, {'decode_task': 'Decode',
                          'molecule_features': 'brightest_sum_area'}, 'Dedup')
-            with self.assertRaisesRegex(ValueError, 'must be one of'):
-                deduplicate.DeduplicateBarcodes(
-                    ds, {'decode_task': 'Decode',
-                         'molecule_features': 'mean'}, 'Dedup')
+            for bad in ('mean', 'averaged', 'Sum', 'SUMMED'):
+                with self.assertRaisesRegex(ValueError, 'must be one of'):
+                    deduplicate.DeduplicateBarcodes(
+                        ds, {'decode_task': 'Decode',
+                             'molecule_features': bad}, 'Dedup')
             with self.assertRaisesRegex(ValueError, 'true or false'):
                 deduplicate.DeduplicateBarcodes(
                     ds, {'decode_task': 'Decode',
                          'crop_to_valid_box': 'yes'}, 'Dedup')
 
-    def test_task_saved_with_old_name_loads_and_regenerates(self):
+    def _saved_as(self, ds, name, dropCropToValidBox=False):
+        """Save Dedup, then rewrite its task.json with molecule_features
+        name, as an older MERlin wrote it."""
+        deduplicate.DeduplicateBarcodes(
+            ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25}, 'Dedup'
+        ).save()
+        path = os.path.join(ds.get_task_subdirectory('Dedup'), 'task.json')
+        with open(path) as f:
+            saved = json.load(f)
+        self.assertEqual(saved['molecule_features'], 'sum')
+        saved['molecule_features'] = name
+        if dropCropToValidBox:
+            del saved['crop_to_valid_box']
+        with open(path, 'w') as f:
+            json.dump(saved, f)
+        return path
+
+    def test_task_saved_as_summed_loads_as_sum(self):
+        # the task.json the former code wrote: every key, 'summed'
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = _DataSet(root)
+            _SyntheticDecode(ds, {}, 'Decode').save()
+            path = self._saved_as(ds, 'summed')
+            loaded = ds.load_analysis_task('Dedup')
+            self.assertEqual(loaded.parameters['molecule_features'], 'sum')
+            self.assertIs(loaded.parameters['crop_to_valid_box'], False)
+            self.assertEqual(loaded.parameters['max_z_gap_um'], 1.25)
+            # regenerating from an analysis json with any name of 'sum', or
+            # none (the default), is accepted ...
+            for parameters in ({'molecule_features': 'summed'},
+                               {'molecule_features': 'all_planes'},
+                               {'molecule_features': 'sum'}, {}):
+                self._saved_as(ds, 'summed')
+                deduplicate.DeduplicateBarcodes(
+                    ds, dict(parameters, decode_task='Decode',
+                             max_z_gap_um=1.25), 'Dedup').save()
+                with open(path) as f:
+                    self.assertEqual(json.load(f)['molecule_features'], 'sum')
+            # ... another setting is not
+            for other in ('average', 'brightest'):
+                self._saved_as(ds, 'summed')
+                with self.assertRaises(
+                        analysistask.AnalysisAlreadyExistsException):
+                    deduplicate.DeduplicateBarcodes(
+                        ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
+                             'molecule_features': other}, 'Dedup').save()
+
+    def test_task_saved_with_older_name_loads_and_regenerates(self):
+        # as older code wrote it: 'all_planes', no
+        # crop_to_valid_box
+        with tempfile.TemporaryDirectory() as root, \
+                contextlib.redirect_stdout(io.StringIO()):
+            ds = _DataSet(root)
+            _SyntheticDecode(ds, {}, 'Decode').save()
+            self._saved_as(ds, 'all_planes', dropCropToValidBox=True)
+            loaded = ds.load_analysis_task('Dedup')
+            self.assertEqual(loaded.parameters['molecule_features'], 'sum')
+            self.assertIs(loaded.parameters['crop_to_valid_box'], False)
+            for name in ('all_planes', 'summed', 'sum'):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
+                         'molecule_features': name}, 'Dedup').save()
+            with self.assertRaises(analysistask.AnalysisAlreadyExistsException):
+                deduplicate.DeduplicateBarcodes(
+                    ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
+                         'molecule_features': 'brightest'}, 'Dedup').save()
+
+    def test_saved_average_loads(self):
         with tempfile.TemporaryDirectory() as root, \
                 contextlib.redirect_stdout(io.StringIO()):
             ds = _DataSet(root)
             _SyntheticDecode(ds, {}, 'Decode').save()
             deduplicate.DeduplicateBarcodes(
-                ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
-                     'molecule_features': 'all_planes'}, 'Dedup').save()
-            # rewrite task.json as an older version saved it: the old name,
-            # no crop_to_valid_box
-            path = os.path.join(ds.get_task_subdirectory('Dedup'),
-                                'task.json')
-            with open(path) as f:
-                saved = json.load(f)
-            saved['molecule_features'] = 'all_planes'
-            del saved['crop_to_valid_box']
-            with open(path, 'w') as f:
-                json.dump(saved, f)
-
-            loaded = ds.load_analysis_task('Dedup')
-            self.assertEqual(loaded.parameters['molecule_features'], 'summed')
-            self.assertIs(loaded.parameters['crop_to_valid_box'], False)
-            # regenerating from an analysis json with either name is accepted
-            for name in ('all_planes', 'summed'):
-                deduplicate.DeduplicateBarcodes(
-                    ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
-                         'molecule_features': name}, 'Dedup').save()
-            # ... a different setting is not
+                ds, {'decode_task': 'Decode',
+                     'molecule_features': 'average'}, 'Dedup').save()
+            self.assertEqual(ds.load_analysis_task('Dedup').parameters[
+                'molecule_features'], 'average')
             with self.assertRaises(analysistask.AnalysisAlreadyExistsException):
                 deduplicate.DeduplicateBarcodes(
-                    ds, {'decode_task': 'Decode', 'max_z_gap_um': 1.25,
-                         'molecule_features': 'brightest'}, 'Dedup').save()
+                    ds, {'decode_task': 'Decode'}, 'Dedup').save()
 
 
 # ------------------------------------------------------------- valid box
@@ -848,7 +1124,7 @@ class ValidBoxTests(unittest.TestCase):
             inside = np.array(_BoxDecode.INSIDE[0])
             got = cropped.get_barcode_database().get_barcodes(0)
             want, _ = deduplicate.deduplicate_barcodes(
-                raw[inside], Z_UNIFORM, 2.0, 0.75, 'summed')
+                raw[inside], Z_UNIFORM, 2.0, 0.75, 'sum')
             self.assertEqual(len(got), len(want))
             np.testing.assert_array_equal(got['unique_id'], want['unique_id'])
             # the pair at x 4.0 / 3.99 and the pair at x 58.0 / 58.01 would

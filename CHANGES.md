@@ -154,8 +154,11 @@ Opt-in tasks; nothing changes unless an analysis lists them
 - `DeduplicateBarcodes`: New task between Decode and the adaptive threshold.
   It merges a molecule's detections on nearby z planes (same barcode,
   `xy_radius_px`, `max_z_gap_um`) into one row, so the misidentification
-  target holds per molecule; `molecule_features` (`summed`, the default, or
-  `brightest`) sets how a molecule's intensity, distance and area are formed.
+  target holds per molecule; `molecule_features` sets how a molecule's
+  intensity, distance and area are formed: `sum` (default; area-weighted means,
+  summed area), `average` (plain means over the detections, mean area rounded
+  down) or `brightest` (the brightest detection's). The former names `summed`
+  and `all_planes` are read as `sum`.
   The row keeps the brightest detection's barcode and plane and adds
   `n_detections`, `n_planes`, `area_sum` and depths in um (`z_um`, the
   centroid; `z_first_um` to `z_last_um`, the span).

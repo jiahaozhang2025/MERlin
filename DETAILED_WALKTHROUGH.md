@@ -420,12 +420,20 @@ per-plane consumers (the filtered images, partition by plane) find it on a
 plane where it was detected, and it records how many planes it was seen on and
 the depths it spans.
 
-`molecule_features` sets the three numbers the threshold bins. `summed`
+`molecule_features` sets the three numbers the threshold bins. `sum`
 (default) uses the whole molecule: the area summed over its planes, and its
 detections' intensity and distance averaged with their areas as weights (the
-intensity is then the mean over all its pixels). `brightest` takes all
-three from the brightest plane, the detection `remove_z_duplicated_barcodes`
-keeps. Two deduplication tasks can read one decode, one with each.
+intensity is then the mean over all its pixels). `average` counts each
+detection once, whatever its size: the intensity and distance are the plain
+means over the detections, and the area is their mean area rounded down to
+whole pixels. The barcode table stores area as an integer and the
+threshold's area edges are whole numbers, so the rounded-down area lands in
+the bin the exact mean would; the exact mean is `area_sum` / `n_detections`.
+`brightest` takes all three from the brightest plane, the detection
+`remove_z_duplicated_barcodes` keeps. All other columns are the same in the
+three modes, and several deduplication tasks can read one decode, one per
+setting. `summed` and `all_planes`, the former names of `sum`, are still read
+as `sum`, so analysis files and saved tasks that use them load unchanged.
 
 Leave `remove_z_duplicated_barcodes` off in Decode and in the filter of this
 chain: in Decode it deletes detections before they can be merged, and after

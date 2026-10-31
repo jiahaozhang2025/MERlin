@@ -39,18 +39,30 @@ z_first_um, z_last_um and area_sum, with:
   and z_last_um: the shallowest and deepest detection depths.
 
 molecule_features:
-- 'summed' (default): over all the molecule's detections, area = area_sum,
+- 'sum' (default): over all the molecule's detections, area = area_sum,
   mean_intensity = area-weighted mean of the detections' mean_intensity (the
   mean magnitude over all the molecule's pixels) and min_distance =
   area-weighted mean of the detections' min_distance;
+- 'average': the plain (unweighted) mean over the molecule's detections, each
+  detection counting once whatever its area: area = area_sum / n_detections
+  rounded down (see below), mean_intensity = mean of the detections'
+  mean_intensity and min_distance = mean of the detections' min_distance;
 - 'brightest': all three from the brightest detection (the rule
   merlin.util.barcodefilters applies after filtering).
-The former name 'all_planes' is read as 'summed'. 'brightest_sum_area'
+Every other column is the same in the three modes. The former names 'summed'
+and 'all_planes' are read as 'sum', so an analysis json or a saved task.json
+that uses them loads and gives the same molecules. 'brightest_sum_area'
 (brightest intensity and distance with the summed area) was removed and is
 refused.
 
 The decode table's area column is 16-bit unsigned; an area_sum above 65535 is
-clipped to 65535 in 'area' (area_sum itself is 32-bit).
+clipped to 65535 in 'area' (area_sum itself is 32-bit). With 'average' the
+area is floor(area_sum / n_detections), kept an integer in the decode table's
+area type: the barcode database stores area as uint16 (a fraction would be
+truncated on writing anyway), and every area bin edge of the adaptive
+threshold is an integer ('unit' edges and area_equal_count_edges, which floors
+the areas itself), so a mean area a and floor(a) fall in the same bin. The
+exact mean is area_sum / n_detections, from the two columns in the table.
 
 Valid box (crop_to_valid_box, off by default). Decode trims each fov to its
 valid region, decode.compute_crop_bounds: crop_width on each edge, widened
@@ -72,8 +84,9 @@ x, y relative to (colStart, rowStart), which are shifted back first); with
 adaptive_crop off the region is the crop_width box and nothing more is
 dropped either.
 
-Summed areas run far beyond the 1..area_bins+1 area edges the adaptive
-threshold uses by default (every molecule above that would share the top bin).
+Summed areas ('sum') run far beyond the 1..area_bins+1 area edges the
+adaptive threshold uses by default (every molecule above that would share the
+top bin).
 GenerateMoleculeAdaptiveThreshold therefore sets the area edges from the
 molecules themselves (area_bin_edges 'equal_count', see
 area_equal_count_edges)
@@ -91,13 +104,13 @@ from scipy.spatial import cKDTree
 from merlin.analysis import decode
 from merlin.analysis import filterbarcodes
 
-MOLECULE_FEATURES = ('summed', 'brightest')
+MOLECULE_FEATURES = ('sum', 'average', 'brightest')
 # Former molecule_features names, read as the new one so that an analysis
 # json or a saved task.json that uses them still loads.
-MOLECULE_FEATURE_ALIASES = {'all_planes': 'summed'}
+MOLECULE_FEATURE_ALIASES = {'summed': 'sum', 'all_planes': 'sum'}
 REMOVED_MOLECULE_FEATURES = {
     'brightest_sum_area': "molecule_features 'brightest_sum_area' was removed;"
-                          " use 'summed' (summed area, area-weighted mean "
+                          " use 'sum' (summed area, area-weighted mean "
                           "intensity and distance) or 'brightest'"}
 
 # A link at exactly the radius or the gap is kept; these absorb float rounding.
@@ -271,12 +284,25 @@ def merge_molecules(barcodes: pandas.DataFrame, labels: np.ndarray,
                                    area, areaSum).astype(
                 barcodes[column].dtype)
 
-    if moleculeFeatures == 'summed':
+    detectionCount = np.bincount(labels, minlength=count)
+    if moleculeFeatures == 'sum':
         out['mean_intensity'] = weighted(meanIntensity, area, areaSum).astype(
             barcodes['mean_intensity'].dtype)
         out['min_distance'] = weighted(minDistance, area, areaSum).astype(
             barcodes['min_distance'].dtype)
         out['area'] = np.minimum(areaSum, _AREA_MAX).astype(
+            _summed_area_dtype(barcodes['area'].dtype))
+    elif moleculeFeatures == 'average':
+        out['mean_intensity'] = (per_molecule_sum(meanIntensity)
+                                 / detectionCount).astype(
+            barcodes['mean_intensity'].dtype)
+        out['min_distance'] = (per_molecule_sum(minDistance)
+                               / detectionCount).astype(
+            barcodes['min_distance'].dtype)
+        # integer floor of the mean: areas are whole pixel counts, so the
+        # float sums are exact integers
+        meanArea = np.rint(areaSum).astype(np.int64) // detectionCount
+        out['area'] = np.minimum(meanArea, _AREA_MAX).astype(
             _summed_area_dtype(barcodes['area'].dtype))
 
     zSorted = zUm[order]
@@ -285,7 +311,7 @@ def merge_molecules(barcodes: pandas.DataFrame, labels: np.ndarray,
     planeBase = int(planes.max() - planes.min()) + 1
     planeKeys = np.sort(labels * planeBase + (planes - planes.min()))
     planeKeys = planeKeys[np.r_[True, planeKeys[1:] != planeKeys[:-1]]]
-    out['n_detections'] = np.bincount(labels, minlength=count).astype(
+    out['n_detections'] = detectionCount.astype(
         _molecule_dtype('n_detections'))
     out['n_planes'] = np.bincount(planeKeys // planeBase,
                                   minlength=count).astype(
@@ -458,8 +484,8 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         max_z_gap_um (0.75): largest depth difference between linked
             detections; 0 links nothing (every detection is its own
             molecule, with the molecule columns added).
-        molecule_features ('summed'): 'summed' or 'brightest', see the
-            module docstring ('all_planes' is read as 'summed').
+        molecule_features ('sum'): 'sum', 'average' or 'brightest', see the
+            module docstring ('summed' and 'all_planes' are read as 'sum').
         crop_to_valid_box (False): drop the detections outside the decode
             task's valid region before linking, see the module docstring.
             Needs a decode task with preprocess_task, crop_width,
@@ -488,7 +514,7 @@ class DeduplicateBarcodes(decode.BarcodeSavingParallelAnalysisTask):
         if 'max_z_gap_um' not in self.parameters:
             self.parameters['max_z_gap_um'] = 0.75
         if 'molecule_features' not in self.parameters:
-            self.parameters['molecule_features'] = 'summed'
+            self.parameters['molecule_features'] = 'sum'
         self.parameters['molecule_features'] = molecule_features_option(
             self.parameters['molecule_features'])
         if 'crop_to_valid_box' not in self.parameters:
