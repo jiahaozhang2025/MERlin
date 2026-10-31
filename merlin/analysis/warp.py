@@ -823,6 +823,48 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     refined; rotation_status gains unrefined_radians and unrefined_trusted,
     which repeat rotation_radians and trusted.
 
+    XY ZERO-SHIFT LOCK (xy_reject_zero_lock, default off). Two frames from
+    the same camera share its fixed pattern, which correlates at exactly
+    zero shift whatever the sample did. On a plane with little bead texture
+    (the glass beyond the tissue, a deep plane without beads) that spike can
+    beat the beads inside the step-3 window, and the sample reads (0, 0)
+    although the stack is offset; when the window misses zero shift by a
+    pixel or two, its best pixel is the spike's shoulder at the window edge
+    nearest zero. A cubic through such samples is pulled towards zero, or is
+    zero at every depth when every sample locks. rigid_walk_confirm rejects
+    the same lock for the rigid offset (a confirming peak within a pixel of
+    zero while the 2D answer is far from zero). With the option on, an xy
+    sample is a zero-shift lock, and is dropped, when
+
+      - the correlation at zero shift is at least the window's best (the
+        spike is the peak, or lies just outside the window and is higher
+        than anything inside it),
+      - the window's best pixel is within xy_zero_lock_reach_px (default 3)
+        of zero shift, and
+      - the stack's rigid offset, the window's centre, is more than
+        xy_zero_lock_min_rigid_px (default 2) from zero (a stack that really
+        sits near zero keeps its samples; the reference stack is at 0).
+
+    The test is made in the frame the sample is measured in (with
+    rotation_task, on the turned-back planes, whose zero shift is the same).
+    A dropped sample enters neither the xy polynomials nor z_xy_refine's xy
+    fit (r1), counts as not kept (kept false in the QC table, so
+    min_xy_planes_kept counts it against the stack) and is left out of the
+    xy fit residual. If fewer than xy_polynomial_order + 2 samples are left,
+    no polynomial is fitted: xy is the constant rigid offset at every depth,
+    as for a rigid_only channel, and fit_quality_flags gives the reason
+    'xy not fitted'. Otherwise xy is the polynomial through the remaining
+    samples at every depth, also beyond the outermost of them where a block
+    of locks ends the stack (nothing is held there, so on glass or other
+    beadless planes, or where most of a stack locks, the cubic can run off
+    beyond the kept samples: check the stacks with many locks). The z samples
+    have no xy search and are not tested; the z gate, finalize()'s z
+    substitution and the rigid offset are unchanged. z_fit_status gains
+    n_xy_samples, n_xy_zero_lock and xy_rigid_fallback (and with z_xy_refine
+    n_xy_zero_lock_first, the locks of the first xy pass); the QC table gains
+    zero_lock. Off: no sample is tested and the tables are exactly as before
+    the option.
+
     Setting z_polynomial_order and xy_polynomial_order to 1 recovers a linear
     ramp in z; setting them to 0 recovers a rigid offset per round with a
     constant z shift.
@@ -1076,6 +1118,49 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             self.parameters['z_xy_refine'] = False
         if not isinstance(self.parameters['z_xy_refine'], (bool, np.bool_)):
             raise ValueError('z_xy_refine must be true or false')
+        # ---- xy samples: drop zero-shift locks (XY ZERO-SHIFT LOCK in the
+        # class docstring) ----
+        # Two frames from the same camera share its fixed pattern, which
+        # correlates at exactly zero shift. On a plane with little bead
+        # texture that spike can beat the beads inside the xy window, and the
+        # sample reads (0, 0) although the stack is offset; rigid_walk_confirm
+        # rejects the same lock for the rigid offset. With this on, an xy
+        # sample is dropped when the correlation at zero shift is at least the
+        # window's best (the spike is the peak, or lies just outside the
+        # window and its shoulder is), the window's best pixel is within
+        # xy_zero_lock_reach_px of zero shift, and the stack's rigid offset is
+        # more than xy_zero_lock_min_rigid_px from zero. Dropped samples
+        # enter neither the xy fit nor z_xy_refine's xy fit and count as not
+        # kept; xy is the cubic through the rest at every depth (no end
+        # hold). False keeps the earlier behaviour exactly.
+        #
+        # The two distances:
+        #   - reach 3 px: where the window misses zero shift by 1 or 2 px its
+        #     best pixel is the one nearest zero shift (the spike's shoulder
+        #     after the 3x3 median and the high pass); 3 or more px away it
+        #     is not;
+        #   - rigid offset 2 px: samples near zero shift in stacks that sit
+        #     within 2 px of zero score like every other sample, so those
+        #     stacks really are near zero; beyond 2 px they score far lower
+        #     and are locks. (3.5 px was tried: the near-zero samples it kept
+        #     were mostly locks.)
+        if 'xy_reject_zero_lock' not in self.parameters:
+            self.parameters['xy_reject_zero_lock'] = False
+        if not isinstance(self.parameters['xy_reject_zero_lock'],
+                          (bool, np.bool_)):
+            raise ValueError('xy_reject_zero_lock must be true or false')
+        if 'xy_zero_lock_reach_px' not in self.parameters:
+            self.parameters['xy_zero_lock_reach_px'] = 3.0
+        if 'xy_zero_lock_min_rigid_px' not in self.parameters:
+            self.parameters['xy_zero_lock_min_rigid_px'] = 2.0
+        for name in ('xy_zero_lock_reach_px', 'xy_zero_lock_min_rigid_px'):
+            value = self.parameters[name]
+            if isinstance(value, (bool, np.bool_)) \
+                    or not isinstance(value, (int, float, np.integer,
+                                              np.floating)) \
+                    or not np.isfinite(value) or value < 0:
+                raise ValueError('%s must be a number >= 0, not %r'
+                                 % (name, value))
         # Channels that get a rigid xy offset and NO 3D warp. Empty by
         # default, so nothing changes for a dataset that does not set it.
         if 'rigid_only_channels' not in self.parameters:
@@ -1362,12 +1447,18 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     def _bounded_correlation_peak(self, fixedImage: np.ndarray,
                                   movingImage: np.ndarray,
                                   centreY: float, centreX: float,
-                                  fixedKey=None, bound=None):
+                                  fixedKey=None, bound=None,
+                                  zeroShift=False):
         """Peak of the cross-correlation of two frames, searched only within
         xy_search_bound pixels of (centreY, centreX).
 
-        Returns (dy, dx, snr) where (dy, dx) is the shift to apply to
-        movingImage to bring it onto fixedImage.
+        Returns (dy, dx, snr, onEdge) where (dy, dx) is the shift to apply
+        to movingImage to bring it onto fixedImage. With zeroShift, a fifth
+        element (zeroBest, peakDistance) describes zero shift for
+        xy_reject_zero_lock: zeroBest is true when the correlation at zero
+        shift is at least the window's best (whether zero shift lies in the
+        window or not), peakDistance is the distance of the window's best
+        pixel (before the sub-pixel step) from zero shift.
         """
         correlation = np.fft.irfft2(
             self._fixed_fft(fixedImage, fixedKey)
@@ -1405,19 +1496,28 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     / (correlation.std() + 1e-12))
         onEdge = bool(i in (0, window.shape[0] - 1)
                       or j in (0, window.shape[1] - 1))
+        if zeroShift:
+            zeroBest = bool(correlation[0, 0] >= window[i, j])
+            peakDistance = float(np.hypot(peakY, peakX))
+            return (peakY + subY, peakX + subX, snr, onEdge,
+                    (zeroBest, peakDistance))
         return peakY + subY, peakX + subX, snr, onEdge
 
     def _robust_polyfit(self, z: np.ndarray, values: np.ndarray,
-                        order: int) -> np.ndarray:
+                        order: int, usable=None) -> np.ndarray:
         """Polynomial fit with iterative sigma trimming.
 
         Returns the coefficients in np.polyval order. Points that survive the
         trimming are the ones the fit is based on; the trimmed ones are
-        recorded in the QC table by the caller.
+        recorded in the QC table by the caller. usable (boolean, one per
+        point; None = all) leaves points out of the fit altogether, as if
+        they were not finite.
         """
         z = np.asarray(z, dtype=float)
         values = np.asarray(values, dtype=float)
         finite = np.isfinite(z) & np.isfinite(values)
+        if usable is not None:
+            finite &= np.asarray(usable, dtype=bool)
         if finite.sum() < order + 2:
             return np.zeros(order + 1), finite
 
@@ -1727,7 +1827,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     def _measure_xy_offsets(self, fov: int, dataChannel: int,
                             rigidY: float, rigidX: float,
                             zCoefficients: np.ndarray):
-        """Per-plane xy offset, measured after the z correction is applied."""
+        """Per-plane xy offset, measured after the z correction is applied.
+
+        Returns (z, dy, dx, snr, onEdge, zeroLock), one entry per sample.
+        zeroLock marks the zero-shift locks (xy_reject_zero_lock; all false
+        with the option off): see _is_zero_lock."""
         dataOrganization = self.dataSet.get_data_organization()
         zPositions = np.asarray(
             dataOrganization.get_fiducial3D_stack_frame_zPos(dataChannel),
@@ -1735,6 +1839,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         planeCount = len(zPositions)
         planeIndices = list(range(1, planeCount - 1,
                                   self.parameters['xy_sample_step']))
+        guard = bool(self.parameters['xy_reject_zero_lock'])
 
         def measure_one(planeIndex):
             zPosition = zPositions[planeIndex]
@@ -1742,15 +1847,67 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
             fixedImage = self._fiducial_plane(0, fov, planeIndex)
             movingImage = self._fiducial_plane_at_z(
                 dataChannel, fov, zPosition + zOffset)
-            dy, dx, snr, onEdge = self._bounded_correlation_peak(
-                fixedImage, movingImage, rigidY, rigidX, fixedKey=planeIndex)
-            return zPosition, dy, dx, snr, onEdge
+            if not guard:
+                dy, dx, snr, onEdge = self._bounded_correlation_peak(
+                    fixedImage, movingImage, rigidY, rigidX,
+                    fixedKey=planeIndex)
+                return zPosition, dy, dx, snr, onEdge, False
+            dy, dx, snr, onEdge, zero = self._bounded_correlation_peak(
+                fixedImage, movingImage, rigidY, rigidX, fixedKey=planeIndex,
+                zeroShift=True)
+            return (zPosition, dy, dx, snr, onEdge,
+                    self._is_zero_lock(zero, rigidY, rigidX))
 
         results = self._map_over_planes(measure_one, planeIndices)
-        measuredZ, measuredY, measuredX, measuredSnr, measuredEdge = (
-            zip(*results) if results else ((), (), (), (), ()))
+        (measuredZ, measuredY, measuredX, measuredSnr, measuredEdge,
+         measuredLock) = (zip(*results) if results
+                          else ((), (), (), (), (), ()))
         return (np.array(measuredZ), np.array(measuredY), np.array(measuredX),
-                np.array(measuredSnr), np.array(measuredEdge, dtype=bool))
+                np.array(measuredSnr), np.array(measuredEdge, dtype=bool),
+                np.array(measuredLock, dtype=bool))
+
+    def _is_zero_lock(self, zero, rigidY: float, rigidX: float) -> bool:
+        """xy_reject_zero_lock: is an xy sample the camera's fixed pattern?
+        zero = (zeroBest, peakDistance) from _bounded_correlation_peak. True
+        when the correlation at zero shift is at least the window's best,
+        the window's best pixel is within xy_zero_lock_reach_px of zero
+        shift, and the rigid offset (the window's centre) is more than
+        xy_zero_lock_min_rigid_px from zero. The same test as
+        rigid_walk_confirm's (a peak at zero shift while the answer it is
+        checked against is far from zero), with distances suited to the
+        +-xy_search_bound window, which can miss zero shift by a pixel or
+        two (see __init__)."""
+        zeroBest, peakDistance = zero
+        return bool(
+            zeroBest
+            and peakDistance <= float(self.parameters['xy_zero_lock_reach_px'])
+            and np.hypot(rigidY, rigidX)
+            > float(self.parameters['xy_zero_lock_min_rigid_px']))
+
+    def _fit_xy_samples(self, sampleZ, sampleY, sampleX, zeroLock,
+                        rigidY: float, rigidX: float, order: int):
+        """The y and x polynomials through the xy samples:
+        ((yCoefficients, yKept), (xCoefficients, xKept), rigidFallback).
+
+        Option off (xy_reject_zero_lock false): _robust_polyfit of every
+        sample, exactly as before the option. On: the zero-shift locks are
+        left out; if fewer than order + 2 samples remain, no polynomial can
+        be fitted and the curves are the constant rigid offset (as for a
+        rigid_only channel), kept all false and rigidFallback true. rigidY /
+        rigidX must be in the frame the samples are in."""
+        if not self.parameters['xy_reject_zero_lock']:
+            return (self._robust_polyfit(sampleZ, sampleY, order),
+                    self._robust_polyfit(sampleZ, sampleX, order), False)
+        usable = (~np.asarray(zeroLock, dtype=bool)
+                  & np.isfinite(sampleZ) & np.isfinite(sampleY)
+                  & np.isfinite(sampleX))
+        if int(usable.sum()) < order + 2:
+            nothing = np.zeros(len(sampleZ), bool)
+            return ((np.r_[np.zeros(order), float(rigidY)], nothing),
+                    (np.r_[np.zeros(order), float(rigidX)], nothing.copy()),
+                    True)
+        return (self._robust_polyfit(sampleZ, sampleY, order, usable),
+                self._robust_polyfit(sampleZ, sampleX, order, usable), False)
 
     @staticmethod
     def _row_transform(row):
@@ -2374,9 +2531,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
             nGood, zFitted, zCoefficients, zKept = fit_z(
                 zGate, zSampleZ, zSampleOffset)
-            xySampleZ, xySampleY, xySampleX, xySnr, xyEdge = \
+            xySampleZ, xySampleY, xySampleX, xySnr, xyEdge, xyLock = \
                 self._measure_xy_offsets(fov, dataChannel, rigidY, rigidX,
                                          zCoefficients)
+            zeroGuard = bool(self.parameters['xy_reject_zero_lock'])
 
             # z_xy_refine: z measured again with each moving plane shifted by
             # the xy fit at its own depth, then z refitted and xy measured
@@ -2389,12 +2547,17 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                 'fitted_first': bool(zFitted),
                                 'z_refined': False,
                                 'refine_max_shift_px': np.nan}
+                if zeroGuard:
+                    refineStatus['n_xy_zero_lock_first'] = int(xyLock.sum())
                 firstZ = (zSampleZ, zSampleOffset, zSampleScore, zKept,
                           zCoefficients)
                 for _ in range(max(1, int(self._zXyRefinePasses))):
-                    shiftCoefficients = (
-                        self._robust_polyfit(xySampleZ, xySampleY, xyOrder)[0],
-                        self._robust_polyfit(xySampleZ, xySampleX, xyOrder)[0])
+                    # the xy fit without the zero-shift locks
+                    # (xy_reject_zero_lock), in the measurement frame
+                    yFit, xFit, _ = self._fit_xy_samples(
+                        xySampleZ, xySampleY, xySampleX, xyLock, rigidY,
+                        rigidX, xyOrder)
+                    shiftCoefficients = (yFit[0], xFit[0])
                     rZ, rOffset, rScore, rCeiling = self._measure_z_offsets(
                         fov, dataChannel, rigidY, rigidX, shiftCoefficients)
                     rGate = self._z_sample_gate(rOffset, rScore, rCeiling)
@@ -2413,9 +2576,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                         rZ, rOffset, rScore, rGate
                     nGood, zFitted, zCoefficients, zKept = fit_z(
                         zGate, zSampleZ, zSampleOffset)
-                    xySampleZ, xySampleY, xySampleX, xySnr, xyEdge = \
-                        self._measure_xy_offsets(fov, dataChannel, rigidY,
-                                                 rigidX, zCoefficients)
+                    (xySampleZ, xySampleY, xySampleX, xySnr, xyEdge,
+                     xyLock) = self._measure_xy_offsets(
+                        fov, dataChannel, rigidY, rigidX, zCoefficients)
 
             if theta != 0.0:
                 # shifts measured on the turned-back planes -> shift of the
@@ -2423,10 +2586,13 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 xySampleX, xySampleY = self._rotate_vector(
                     (xySampleX, xySampleY), theta)
             self._measurementRotation.pop((fov, dataChannel), None)
-            yCoefficients, yKept = self._robust_polyfit(
-                xySampleZ, xySampleY, xyOrder)
-            xCoefficients, xKept = self._robust_polyfit(
-                xySampleZ, xySampleX, xyOrder)
+            # the fallback for too few samples left by xy_reject_zero_lock is
+            # the rigid offset, in the frame the samples are now in
+            movingRigidY, movingRigidX = self._to_moving_frame(
+                rigidY, rigidX, theta)
+            (yCoefficients, yKept), (xCoefficients, xKept), xyRigid = \
+                self._fit_xy_samples(xySampleZ, xySampleY, xySampleX, xyLock,
+                                     movingRigidY, movingRigidX, xyOrder)
 
             entry = {'z': zCoefficients, 'y': yCoefficients,
                      'x': xCoefficients}
@@ -2437,6 +2603,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                       'n_gated_out': int(len(zGate) - nGood),
                       'fitted': bool(zFitted),
                       'source': 'fit' if zFitted else 'unfitted'}
+            if zeroGuard:
+                status.update(n_xy_samples=int(len(xySampleZ)),
+                              n_xy_zero_lock=int(xyLock.sum()),
+                              xy_rigid_fallback=bool(xyRigid))
             if refineStatus is not None:
                 # n_good above is the refined count when z_refined
                 status.update(refineStatus)
@@ -2469,19 +2639,37 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                     'zPos': xySampleZ, 'measured': xySampleX,
                     'fitted': np.polyval(xCoefficients, xySampleZ),
                     'score': xySnr, 'kept': xKept, 'on_edge': xyEdge}))
+                if zeroGuard:
+                    # xy_reject_zero_lock: which xy samples were dropped as
+                    # zero-shift locks (false on the z rows)
+                    for frame in measurements[:-2]:
+                        frame['zero_lock'] = False
+                    measurements[-2]['zero_lock'] = xyLock
+                    measurements[-1]['zero_lock'] = xyLock
 
             residualY = xySampleY - np.polyval(yCoefficients, xySampleZ)
             residualX = xySampleX - np.polyval(xCoefficients, xySampleZ)
+            if zeroGuard:
+                # a zero-shift lock is not a measurement: the residual is the
+                # remaining samples' (NaN if none), while the kept fraction
+                # below still counts it in its denominator
+                residualY = residualY[~xyLock]
+                residualX = residualX[~xyLock]
             zResidual = float(np.median(np.abs(
                 zSampleOffset - np.polyval(zCoefficients, zSampleZ))))
-            yResidual = float(np.median(np.abs(residualY)))
-            xResidual = float(np.median(np.abs(residualX)))
+            yResidual = (float(np.median(np.abs(residualY)))
+                         if not zeroGuard or len(residualY) else np.nan)
+            xResidual = (float(np.median(np.abs(residualX)))
+                         if not zeroGuard or len(residualX) else np.nan)
             keptFraction = (float(yKept.sum()) / len(xySampleZ)
                             if len(xySampleZ) else 0.0)
             line = ('fov %d channel %d: z fit residual %.3f um, '
                     'xy fit residual %.3f / %.3f px, %d/%d xy planes kept'
                     % (fov, dataChannel, zResidual, yResidual, xResidual,
                        int(yKept.sum()), len(xySampleZ)))
+            if zeroGuard:
+                line += ', %d xy zero-shift lock%s dropped' % (
+                    int(xyLock.sum()), '' if int(xyLock.sum()) == 1 else 's')
 
             reasons = []
             if zResidual > self.parameters['max_z_fit_residual']:
@@ -2493,6 +2681,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                                   self.parameters['max_xy_fit_residual']))
             if keptFraction < self.parameters['min_xy_planes_kept']:
                 reasons.append('only %.0f%% of xy planes kept' % (100 * keptFraction))
+            if xyRigid:
+                reasons.append('xy not fitted: %d of %d xy samples were '
+                               'zero-shift locks, rigid offset at every depth'
+                               % (int(xyLock.sum()), len(xySampleZ)))
             if roundAngles is not None and key != referenceStack:
                 line += ', round angle %.4f deg' % np.degrees(theta)
             if refineStatus is not None:
@@ -2519,6 +2711,14 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                          'fovs curve if z_neighbor_substitution is on. ***'
                          % (fov, dataChannel, nGood, len(zGate),
                             self.parameters['z_min_good_samples']))
+            if xyRigid:
+                line += ('\n  *** XY NOT FITTED, fov %d channel %d: %d of %d '
+                         'xy samples were zero-shift locks, fewer than %d '
+                         'left. xy is the rigid offset (%.2f, %.2f) at every '
+                         'depth. ***'
+                         % (fov, dataChannel, int(xyLock.sum()),
+                            len(xySampleZ), xyOrder + 2, movingRigidY,
+                            movingRigidX))
             # rotation_task: the round angle and the rotation task's verdict
             # on this fov's own first-plane angle, written as rotation_status
             rotationStatus = None
@@ -2641,10 +2841,15 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 fov=fov, dataChannel=dataChannel, owner_channel=dataChannel,
                 n_samples=0, n_good=0, n_gated_out=0, fitted=False,
                 source='rigid_only'))
+            if self.parameters['xy_reject_zero_lock']:
+                statusRows[-1].update(n_xy_samples=0, n_xy_zero_lock=0,
+                                      xy_rigid_fallback=False)
             if self.parameters['z_xy_refine']:
                 statusRows[-1].update(n_good_first=0, fitted_first=False,
                                       z_refined=False,
                                       refine_max_shift_px=np.nan)
+                if self.parameters['xy_reject_zero_lock']:
+                    statusRows[-1]['n_xy_zero_lock_first'] = 0
 
         # One row per data channel, always written, so finalize() can find the
         # stacks needing substitution without re-reading any measurement, and
@@ -2652,12 +2857,21 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         # run". source is 'fit', 'unfitted' or 'rigid_only'; finalize()
         # rewrites 'unfitted' to 'neighbor' when it substitutes one. With
         # z_xy_refine, n_good / fitted are the final values and the first
-        # pass's are kept beside them.
+        # pass's are kept beside them. With xy_reject_zero_lock, the xy
+        # samples of the final xy pass, how many of them were dropped as
+        # zero-shift locks, and whether too few were left for a fit (the
+        # rigid offset at every depth); with z_xy_refine too, the locks of
+        # the first xy pass, whose fit z_xy_refine used.
         statusColumns = ['fov', 'dataChannel', 'owner_channel', 'n_samples',
                          'n_good', 'n_gated_out', 'fitted', 'source']
+        if self.parameters['xy_reject_zero_lock']:
+            statusColumns += ['n_xy_samples', 'n_xy_zero_lock',
+                              'xy_rigid_fallback']
         if self.parameters['z_xy_refine']:
             statusColumns += ['n_good_first', 'fitted_first', 'z_refined',
                               'refine_max_shift_px']
+            if self.parameters['xy_reject_zero_lock']:
+                statusColumns += ['n_xy_zero_lock_first']
         self.dataSet.save_dataframe_to_csv(
             pd.DataFrame(statusRows, columns=statusColumns)
             .sort_values('dataChannel'),

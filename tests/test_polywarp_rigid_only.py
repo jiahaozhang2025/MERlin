@@ -97,7 +97,7 @@ def run_task(rigidOnly, raw=None):
         z = Z[1:-1:3]
         _, dy, dx = drift(dataChannel, z)
         return (z, rigidY + dy, rigidX + dx, np.full(len(z), 50.0),
-                np.zeros(len(z), bool))
+                np.zeros(len(z), bool), np.zeros(len(z), bool))
 
     task._measure_rigid_offsets = lambda fov: [RIGID[c] for c in CHANNELS]
     task._measure_z_offsets = measure_z

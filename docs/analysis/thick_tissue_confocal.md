@@ -75,6 +75,15 @@ misidentification rate and all of `Segment`.
   samples although their xy fits are clean and the beads are bright, typically
   because the stack's xy moves by a few pixels with depth. z is then sampled
   at each depth's own xy; `n_good_first` keeps the first pass's count.
+- `xy_reject_zero_lock`: Turn it on when the `measurements` QC table shows xy
+  samples reading (0, 0) in stacks whose rigid offset is a few pixels or more
+  from zero (the camera's fixed pattern on beadless planes). They are then
+  left out of the xy fit; `n_xy_zero_lock` in `z_fit_status` counts them, and
+  `xy_rigid_fallback` marks stacks left with too few samples, which keep their
+  rigid offset at every depth. Elsewhere xy is the cubic through the kept
+  samples, beyond the last of them too (nothing is held), so check stacks with
+  many locks, such as glass FOVs. Stacks within `xy_zero_lock_min_rigid_px` (2)
+  of zero keep all their samples.
 - `max_z_fit_residual`, `max_xy_fit_residual`, `min_xy_planes_kept`: A wrong
   rigid offset shows up as a large residual of the fit on top of it; such fits
   are listed in `transformations/fit_quality_flags_<fov>.csv`.

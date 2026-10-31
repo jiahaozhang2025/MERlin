@@ -209,6 +209,33 @@ on, the z samples are measured a second time, each shifted by the fitted xy at
 its own depth, and z is refitted and xy measured again on the new z curve.
 The refined samples are used unless fewer of them pass the gate.
 
+*Dropping zero-shift locks among the xy samples (`xy_reject_zero_lock`, off
+by default).* The camera's fixed pattern, which `rigid_walk_confirm` keeps
+out of the rigid offset, also reaches the per-depth xy samples. On a plane
+with little bead texture, such as the glass beyond the tissue or a deep plane
+without beads, the zero-shift spike of the fixed pattern can beat the beads
+inside the xy window, and the sample reads (0, 0) although the stack is
+offset. When the window misses zero shift by a pixel or two, its best pixel
+is the spike's shoulder at the window edge facing zero. A run of such samples
+pulls the top or the bottom of the cubic towards zero, and where nearly every
+sample of a stack locks, the stack is registered at zero shift. With the
+option on, a sample counts as a lock when the correlation at zero shift is at
+least the window's best, the window's best pixel is within 3 px of zero shift,
+and the stack's rigid offset is more than 2 px from zero. Near-zero samples of
+stacks within 2 px of zero score like every other sample (they really sit
+there), while beyond 2 px they score far lower. A lock is left out of the xy
+fit, as if trimmed. When fewer samples are left than the polynomial needs
+(`xy_polynomial_order` + 2), the stack takes its rigid offset at every depth,
+which is what the coverglass beads measured. Otherwise xy is the cubic through
+the kept samples at every depth, also beyond the outermost of them, so where
+most of a stack locks, on glass for example, the cubic can run off beyond the
+kept samples: check the stacks with many locks.
+
+Two additions were tried and removed. Holding xy beyond the outermost kept
+sample changed almost nothing once the fiducial filter kept only the brightest
+pixels (`zero_below_percentile` 99). A larger minimum rigid offset (3.5 px)
+kept near-zero samples that were mostly camera locks.
+
 **`CrossFOVCompositeWarp`** (from Lida Cheng). When the stage drifts between
 rounds, part of a FOV's field in a late round was imaged by the neighbouring FOV
 instead. Per-FOV registration can only mark that strip invalid, so its molecules

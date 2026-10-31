@@ -382,6 +382,17 @@ Opt-in tasks; nothing changes unless an analysis lists them
     `rotation_task`), no walk; z and xy are then fitted from it. With
     `measure_on` `fiducial_frame`: surface shift, angle, surface shift again,
     depth fit.
+  - `xy_reject_zero_lock` (default false, with `xy_zero_lock_reach_px` 3 and
+    `xy_zero_lock_min_rigid_px` 2): Drops an xy sample that is the camera's
+    fixed pattern at zero shift (the correlation at zero shift is at least
+    the window's best, the window's best pixel is within the reach of zero
+    shift, and the stack's rigid offset is more than the minimum from zero),
+    the same lock `rigid_walk_confirm` rejects. Dropped samples leave the xy
+    fit and `z_xy_refine`'s xy fit and count as not kept; too few left and xy
+    is the rigid offset at every depth. Beyond the outermost kept sample xy
+    is the cubic through the kept samples. `z_fit_status` gains
+    `n_xy_samples`, `n_xy_zero_lock`, `xy_rigid_fallback` (and
+    `n_xy_zero_lock_first`), the QC table `zero_lock`.
   - `measure_on` (`FiducialRoundRotation`, default `stack_plane`):
     `fiducial_frame` measures the angle on the 2D fiducial frames instead,
     starting from the frames' own rigid offset (one bounded 2D correlation, no
@@ -479,7 +490,8 @@ Opt-in tasks; nothing changes unless an analysis lists them
   synthetic spots, windowed fiducial peak search, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
   PolyWarp round angle (`rotation_task`), round rotation
   (`FiducialRoundRotation`), surface-first registration (`measure_on`
-  `fiducial_frame` with `rigid_source` `frame`).
+  `fiducial_frame` with `rigid_source` `frame`), xy zero-shift locks
+  (`xy_reject_zero_lock`).
 - Removed: PolyWarp's per-stack in-plane angle (`rotation_correction` without
   `rotation_task`, with `rotation_tiles`, `rotation_tile_min_snr`,
   `rotation_min_tiles`, `rotation_min_planes`, `rotation_max_degrees`,
