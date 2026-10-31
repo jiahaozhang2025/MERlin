@@ -377,6 +377,17 @@ Opt-in tasks; nothing changes unless an analysis lists them
     the median curve of the same round in neighbouring FOVs.
   - `max_z_fit_residual`, `max_xy_fit_residual`, `min_xy_planes_kept`: Flag
     suspect fits in `fit_quality_flags_<fov>.csv`.
+  - `rigid_source` (default `frame_and_walk`): `frame` takes the rigid offset
+    from the 2D fiducial frame alone (turned back by the round angle with
+    `rotation_task`), no walk; z and xy are then fitted from it. With
+    `measure_on` `fiducial_frame`: surface shift, angle, surface shift again,
+    depth fit.
+  - `measure_on` (`FiducialRoundRotation`, default `stack_plane`):
+    `fiducial_frame` measures the angle on the 2D fiducial frames instead,
+    starting from the frames' own rigid offset (one bounded 2D correlation, no
+    walk into the bead stack; same tile fit, residual pass and alignment check,
+    no depth match); the gate's depth test is dropped (`aligned_score` >=
+    `z_min_score` stays), and `plane_index` is -1 with the depth columns empty.
   - `rotation_task` (default unset): In-plane rotation, one angle per round.
     Names a `FiducialRoundRotation` task, and every stack of a round gets that
     task's round angle: its frames are turned back by it before the rigid
@@ -467,7 +478,8 @@ Opt-in tasks; nothing changes unless an analysis lists them
 - Tests (`python -m unittest discover tests`): stitched workflow, chromatic fit on
   synthetic spots, windowed fiducial peak search, PolyWarp rigid-only channels, rigid walk and `z_xy_refine`,
   PolyWarp round angle (`rotation_task`), round rotation
-  (`FiducialRoundRotation`).
+  (`FiducialRoundRotation`), surface-first registration (`measure_on`
+  `fiducial_frame` with `rigid_source` `frame`).
 - Removed: PolyWarp's per-stack in-plane angle (`rotation_correction` without
   `rotation_task`, with `rotation_tiles`, `rotation_tile_min_snr`,
   `rotation_min_tiles`, `rotation_min_planes`, `rotation_max_degrees`,

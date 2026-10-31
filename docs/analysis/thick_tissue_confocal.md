@@ -66,7 +66,11 @@ misidentification rate and all of `Segment`.
   `round_rotation.csv` holds the round angles; `fov_rotation.csv` lists the
   FOVs whose own angle was untrusted or deviated (flagged, not corrected).
   Without `rotation_task` there is no rotation. `CrossFOVCompositeWarp` does
-  not accept a `PolyWarp` with `rotation_task`.
+  not accept a `PolyWarp` with `rotation_task`. `measure_on`
+  `fiducial_frame` measures the angle on the 2D fiducial frames instead of a
+  bead-stack plane; compare both on the dataset before choosing. With it,
+  `rigid_source` `frame` in `PolyWarp` registers surface first: surface
+  shift, angle, surface shift again, then the depth fit.
 - `z_xy_refine`: Turn it on when `z_fit_status` shows stacks with few good z
   samples although their xy fits are clean and the beads are bright, typically
   because the stack's xy moves by a few pixels with depth. z is then sampled

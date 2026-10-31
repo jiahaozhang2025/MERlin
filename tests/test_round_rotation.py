@@ -9,6 +9,11 @@ round is beadless (flagged as untrusted; in the registration its z is unfitted
 and finalize() substitutes it). Both tasks' own measurement, aggregation, table
 and application code run end to end; only the dataset is a stand-in.
 
+measure_on 'fiducial_frame' runs on a variant whose 2D fiducial frames are
+dense, clean bead fields turned by angles of their own (FRAME_DEG, not the
+stacks' ROUND_DEG), so recovering them shows the frame was measured; the
+beadless stack's 2D frame has beads and is trusted there.
+
 Run with `python -m unittest tests/test_round_rotation.py`.
 """
 import contextlib
@@ -34,6 +39,8 @@ STACK = {0: 'r0', 1: 'r1', 2: 'r1', 3: 'r2', 4: 'nuc'}
 ROUND_DEG = {'r1': 0.3, 'r2': -0.2, 'nuc': 0.12}
 DEVIANT = (5, 'r1', 0.15)       # fov, stack, extra degrees
 BEADLESS = (4, 'r2')
+# the 2D fiducial frames of _FrameDataSet turn by these instead
+FRAME_DEG = {'r1': 0.25, 'r2': -0.15, 'nuc': 0.2}
 
 
 def beads(seed, n=500):
@@ -74,6 +81,17 @@ def moved(image, matrix):
     # forward map: moving(matrix p) = image(p)
     return cv2.warpAffine(image, matrix[:2], SHAPE[::-1],
                           flags=cv2.INTER_LINEAR, borderValue=0)
+
+
+def frame_truth(stack, fov):
+    """The 2D fiducial frame's output->input map in _FrameDataSet: its own
+    angle, the stack's translation at z = 0."""
+    theta = np.radians(FRAME_DEG[stack])
+    t = true_shift(stack, fov, 0.0)
+    c, s = np.cos(theta), np.sin(theta)
+    cx, cy = CENTRE
+    return np.array([[c, -s, cx - c * cx + s * cy + t[0]],
+                     [s, c, cy - s * cx - c * cy + t[1]], [0, 0, 1.0]])
 
 
 class _Org:
@@ -180,6 +198,23 @@ class _DataSet:
 
     def load_analysis_task(self, name):
         return self.tasks[name]
+
+
+class _FrameDataSet(_DataSet):
+    """_DataSet with coverslip-like 2D fiducial frames: 1500 beads, little
+    noise, each round's frame turned by FRAME_DEG (the same in every fov)."""
+
+    def __init__(self):
+        super().__init__()
+        for fov in FOVS:
+            rng = np.random.default_rng(500 + fov)
+            fixed2D = beads(7000 + fov, n=1500)
+            self.twoD['r0', fov] = (fixed2D + 100 + rng.normal(
+                0, 5, SHAPE).astype(np.float32))
+            for stack in ('r1', 'r2', 'nuc'):
+                self.twoD[stack, fov] = (
+                    moved(fixed2D, frame_truth(stack, fov)) + 100
+                    + rng.normal(0, 5, SHAPE).astype(np.float32))
 
 
 SHARED = {'highpass_sigma': 3, 'median_filter': False,
@@ -342,6 +377,13 @@ class RoundRotationTests(unittest.TestCase):
             FiducialRoundRotation(_DataSet(), {'refine_passes': -1})
         with self.assertRaises(ValueError):
             FiducialRoundRotation(_DataSet(), {'measure_plane': 2.5})
+        with self.assertRaises(ValueError):
+            FiducialRoundRotation(_DataSet(), {'measure_on': 'stack'})
+        with self.assertRaises(ValueError):
+            FiducialRoundRotation(_DataSet(), {'measure_on': 'fiducial_frame',
+                                               'measure_plane': 3})
+        self.assertEqual(FiducialRoundRotation(_DataSet()).parameters[
+            'measure_on'], 'stack_plane')
         defaults = FiducialPolynomialWarp3D(_DataSet()).parameters
         task = FiducialRoundRotation(_DataSet())
         for name in FiducialRoundRotation._MEASUREMENT_PARAMETERS:
@@ -353,6 +395,90 @@ class RoundRotationTests(unittest.TestCase):
                           task.parameters['rotation_min_tiles']), (6, 8.0, 8))
         for name in FiducialPolynomialWarp3D._REMOVED_PARAMETERS:
             self.assertNotIn(name, defaults)
+
+    # ---- measure_on ----
+
+    def test_explicit_stack_plane_is_the_default(self):
+        dataSet = _DataSet()
+        task = FiducialRoundRotation(dataSet, dict(SHARED,
+                                                   measure_on='stack_plane'),
+                                     'RoundRot')
+        dataSet.tasks['RoundRot'] = task
+        self.assertEqual(run_all(task), self.roundLog)
+        mine = {k: v for k, v in dataSet.saved.items() if k[0] == 'RoundRot'}
+        default = {k: v for k, v in self.dataSet.saved.items()
+                   if k[0] == 'RoundRot'}
+        self.assertEqual(mine.keys(), default.keys())
+        for key in mine:
+            self.assertEqual(mine[key], default[key], key)
+
+    def test_fiducial_frame_angles_recovered(self):
+        dataSet = _FrameDataSet()
+        task = round_task(dataSet, measure_on='fiducial_frame')
+        log = run_all(task)
+        self.assertIn('2D fiducial frame (aligned', log)
+        self.assertNotIn('depth', log.split('round angles')[0])
+        for fov in FOVS:
+            table = task.get_first_plane_rotation(fov)
+            self.assertEqual(sorted(table.owner_channel), [1, 3, 4])
+            for row in table.itertuples():
+                stack = STACK[row.owner_channel]
+                self.assertEqual(row.plane_index, -1)
+                for column in ('plane_z_um', 'depth_offset_um',
+                               'depth_score'):
+                    self.assertTrue(np.isnan(getattr(row, column)), column)
+                # the beadless STACK does not matter: its 2D frame has beads
+                self.assertTrue(row.trusted, (fov, stack, row.reason))
+                self.assertTrue(row.depth_ok)
+                self.assertGreater(row.aligned_score, 0.9)
+                self.assertAlmostEqual(row.angle_deg, FRAME_DEG[stack],
+                                       delta=0.01, msg=(fov, stack))
+                tx, ty = true_shift(stack, fov, 0.0)
+                self.assertAlmostEqual(row.xshift, tx, delta=0.1)
+                self.assertAlmostEqual(row.yshift, ty, delta=0.1)
+        table = task.get_round_rotation().set_index('owner_channel')
+        for owner, stack in ((1, 'r1'), (3, 'r2'), (4, 'nuc')):
+            self.assertAlmostEqual(table.loc[owner, 'angle_deg'],
+                                   FRAME_DEG[stack], delta=0.0075)
+            self.assertEqual(table.loc[owner, 'n_fovs'], 9)
+            self.assertEqual(table.loc[owner, 'plane_index'], -1)
+        self.assertFalse(task.get_fov_rotation().flagged.any())
+        # the default measures the bead stacks of the same dataset, which
+        # turn by ROUND_DEG
+        stackTask = FiducialRoundRotation(dataSet, dict(SHARED), 'StackRot')
+        with contextlib.redirect_stdout(io.StringIO()):
+            stackTask._run_analysis(0)
+        stackTable = stackTask.get_first_plane_rotation(0).set_index(
+            'owner_channel')
+        for owner, stack in ((1, 'r1'), (3, 'r2'), (4, 'nuc')):
+            self.assertAlmostEqual(stackTable.loc[owner, 'angle_deg'],
+                                   ROUND_DEG[stack], delta=0.01)
+        # and PolyWarp applies the frame-measured round angle
+        poly = poly_task(dataSet)
+        with contextlib.redirect_stdout(io.StringIO()):
+            poly._run_analysis(0)
+        angles = task.get_round_angles()
+        applied = poly.get_transformation_table(0)
+        for dataChannel in STACK:
+            np.testing.assert_allclose(
+                applied[applied.dataChannel == dataChannel]
+                .rotation_radians.to_numpy(float), angles[dataChannel],
+                rtol=0, atol=1e-15)
+
+    def test_fiducial_frame_gate_without_depth(self):
+        # an aligned score below z_min_score untrusts the fov, with a reason
+        # that names the score, not a depth
+        dataSet = _FrameDataSet()
+        task = round_task(dataSet, measure_on='fiducial_frame',
+                          z_min_score=0.999)
+        with contextlib.redirect_stdout(io.StringIO()):
+            task._run_analysis(0)
+        table = task.get_first_plane_rotation(0)
+        self.assertFalse(table.trusted.any())
+        self.assertFalse(table.depth_ok.any())
+        for reason in table.reason:
+            self.assertIn('below z_min_score', reason)
+            self.assertNotIn('depth', reason)
 
     # ---- the registration with rotation_task ----
 

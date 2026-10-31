@@ -734,10 +734,11 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
 
       t1. its fiducial planes and its 2D fiducial frame are turned back by
           the round angle about the frame centre, from the start;
-      t2. the rigid offset (2D frame, walk, rigid_walk_confirm) is measured
-          on those turned-back frames;
+      t2. the rigid offset is measured on those turned-back frames: the 2D
+          frame refined by the walk (rigid_walk_confirm), or with
+          rigid_source 'frame' the 2D frame alone (RIGID SOURCE below);
       t3. steps 2-3 (and z_xy_refine, if on) run on the turned-back planes,
-          exactly as without rotation;
+          about that rigid offset, exactly as without rotation;
       t4. the rigid offset and the xy shifts are turned back into the
           moving frame before they are stored, so rigid_y/rigid_x and
           xshift/yshift keep their meaning (xshift/yshift = displacement of
@@ -764,6 +765,26 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
     saved with it still loads, so the tables it wrote can be read and
     applied (their angle is in rotation_radians), but it does not run (see
     __init__).
+
+    RIGID SOURCE (rigid_source). 'frame_and_walk' (the default) takes the
+    rigid offset from the 2D fiducial frame and lets the walk into the bead
+    stack (rigid_plane_search, rigid_walk_confirm) refine or overrule it.
+    'frame' takes it from the 2D frame alone: one bounded correlation
+    (+-rigid_search_bound about zero) of the filtered 2D frames, no walk;
+    the walk options are not used, and with rigid_walk_confirm on the
+    rigid_walk table reads branch 'frame'. Steps 2-3 and z_xy_refine then
+    search about that offset as usual. Together with a rotation task that
+    measures on the 2D frame (FiducialRoundRotation measure_on
+    'fiducial_frame') this gives the surface-first order:
+
+      s1. surface rigid xy: the round task's coarse shift, the 2D frame's
+          own offset (unrotated frames);
+      s2. rotation: the round task's tile fit on the 2D frames, starting
+          from that shift; the round angle is the median over fovs;
+      s3. surface rigid xy again: here, on the 2D frame turned back by the
+          round angle (t1-t2), no walk;
+      s4. polywarp: the z search, the xy polynomial, z_xy_refine, the z
+          gate and finalize()'s neighbour substitution, from that offset.
 
     RIGID WALK CONFIRMATION (rigid_walk_confirm, default off). The walk's
     first plane is searched wide, so that it can overrule a bad 2D frame. On
@@ -851,6 +872,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         'rotation_tiles', 'rotation_tile_min_snr', 'rotation_min_tiles',
         'rotation_min_planes', 'rotation_max_degrees',
         'rotation_max_spread_degrees', 'rotation_neighbor_substitution')
+
+    # rigid_source values (see the class docstring)
+    _RIGID_SOURCES = ('frame_and_walk', 'frame')
 
     def __init__(self, dataSet, parameters=None, analysisName=None):
         super().__init__(dataSet, parameters, analysisName)
@@ -1023,6 +1047,19 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         if not isinstance(self.parameters['rigid_walk_confirm'],
                           (bool, np.bool_)):
             raise ValueError('rigid_walk_confirm must be true or false')
+        # Where the rigid offset comes from (RIGID SOURCE in the class
+        # docstring). 'frame_and_walk' (the default, the behaviour before the
+        # option): the 2D fiducial frame, refined by the walk into the bead
+        # stack above. 'frame': the 2D fiducial frame alone; the walk options
+        # (rigid_plane_search, rigid_plane_step, rigid_snr_ratio,
+        # rigid_walk_bound, rigid_walk_confirm) are not used. It applies to
+        # every channel, rigid_only_channels included.
+        if 'rigid_source' not in self.parameters:
+            self.parameters['rigid_source'] = 'frame_and_walk'
+        if self.parameters['rigid_source'] not in self._RIGID_SOURCES:
+            raise ValueError('rigid_source must be one of %s, not %r'
+                             % (list(self._RIGID_SOURCES),
+                                self.parameters['rigid_source']))
         # ---- z sampled at each depth's own xy (see the class docstring) ----
         # The z samples are measured with the moving plane shifted by ONE xy,
         # the rigid offset, which is right only at the depth the rigid offset
@@ -1451,7 +1488,7 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 resolved.add(int(entry))
         return resolved
 
-    def _measure_rigid_offsets(self, fov: int, dataChannels=None):
+    def _measure_rigid_offsets(self, fov: int, dataChannels=None, walk=None):
         """Rigid xy per data channel, from the 2D fiducial frame or, if
         rigid_plane_search is on, from whichever early plane correlates best.
 
@@ -1459,6 +1496,10 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         channel). A channel with a measurement rotation set (rotation_task)
         is measured on frames turned back by it: its walk planes through
         _fiducial_plane, its 2D frame here.
+
+        walk: False measures the 2D frame only (no walk; the rigid_walk
+        record's branch reads 'frame'); None (the default) takes it from
+        rigid_source ('frame_and_walk' walks, 'frame' does not).
 
         The search is BOUNDED at rigid_search_bound about zero. An unbounded
         peak search on a dense self-similar bead field regularly locks onto a
@@ -1473,7 +1514,9 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
         _run_analysis as the rigid_walk table.
         """
         bound = self.parameters['rigid_search_bound']
-        search = int(self.parameters['rigid_plane_search'])
+        if walk is None:
+            walk = self.parameters['rigid_source'] == 'frame_and_walk'
+        search = int(self.parameters['rigid_plane_search']) if walk else 0
         step = max(1, int(self.parameters['rigid_plane_step']))
         ratio = float(self.parameters['rigid_snr_ratio'])
         walkBound = self.parameters['rigid_walk_bound']
@@ -1494,7 +1537,8 @@ class FiducialPolynomialWarp3D(FiducialCorrelationWarp):
                 fixed2D, moving2D, 0.0, 0.0, bound=bound)
             best = (dy, dx, snr, -1)
             record = {'fov': fov, 'dataChannel': int(dataChannel),
-                      'branch': '2d' if search else 'off',
+                      'branch': ('2d' if search else 'off') if walk
+                      else 'frame',
                       'y_2d': dy, 'x_2d': dx, 'snr_2d': snr,
                       'y_first': np.nan, 'x_first': np.nan,
                       'snr_first': np.nan, 'confirm_plane': -1,
@@ -2669,9 +2713,11 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
     round turns by the same angle, while the translation differs from fov to
     fov (the stage does not return to exactly the same position). This task
     therefore measures the angle in every fov, on one shallow plane of the
-    3D bead stack, and takes the median over the fovs as the round's angle.
-    FiducialPolynomialWarp3D then applies that one angle to every fov and
-    measures only translation and depth.
+    3D bead stack (measure_on 'stack_plane', the default) or on the 2D
+    fiducial frame (measure_on 'fiducial_frame', below), and takes the
+    median over the fovs as the round's angle. FiducialPolynomialWarp3D then
+    applies that one angle to every fov and measures only translation and
+    depth.
 
     Channels are grouped by fiducial bead stack, as FiducialPolynomialWarp3D
     groups them: the channels of one imaging round share a stack, and a
@@ -2685,7 +2731,8 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
          frames -- the 2D fiducial frame, refined by the walk into the bead
          stack (rigid_plane_search, rigid_plane_step, rigid_snr_ratio,
          rigid_search_bound, rigid_walk_bound), with rigid_walk_confirm's
-         false-peak guard if set.
+         false-peak guard if set. (measure_on 'fiducial_frame': the 2D
+         frame's own offset, no walk; see below.)
       2. depth match: plane measure_plane of the reference bead stack is
          compared with the moving stack's planes within +-z_search_range of
          the same index, each shifted by the coarse shift. The highest
@@ -2726,6 +2773,32 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
     +-z_search_range limit (z_reject_at_search_limit) -- every pass keeps at
     least rotation_min_tiles tiles, and |angle| is within
     rotation_max_degrees; otherwise `reason` says why.
+
+    measure_on 'fiducial_frame': everything runs on the 2D fiducial frames
+    (DataSet.get_fiducial_image: the data organization's fiducial frame of
+    channel 0 for the reference, of the group's owner_channel for the moving
+    round), filtered as the bead planes are, instead of on a bead-stack
+    plane. Such a frame is typically imaged at the coverslip, where the
+    beads sit on the glass, so the gel's swelling or shear between rounds
+    does not move them and there is no depth to match. The order is:
+
+      f1. surface rigid xy (step 1): the coarse shift is the 2D frame's own
+          offset, one bounded correlation (+-rigid_search_bound about zero)
+          of the two filtered 2D frames -- FiducialPolynomialWarp3D's 2D
+          answer, with no walk into the bead stack (the walk options are not
+          used; with rigid_walk_confirm on, the rigid_walk table reads
+          branch 'frame');
+      f2. rotation: steps 3-6 on the 2D frames, from that shift (step 2 is
+          skipped).
+
+    FiducialPolynomialWarp3D with rigid_source 'frame' then measures the
+    rigid xy again on the 2D frame turned back by the round angle and fits
+    the depth drift from it (its docstring, RIGID SOURCE). Without a depth
+    the gate is only aligned_score >= z_min_score (aligned_score now
+    compares the two 2D frames); the tile, residual-pass and angle
+    conditions are the same. In the tables plane_index is -1 and
+    plane_z_um, depth_offset_um and depth_score are NaN; depth_ok holds the
+    gate. measure_plane must be left unset.
 
     ACROSS FOVS, in finalize() (`merlin -t <task> --check-done`, once every
     fragment is done), per stack group:
@@ -2779,6 +2852,8 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         'minimum_overlap_pixels', 'plane_cache_size',
         'per_z_slice_num_threads')
 
+    _MEASURE_ON = ('stack_plane', 'fiducial_frame')
+
     _FRAGMENT_COLUMNS = [
         'fov', 'owner_channel', 'members', 'stack_label', 'plane_index',
         'plane_z_um', 'coarse_y', 'coarse_x', 'depth_offset_um',
@@ -2814,6 +2889,12 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         # samples z on.
         if 'measure_plane' not in self.parameters:
             self.parameters['measure_plane'] = None
+        # What the angle is measured on: 'stack_plane', plane measure_plane
+        # of the 3D bead stack after a depth match, or 'fiducial_frame', the
+        # 2D fiducial frame from its own rigid offset, with no walk and no
+        # depth match (see the class docstring).
+        if 'measure_on' not in self.parameters:
+            self.parameters['measure_on'] = 'stack_plane'
         # Residual passes of the tile fit (step 4); 0 = the first fit only.
         if 'refine_passes' not in self.parameters:
             self.parameters['refine_passes'] = 1
@@ -2839,6 +2920,14 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         if not isinstance(passes, (int, np.integer)) \
                 or isinstance(passes, bool) or passes < 0:
             raise ValueError('refine_passes must be an integer >= 0')
+        if self.parameters['measure_on'] not in self._MEASURE_ON:
+            raise ValueError('measure_on must be one of %s, not %r'
+                             % (list(self._MEASURE_ON),
+                                self.parameters['measure_on']))
+        if self.parameters['measure_on'] == 'fiducial_frame' \
+                and plane is not None:
+            raise ValueError("measure_plane is a bead-stack plane; it does "
+                             "not apply to measure_on 'fiducial_frame'")
 
         self._measurer = FiducialPolynomialWarp3D(
             dataSet, {name: self.parameters[name]
@@ -2994,10 +3083,20 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
                       scale_ppm=float(similaritySolution[3] * 1e6))
         return result
 
+    def _fiducial_frame(self, dataChannel: int, fov: int) -> np.ndarray:
+        """The channel's 2D fiducial frame (DataSet.get_fiducial_image),
+        filtered as the bead planes are (measure_on 'fiducial_frame')."""
+        return self._measurer._filter(self.dataSet.get_fiducial_image(
+            dataChannel, fov)).astype(np.float32)
+
     def _measure_stack(self, fov: int, members, coarseY: float,
-                       coarseX: float) -> dict:
-        """Steps 2-5 of the class docstring for one stack; returns its row
-        of first_plane_rotation."""
+                       coarseX: float, fixedFrame=None) -> dict:
+        """Steps 2-6 of the class docstring for one stack; returns its row
+        of first_plane_rotation. fixedFrame: the reference's filtered 2D
+        fiducial frame (measure_on 'fiducial_frame'; read here if None)."""
+        if self.parameters['measure_on'] == 'fiducial_frame':
+            return self._measure_frame(fov, members, coarseY, coarseX,
+                                       fixedFrame)
         measurer = self._measurer
         owner = members[0]
         zPositions = np.asarray(
@@ -3046,6 +3145,56 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         # 3. tile fit on the plane at the matched depth, coarse-shifted
         movingImage = measurer._fiducial_plane_at_z(
             owner, fov, zPositions[plane] + depthOffset)
+        fit, alignedScore = self._fit_rotation(
+            fixedImage, movingImage, coarseY, coarseX, row, reasons)
+        # FiducialPolynomialWarp3D's z sample gate, on the aligned planes
+        depthOk = bool(measurer._z_sample_gate(
+            np.array([depthOffset]), np.array([alignedScore]),
+            searchRange * spacing)[0])
+        row.update(aligned_score=float(alignedScore), depth_ok=depthOk)
+        if not depthOk and fit['ok']:
+            reasons.append('z gate failed (aligned score %.2f, depth offset '
+                           '%+.2f um)' % (alignedScore, depthOffset))
+        row.update(trusted=not reasons, reason='; '.join(reasons))
+        return row
+
+    def _measure_frame(self, fov: int, members, coarseY: float,
+                       coarseX: float, fixedFrame=None) -> dict:
+        """measure_on 'fiducial_frame': steps 3-6 of the class docstring on
+        the 2D fiducial frames, no depth match; returns the stack's row of
+        first_plane_rotation (plane_index -1; plane_z_um, depth_offset_um
+        and depth_score NaN)."""
+        owner = members[0]
+        row = dict.fromkeys(self._FRAGMENT_COLUMNS, np.nan)
+        row.update(fov=fov, owner_channel=owner,
+                   members=';'.join(str(c) for c in members),
+                   stack_label=self._stack_label(owner), plane_index=-1,
+                   coarse_y=float(coarseY), coarse_x=float(coarseX),
+                   trusted=False, reason='')
+        reasons = []
+        fixedImage = self._fiducial_frame(0, fov) if fixedFrame is None \
+            else fixedFrame
+        fit, alignedScore = self._fit_rotation(
+            fixedImage, self._fiducial_frame(owner, fov), coarseY, coarseX,
+            row, reasons)
+        # the z sample gate without a depth: aligned_score >= z_min_score
+        frameOk = bool(self._measurer._z_sample_gate(
+            np.array([0.0]), np.array([alignedScore]), 0.0)[0])
+        row.update(aligned_score=float(alignedScore), depth_ok=frameOk)
+        if not frameOk and fit['ok']:
+            reasons.append('aligned score %.2f below z_min_score %s'
+                           % (alignedScore, self.parameters['z_min_score']))
+        row.update(trusted=not reasons, reason='; '.join(reasons))
+        return row
+
+    def _fit_rotation(self, fixedImage: np.ndarray, movingImage: np.ndarray,
+                      coarseY: float, coarseX: float, row: dict,
+                      reasons: list):
+        """Steps 3-6 of the class docstring: the tile fit of movingImage
+        (coarse-shifted) against fixedImage, the residual passes and the
+        alignment check. Fills row's fit columns and appends to reasons;
+        returns (the first fit, aligned_score)."""
+        measurer = self._measurer
         fit = self._tile_fit(fixedImage, measurer._shift_image(
             movingImage, coarseY, coarseX))
         row.update(first_pass_radians=fit['theta'],
@@ -3088,16 +3237,7 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
                                % np.degrees(theta))
         row.update(n_tiles=final['n_tiles'], n_tiles_usable=final['n_usable'],
                    n_tiles_used=final['n_used'], residual_px=final['rms_px'])
-        # FiducialPolynomialWarp3D's z sample gate, on the aligned planes
-        depthOk = bool(measurer._z_sample_gate(
-            np.array([depthOffset]), np.array([alignedScore]),
-            searchRange * spacing)[0])
-        row.update(aligned_score=float(alignedScore), depth_ok=depthOk)
-        if not depthOk and fit['ok']:
-            reasons.append('z gate failed (aligned score %.2f, depth offset '
-                           '%+.2f um)' % (alignedScore, depthOffset))
-        row.update(trusted=not reasons, reason='; '.join(reasons))
-        return row
+        return fit, alignedScore
 
     def _run_analysis(self, fragmentIndex: int):
         fov = list(self.dataSet.get_fovs())[fragmentIndex]
@@ -3107,15 +3247,20 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
         items = [(key, members) for key, members
                  in self._stack_groups(fov).items() if key != referenceStack]
         owners = [members[0] for _, members in items]
+        onFrame = self.parameters['measure_on'] == 'fiducial_frame'
         try:
-            # 1. coarse shift of every non-reference stack (unrotated frames)
+            # 1. coarse shift of every non-reference stack (unrotated
+            # frames): the rigid offset with the walk, or on the 2D frame
+            # its own offset, no walk (f1 of the class docstring)
             coarse = dict(zip(owners, measurer._measure_rigid_offsets(
-                fov, dataChannels=owners)))
+                fov, dataChannels=owners, walk=not onFrame)))
             walkRecords = measurer._rigidWalkRecords.pop(fov, None)
+            fixedFrame = self._fiducial_frame(0, fov) if onFrame else None
 
             def solve(item):
                 _, members = item
-                return self._measure_stack(fov, members, *coarse[members[0]])
+                return self._measure_stack(fov, members, *coarse[members[0]],
+                                           fixedFrame=fixedFrame)
 
             threads = max(1, int(self.parameters['stack_num_threads']))
             if threads > 1 and len(items) > 1:
@@ -3129,14 +3274,20 @@ class FiducialRoundRotation(analysistask.ParallelAnalysisTask):
             measurer._fftCache.clear()
 
         for row in rows:
+            if onFrame:
+                where = ('2D fiducial frame (aligned %.2f)'
+                         % row['aligned_score'])
+            else:
+                where = 'depth %+.2f um (score %.2f, aligned %.2f)' % (
+                    row['depth_offset_um'], row['depth_score'],
+                    row['aligned_score'])
             print('fov %d stack %d (%s): angle %.4f deg (first pass %.4f), '
-                  'depth %+.2f um (score %.2f, aligned %.2f), %d/%d tiles, '
+                  '%s, %d/%d tiles, '
                   'residual %.3f px, scale %+.0f ppm%s'
                   % (fov, row['owner_channel'], row['stack_label'],
                      np.degrees(row['angle_radians']),
                      np.degrees(row['first_pass_radians']),
-                     row['depth_offset_um'], row['depth_score'],
-                     row['aligned_score'],
+                     where,
                      row['n_tiles_used'], row['n_tiles'], row['residual_px'],
                      row['scale_ppm'],
                      '' if row['trusted']

@@ -136,11 +136,29 @@ resampling. Without `rotation_task` nothing is turned and the tables have no
 rotation columns. A FOV whose bead field deforms with depth (stretch or shear
 of the gel) is not described by the round angle, which is the rigid part only.
 
-The angle is taken from the bead stack, not from the 2D coverglass frame: the
-frame is imaged at one depth only, and in late rounds its angle disagreed with
-the bead stack's, FOV by FOV and in the round median. Lida Cheng's
-`rotation_correction`, which fits one angle per FOV on the 2D frame, was the
-starting point.
+By default the angle is taken from the bead stack, not from the 2D coverglass
+frame: the frame is imaged at one depth only, and in late rounds its angle
+disagreed with the bead stack's, FOV by FOV and in the round median. Lida
+Cheng's `rotation_correction`, which fits one angle per FOV on the 2D frame,
+was the starting point. `measure_on` `fiducial_frame` measures the same tile
+fit on the 2D frame instead. There the beads lie on the coverglass, where
+swelling or shear of the gel between rounds cannot move them, there is no
+depth to match, and the frame often holds the most beads. The trust gate
+then has no depth to check and keeps only the alignment score. Which of the
+two follows the turn of the sample better can differ between datasets, so
+compare them on a dataset before relying on either.
+
+On the 2D frame the tile fit starts from the frame's own rigid offset, not
+from the registration's walk into the bead stack. The tiles search only a
+small window around the coarse shift, and the stack's offset a few microns
+deep can sit several pixels from the coverglass beads' offset, which would
+use up that window. The registration can then follow the same surface-first
+order (`rigid_source` `frame`): the surface shift and the angle from the
+round task, the surface shift measured again on the 2D frame turned back by
+the round angle, and the depth fit (z search, xy polynomial, `z_xy_refine`)
+from that shift. One reference, the coverglass beads, then sets both the
+shift and the angle, and everything below the surface is left to the depth
+fit, which searches its usual window around the surface shift at each depth.
 
 The angle is measured on one shallow plane, not through the whole stack.
 Angles fitted per stack through its whole depth scattered more than the turn
