@@ -374,6 +374,25 @@ smooth model with three coefficients instead of a histogram with thousands of
 bins, so it does not depend on bins being well populated. It needs no separate
 threshold task. `l2_regularization` and `max_iterations` control the fit.
 
+**Location-stratified filter (`location_strata_path`,
+`location_stratified`)**. The adaptive threshold fits one histogram over all
+barcodes, so a location where blank calls are more common than average passes
+at a threshold set mostly by the other locations, so the misidentification
+rate can sit above the target there and below it elsewhere. With
+`location_strata_path` the threshold task
+reads, for each barcode, a location code from a per-FOV label volume made from
+the segmentation (`merlin/util/locationstrata.py`: `codes[plane, row, col]` at
+`rint` of the barcode's z, y, x minus the volume's origin; outside the volume
+the sidecar's `outside_code`), and also builds one histogram per location with
+the same bins. `location_stratified` on the filter then fits each location's
+threshold on its own histogram, so the target holds in each location. A
+location with too few blank molecules for a stable fit
+(`location_min_blank_molecules`) keeps the pooled rule, i.e. exactly the
+unstratified filter there. For a deduplicated molecule z is its brightest
+detection's plane, so the location is read at the voxel a partition by plane
+would assign. The filter refuses to run if the volumes' sidecar changed since
+the threshold was fit.
+
 ## Molecule deduplication
 
 **`DeduplicateBarcodes`**. Decode works plane by plane, so a molecule in focus
@@ -446,6 +465,10 @@ kept equal by hand:
   `AdaptiveFilterBarcodes` take the `DeduplicateBarcodes` task as
   `decode_task`, with `remove_z_duplicated_barcodes` off in Decode and the
   filter.
+- Location strata: the volumes must be in the barcode table's frame (the
+  registration the segmentation was made on, full-frame x, y, and z = plane
+  index). The stratified filter and its threshold task read the same
+  directory; the sidecar digest recorded at the fit is checked when filtering.
 
 ## Example images
 

@@ -1,3 +1,4 @@
+import logging
 import os
 import time
 import numpy as np
@@ -9,6 +10,7 @@ from merlin.core import analysistask
 from merlin.analysis import decode
 from merlin.util import barcodefilters
 from merlin.util import imagesample
+from merlin.util import locationstrata
 
 
 def _extract_finite_threshold_candidates(blank_fraction_hist: np.ndarray,
@@ -146,6 +148,22 @@ def _threshold_from_cumulative_bins(blank_hist: np.ndarray,
         if (over_mag < under_mag) and within_tolerance:
             chosen_idx = over_idx
     return float(np.nextafter(ratios[chosen_idx], np.inf))
+
+
+def normalized_blank_fraction(blankHistogram: np.ndarray,
+                              codingHistogram: np.ndarray,
+                              blankBarcodeCount: int,
+                              codingBarcodeCount: int) -> np.ndarray:
+    """The normalized blank fraction of a pair of count histograms, operation
+    for operation as GenerateAdaptiveThreshold.get_blank_fraction_histogram
+    (a bin without coding barcodes gets finfo.max before the normalization)."""
+    with np.errstate(divide='ignore', invalid='ignore'):
+        blankFraction = blankHistogram / codingHistogram
+    blankFraction[codingHistogram == 0] = np.finfo(blankFraction.dtype).max
+    with np.errstate(over='ignore'):
+        blankFraction /= blankBarcodeCount/(
+                blankBarcodeCount + codingBarcodeCount)
+    return blankFraction
 
 
 def _threshold_from_newton(error_fn, tolerance: float) -> float:
@@ -396,6 +414,15 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         # arriving. The original loop had no sleep at all and burned a core.
         if 'poll_interval' not in self.parameters:
             self.parameters['poll_interval'] = 30
+        # Optional: a location strata directory (merlin.util.locationstrata).
+        # With it the task also builds one histogram per location, for
+        # AdaptiveFilterBarcodes location_stratified. Read with .get and
+        # never filled in, so a task without it saves the same parameters.
+        strataPath = self.parameters.get('location_strata_path')
+        if strataPath is not None and (not isinstance(strataPath, str)
+                                       or not os.path.isabs(strataPath)):
+            raise ValueError('location_strata_path must be an absolute '
+                             'directory path, not %r' % (strataPath,))
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -641,6 +668,301 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         np.add.at(counts, (iBin, dBin, aBin), 1)
         return counts
 
+    # Location strata (location_strata_path; merlin.util.locationstrata).
+    # The pooled histograms are built exactly as without them; the strata
+    # histograms (blank_counts_strata, coding_counts_strata: shape
+    # (strata,) + the pooled shape, the same bins) split the same barcodes by
+    # location, so pooled == strata.sum(0). The 'location_strata' result
+    # records the directory, its sidecar digest, the names and per-fov counts.
+
+    def has_location_strata(self) -> bool:
+        """True when this task builds location-strata histograms."""
+        return self.parameters.get('location_strata_path') is not None
+
+    def _location_strata_path(self) -> str:
+        if not self.has_location_strata():
+            raise ValueError('%s has no location_strata_path'
+                             % self.get_analysis_name())
+        return self.parameters['location_strata_path']
+
+    def get_location_strata_metadata(self) -> dict:
+        """The strata directory's sidecar, validated."""
+        return locationstrata.read_metadata(self._location_strata_path())
+
+    def get_location_strata_fit(self) -> dict:
+        """The saved 'location_strata' result: path, metadata_digest,
+        strata, outside_code, fovs, per-stratum totals and occupied bins,
+        per_fov counts."""
+        return self.dataSet.load_json_analysis_result('location_strata', self)
+
+    def get_blank_count_histogram_strata(self) -> np.ndarray:
+        return self.dataSet.load_numpy_analysis_result(
+            'blank_counts_strata', self)
+
+    def get_coding_count_histogram_strata(self) -> np.ndarray:
+        return self.dataSet.load_numpy_analysis_result(
+            'coding_counts_strata', self)
+
+    def get_location_strata(self, fov: int, barcodes: pandas.DataFrame,
+                            metadata: dict = None) -> np.ndarray:
+        """uint8 stratum code of each row of barcodes (columns x, y, z)."""
+        return locationstrata.strata_of_barcodes(
+            barcodes, self._location_strata_path(), fov, metadata)
+
+    def check_location_strata_unchanged(self) -> dict:
+        """The fit record, after checking that the strata directory and its
+        sidecar are the ones the histograms were built from."""
+        path = self._location_strata_path()
+        fit = self.get_location_strata_fit()
+        digest = locationstrata.metadata_digest(path)
+        if fit['path'] != path or fit['metadata_digest'] != digest:
+            raise RuntimeError(
+                '%s: its strata histograms were built from %s (sidecar sha256 '
+                '%s), but %s now has sidecar sha256 %s; fit and filter must '
+                'use the same strata' % (self.get_analysis_name(), fit['path'],
+                                         fit['metadata_digest'], path, digest))
+        return fit
+
+    def _codeword_counts(self):
+        """(blank, coding) codeword counts of the decode task's codebook."""
+        codebook = self.dataSet.load_analysis_task(
+            self.parameters['decode_task']).get_codebook()
+        return (len(codebook.get_blank_indexes()),
+                len(codebook.get_coding_indexes()))
+
+    def barcode_bin_indexes(self, barcodeSet: pandas.DataFrame) -> np.ndarray:
+        """Flat histogram bin of each barcode, binned exactly as
+        extract_barcodes_with_threshold bins it."""
+        selectData = barcodeSet[
+            ['mean_intensity', 'min_distance', 'area']].values
+        intensityTransform = _get_intensity_transform_method(self.parameters)
+        selectData[:, 0] = _transform_intensity_values(
+            selectData[:, 0], intensityTransform)
+        shape = self.get_blank_count_histogram().shape
+
+        barcodeBins = np.array(
+            (np.digitize(selectData[:, 0], self.get_intensity_bins(),
+                         right=True),
+             np.digitize(selectData[:, 1], self.get_distance_bins(),
+                         right=True),
+             np.digitize(selectData[:, 2], self.get_area_bins()))) - 1
+        barcodeBins[0, :] = np.clip(barcodeBins[0, :], 0, shape[0]-1)
+        barcodeBins[1, :] = np.clip(barcodeBins[1, :], 0, shape[1]-1)
+        barcodeBins[2, :] = np.clip(barcodeBins[2, :], 0, shape[2]-1)
+        return np.ravel_multi_index(barcodeBins[:, :], shape)
+
+    def stratum_rules(self, targetMisidentificationRate: float,
+                      minBlankMolecules: int):
+        """(report, keep): the threshold of each stratum, and keep, a bool
+        array [stratum, flat bin] (True = a barcode of that stratum in that
+        bin passes).
+
+        A stratum is fit on its own histogram ('own') with the pooled
+        solver (cumulative_bins, this task's overshoot settings) when it has
+        coding molecules, at least minBlankMolecules blank molecules and a
+        finite threshold. Otherwise it takes the pooled rule ('pooled': the
+        pooled blank fraction below the pooled threshold, exactly the
+        unstratified filter) and the reason is recorded:
+        no_coding_molecules, blank_molecules_below_min or
+        non_finite_threshold. fit_misid is the stratum's misidentification
+        rate in the fit histograms under the rule it gets.
+        """
+        solverMethod = self.parameters.get('threshold_solver_method', 'newton')
+        if solverMethod != 'cumulative_bins':
+            raise ValueError(
+                'location strata need threshold_solver_method '
+                "'cumulative_bins'; %s has %r"
+                % (self.get_analysis_name(), solverMethod))
+        fit = self.check_location_strata_unchanged()
+        blankBarcodeCount, codingBarcodeCount = self._codeword_counts()
+
+        pooledThreshold = self.calculate_threshold_for_misidentification_rate(
+            targetMisidentificationRate)
+        if not np.isfinite(pooledThreshold):
+            raise RuntimeError('Adaptive threshold is non-finite. '
+                               'Check threshold histograms and codebook '
+                               'blank/coding assignments.')
+        blankPooled = self.get_blank_count_histogram()
+        codingPooled = self.get_coding_count_histogram()
+        pooledKeep = (self.get_blank_fraction_histogram()
+                      < pooledThreshold).ravel()
+        blankStrata = self.get_blank_count_histogram_strata()
+        codingStrata = self.get_coding_count_histogram_strata()
+        names = list(fit['strata'])
+        expected = (len(names),) + blankPooled.shape
+        if blankStrata.shape != expected or codingStrata.shape != expected:
+            raise RuntimeError('%s: strata histograms %s / %s, expected %s'
+                               % (self.get_analysis_name(), blankStrata.shape,
+                                  codingStrata.shape, expected))
+
+        def kept(keep, blank, coding):
+            keptBlank = int(blank.ravel()[keep].sum())
+            keptCoding = int(coding.ravel()[keep].sum())
+            misid = None if keptCoding == 0 else float(
+                (keptBlank / blankBarcodeCount)
+                / (keptCoding / codingBarcodeCount))
+            return {'fit_kept_blank': keptBlank,
+                    'fit_kept_coding': keptCoding, 'fit_misid': misid}
+
+        report = {
+            'threshold_task': self.get_analysis_name(),
+            'target_misidentification_rate': float(
+                targetMisidentificationRate),
+            'location_min_blank_molecules': int(minBlankMolecules),
+            'location_strata_path': fit['path'],
+            'metadata_digest': fit['metadata_digest'],
+            'blank_codewords': int(blankBarcodeCount),
+            'coding_codewords': int(codingBarcodeCount),
+            'pooled': dict({
+                'threshold': float(pooledThreshold),
+                'bins_kept': int(pooledKeep.sum()),
+                'fit_blank_molecules': int(blankPooled.sum()),
+                'fit_coding_molecules': int(codingPooled.sum())},
+                **kept(pooledKeep, blankPooled, codingPooled)),
+            'strata': []}
+        keepTable = np.zeros((len(names), pooledKeep.size), dtype=bool)
+        for code, name in enumerate(names):
+            blank, coding = blankStrata[code], codingStrata[code]
+            fitBlank, fitCoding = float(blank.sum()), float(coding.sum())
+            reason, threshold = None, np.nan
+            if not fitCoding > 0:
+                reason = 'no_coding_molecules'
+            elif fitBlank < minBlankMolecules:
+                reason = 'blank_molecules_below_min'
+            else:
+                blankFraction = normalized_blank_fraction(
+                    blank, coding, blankBarcodeCount, codingBarcodeCount)
+                threshold = _threshold_from_cumulative_bins(
+                    blank, coding, blankFraction,
+                    targetMisidentificationRate,
+                    blankBarcodeCount, codingBarcodeCount,
+                    overshoot_toward_target=self.parameters.get(
+                        'overshoot_toward_target', False),
+                    overshoot_tolerance=self.parameters.get(
+                        'overshoot_tolerance', 0.20))
+                if not np.isfinite(threshold):
+                    reason = 'non_finite_threshold'
+            if reason is None:
+                source = 'own'
+                keepTable[code] = (blankFraction < threshold).ravel()
+            else:
+                source, threshold = 'pooled', pooledThreshold
+                keepTable[code] = pooledKeep
+            report['strata'].append(dict({
+                'code': int(code), 'name': name, 'source': source,
+                'reason': reason, 'threshold': float(threshold),
+                'bins_kept': int(keepTable[code].sum()),
+                'fit_blank_molecules': int(fitBlank),
+                'fit_coding_molecules': int(fitCoding)},
+                **kept(keepTable[code], blank, coding)))
+        return report, keepTable
+
+    def calculate_stratum_thresholds(self, targetMisidentificationRate: float,
+                                     minBlankMolecules: int) -> dict:
+        """The report of stratum_rules: target, pooled threshold and fit,
+        and per stratum code, name, source, reason, threshold, bins_kept,
+        fit molecules, fit kept molecules and fit_misid."""
+        return self.stratum_rules(targetMisidentificationRate,
+                                  minBlankMolecules)[0]
+
+    def _open_location_strata(self, blankCounts, codingCounts,
+                              completeFragments) -> dict:
+        """The strata state to build on: the saved strata histograms if this
+        task has histograms already (they must be from the same run, the
+        same directory and sidecar, and sum to the pooled ones), else none
+        yet."""
+        name = self.get_analysis_name()
+        path = self._location_strata_path()
+        metadata = locationstrata.read_metadata(path)
+        digest = locationstrata.metadata_digest(path)
+        names = list(metadata['strata'])
+        blankStrata = self.dataSet.load_numpy_analysis_result_if_available(
+            'blank_counts_strata', self, None)
+        codingStrata = self.dataSet.load_numpy_analysis_result_if_available(
+            'coding_counts_strata', self, None)
+        try:
+            fit = self.get_location_strata_fit()
+        except FileNotFoundError:
+            fit = None
+        pooled = [blankCounts is not None, codingCounts is not None]
+        saved = [blankStrata is not None, codingStrata is not None,
+                 fit is not None]
+        perFov = {}
+        if any(pooled) or any(saved):
+            problem = None
+            if not (all(pooled) and all(saved)):
+                problem = ('pooled histograms %s, strata histograms %s'
+                           % ('saved' if any(pooled) else 'missing',
+                              'saved' if all(saved) else
+                              'partly saved' if any(saved) else 'missing'))
+            elif fit['path'] != path or fit['metadata_digest'] != digest:
+                problem = ('strata built from %s (sidecar sha256 %s), now %s '
+                           '(%s)' % (fit['path'], fit['metadata_digest'],
+                                     path, digest))
+            elif (fit['strata'] != names
+                  or blankStrata.shape != (len(names),) + blankCounts.shape
+                  or codingStrata.shape != (len(names),) + codingCounts.shape):
+                problem = 'strata names or histogram shapes differ'
+            elif not (np.array_equal(blankStrata.sum(axis=0), blankCounts)
+                      and np.array_equal(codingStrata.sum(axis=0),
+                                         codingCounts)):
+                problem = 'pooled histograms != sum of the strata histograms'
+            elif sorted(int(f) for f in fit['per_fov']) != sorted(
+                    i for i, done in enumerate(completeFragments) if done):
+                problem = 'strata fovs != completed fovs'
+            if problem is not None:
+                raise RuntimeError(
+                    '%s: saved histograms cannot be resumed with location '
+                    'strata (%s); clear this task\'s results and rerun it'
+                    % (name, problem))
+            perFov = {str(f): v for f, v in fit['per_fov'].items()}
+        print('%s: location strata %s from %s' % (name, names, path),
+              flush=True)
+        return {'path': path, 'metadata': metadata, 'digest': digest,
+                'names': names, 'blank': blankStrata, 'coding': codingStrata,
+                'per_fov': perFov}
+
+    def _add_location_strata_counts(self, strata, fov, barcodes, codebook,
+                                    intensityBins, distanceBins, areaBins):
+        codes = self.get_location_strata(fov, barcodes, strata['metadata'])
+        isBlank = barcodes['barcode_id'].isin(
+            codebook.get_blank_indexes()).to_numpy()
+        isCoding = barcodes['barcode_id'].isin(
+            codebook.get_coding_indexes()).to_numpy()
+        counts = {'blank': [], 'coding': []}
+        for code in range(len(strata['names'])):
+            inStratum = codes == code
+            for kind, mask in (('blank', isBlank), ('coding', isCoding)):
+                rows = barcodes[mask & inStratum]
+                strata[kind][code] += self._extract_counts(
+                    rows, intensityBins, distanceBins, areaBins)
+                counts[kind].append(int(len(rows)))
+        strata['per_fov'][str(int(fov))] = counts
+
+    def _save_location_strata(self, strata) -> None:
+        self.dataSet.save_numpy_analysis_result(
+            strata['blank'], 'blank_counts_strata', self)
+        self.dataSet.save_numpy_analysis_result(
+            strata['coding'], 'coding_counts_strata', self)
+        count = len(strata['names'])
+        blank = strata['blank'].reshape(count, -1)
+        coding = strata['coding'].reshape(count, -1)
+        fovs = sorted(int(f) for f in strata['per_fov'])
+        self.dataSet.save_json_analysis_result({
+            'path': strata['path'],
+            'metadata_digest': strata['digest'],
+            'strata': strata['names'],
+            'outside_code': int(strata['metadata']['outside_code']),
+            'fovs': fovs,
+            'blank_molecules': [int(v) for v in blank.sum(axis=1)],
+            'coding_molecules': [int(v) for v in coding.sum(axis=1)],
+            'blank_occupied_bins': [int(v) for v in
+                                    np.count_nonzero(blank, axis=1)],
+            'coding_occupied_bins': [int(v) for v in
+                                     np.count_nonzero(coding, axis=1)],
+            'per_fov': {str(f): strata['per_fov'][str(f)] for f in fovs}},
+            'location_strata', self)
+
     def _run_analysis(self):
         decodeTask = self.dataSet.load_analysis_task(
             self.parameters['decode_task'])
@@ -675,6 +997,10 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
             'blank_counts', self, None)
         codingCounts = self.dataSet.load_numpy_analysis_result_if_available(
             'coding_counts', self, None)
+        strata = None
+        if self.has_location_strata():
+            strata = self._open_location_strata(
+                blankCounts, codingCounts, completeFragments)
 
         self.dataSet.save_numpy_analysis_result(
             areaBins, 'area_bins', self)
@@ -685,7 +1011,8 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
         updated = False
         while not all(completeFragments[i] for i in selectedFragments):
             if (intensityBins is None or distanceBins is None or
-                    blankCounts is None or codingCounts is None):
+                    blankCounts is None or codingCounts is None or
+                    (strata is not None and strata['blank'] is None)):
                 for i in selectedFragments:
                     if not pendingFragments[i] and decodeTask.is_complete(i):
                         pendingFragments[i] = decodeTask.is_complete(i)
@@ -722,6 +1049,12 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                     codingCounts = np.zeros((len(intensityBins)-1,
                                             len(distanceBins)-1,
                                             len(areaBins)-1))
+                    if strata is not None:
+                        strataShape = (len(strata['names']),) \
+                            + blankCounts.shape
+                        strata['blank'] = np.zeros(strataShape)
+                        strata['coding'] = np.zeros(strataShape)
+                        strata['per_fov'] = {}
 
             else:
                 progressed = False
@@ -730,7 +1063,8 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                         progressed = True
                         barcodes = barcodeDB.get_barcodes(
                             i, columnList=['barcode_id', 'mean_intensity',
-                                           'min_distance', 'area'])
+                                           'min_distance', 'area'] + (
+                                [] if strata is None else ['x', 'y', 'z']))
                         blankCounts += self._extract_counts(
                             barcodes[barcodes['barcode_id'].isin(
                                 codebook.get_blank_indexes())],
@@ -739,6 +1073,10 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                             barcodes[barcodes['barcode_id'].isin(
                                 codebook.get_coding_indexes())],
                             intensityBins, distanceBins, areaBins)
+                        if strata is not None:
+                            self._add_location_strata_counts(
+                                strata, i, barcodes, codebook,
+                                intensityBins, distanceBins, areaBins)
                         updated = True
                         completeFragments[i] = True
 
@@ -749,6 +1087,8 @@ class GenerateAdaptiveThreshold(analysistask.AnalysisTask):
                         blankCounts, 'blank_counts', self)
                     self.dataSet.save_numpy_analysis_result(
                         codingCounts, 'coding_counts', self)
+                    if strata is not None:
+                        self._save_location_strata(strata)
                 if not progressed:
                     time.sleep(self.parameters['poll_interval'])
 
@@ -796,6 +1136,23 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
                 self.dataSet, self.parameters['write_images_seed'])
             self.parameters.setdefault('write_filtered_fovs', fovs)
             self.parameters.setdefault('write_filtered_z', zIndexes)
+
+        # Location-stratified threshold (select_barcodes). Read with .get:
+        # absent (or false) nothing is filled in, so a pooled filter saves
+        # the same parameters as before.
+        stratified = self.parameters.get('location_stratified', False)
+        if stratified not in (True, False):
+            raise ValueError('location_stratified must be true or false')
+        if stratified:
+            self.parameters.setdefault('location_min_blank_molecules', 50000)
+            minBlank = self.parameters['location_min_blank_molecules']
+            if isinstance(minBlank, bool) or not isinstance(
+                    minBlank, (int, np.integer)) or minBlank < 0:
+                raise ValueError('location_min_blank_molecules must be an '
+                                 'integer >= 0, not %r' % (minBlank,))
+        elif 'location_min_blank_molecules' in self.parameters:
+            raise ValueError('location_min_blank_molecules is only read with '
+                             'location_stratified: true')
 
     def fragment_count(self):
         return len(self.dataSet.get_fovs())
@@ -860,6 +1217,8 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
                 'filtered image for fov %s not written: %r', fragmentIndex, e)
 
     def get_estimated_memory(self):
+        if self.parameters.get('location_stratified', False):
+            return 4000         # holds one fov's strata volume
         return 1000
 
     def get_estimated_time(self):
@@ -879,6 +1238,8 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
             self.parameters['adaptive_task'])
 
     def _run_analysis(self, fragmentIndex):
+        if self.parameters.get('location_stratified', False):
+            return self._run_stratified(fragmentIndex)
         adaptiveTask = self.dataSet.load_analysis_task(
             self.parameters['adaptive_task'])
         decodeTask = self.dataSet.load_analysis_task(
@@ -908,7 +1269,122 @@ class AdaptiveFilterBarcodes(AbstractFilterBarcodes):
         bcDatabase.write_barcodes(currentBarcodes, fov=fragmentIndex)
         self._write_filtered_images_if_requested(fragmentIndex, currentBarcodes)
 
+    def select_barcodes(self, fragmentIndex: int, barcodes: pandas.DataFrame):
+        """(kept, summary) under the location-stratified threshold. Nothing
+        is written.
 
+        Each barcode is binned as the pooled filter bins it
+        (barcode_bin_indexes) and gets the stratum of its x, y, z in the
+        threshold task's strata. It is kept when its bin passes its
+        stratum's rule (GenerateAdaptiveThreshold.stratum_rules at this
+        task's misidentification_rate and location_min_blank_molecules):
+        the stratum's own blank fraction below its own threshold, or for a
+        'pooled' stratum the pooled rule of the unstratified filter. kept
+        holds the passing rows in their input order plus the uint8 column
+        location_stratum; summary holds this fov's barcodes in and kept per
+        stratum (coding, blank, total) and the threshold report.
+        """
+        adaptiveTask = self.get_adaptive_thresholds()
+        if not getattr(adaptiveTask, 'has_location_strata', lambda: False)():
+            raise ValueError(
+                '%s: location_stratified needs a threshold task with '
+                'location strata; set location_strata_path on %s'
+                % (self.get_analysis_name(), self.parameters['adaptive_task']))
+        report, keepTable = adaptiveTask.stratum_rules(
+            self.parameters['misidentification_rate'],
+            self.parameters['location_min_blank_molecules'])
+        codes = adaptiveTask.get_location_strata(
+            fragmentIndex, barcodes, adaptiveTask.get_location_strata_metadata())
+        if len(barcodes):
+            keep = keepTable[codes.astype(np.intp),
+                             adaptiveTask.barcode_bin_indexes(barcodes)]
+        else:
+            keep = np.zeros(0, dtype=bool)
+        kept = barcodes[keep].copy()
+        kept['location_stratum'] = codes[keep].astype(np.uint8)
+
+        codebook = self.get_codebook()
+        isBlank = barcodes['barcode_id'].isin(
+            codebook.get_blank_indexes()).to_numpy()
+        isCoding = barcodes['barcode_id'].isin(
+            codebook.get_coding_indexes()).to_numpy()
+        perStratum = []
+        for rule in report['strata']:
+            inStratum = codes == rule['code']
+            keptStratum = inStratum & keep
+            perStratum.append({
+                'code': rule['code'], 'name': rule['name'],
+                'source': rule['source'], 'reason': rule['reason'],
+                'threshold': rule['threshold'],
+                'in_coding': int((inStratum & isCoding).sum()),
+                'in_blank': int((inStratum & isBlank).sum()),
+                'in_total': int(inStratum.sum()),
+                'kept_coding': int((keptStratum & isCoding).sum()),
+                'kept_blank': int((keptStratum & isBlank).sum()),
+                'kept_total': int(keptStratum.sum())})
+        summary = {
+            'fov': int(fragmentIndex),
+            'filter_task': self.get_analysis_name(),
+            'adaptive_task': self.parameters['adaptive_task'],
+            'decode_task': self.parameters['decode_task'],
+            'misidentification_rate': float(
+                self.parameters['misidentification_rate']),
+            'location_min_blank_molecules': int(
+                self.parameters['location_min_blank_molecules']),
+            'rows_in': int(len(barcodes)),
+            'rows_selected': int(keep.sum()),
+            'strata': perStratum,
+            'thresholds': report}
+        return kept, summary
+
+    def _run_stratified(self, fragmentIndex):
+        decodeTask = self.dataSet.load_analysis_task(
+            self.parameters['decode_task'])
+        currentBarcodes = decodeTask.get_barcode_database()\
+            .get_barcodes(fragmentIndex)
+        currentBarcodes, summary = self.select_barcodes(
+            fragmentIndex, currentBarcodes)
+        self._log_location_strata(summary)
+
+        if self.parameters['remove_z_duplicated_barcodes']:
+            currentBarcodes = self._remove_z_duplicate_barcodes(currentBarcodes)
+
+        self.get_barcode_database().write_barcodes(currentBarcodes,
+                                                   fov=fragmentIndex)
+        self._write_filtered_images_if_requested(fragmentIndex, currentBarcodes)
+        summary['rows_out'] = int(len(currentBarcodes))
+        self.dataSet.save_json_analysis_result(
+            summary, 'location_filter_summary', self,
+            resultIndex=fragmentIndex)
+
+    def get_location_filter_summary(self, fov: int) -> dict:
+        """The 'location_filter_summary' a stratified run saved for fov."""
+        return self.dataSet.load_json_analysis_result(
+            'location_filter_summary', self, resultIndex=fov)
+
+    def _log_location_strata(self, summary) -> None:
+        """One line per stratum; a pooled fallback is also a warning in the
+        fragment's log (the logger ParallelAnalysisTask.run set up)."""
+        rules = {r['code']: r for r in summary['thresholds']['strata']}
+        for counts in summary['strata']:
+            rule = rules[counts['code']]
+            misid = rule['fit_misid']
+            line = ('%s fov %d: %s (%d) threshold %.6g (%s; fit %d blank / %d '
+                    'coding, est. misID %s): kept %d coding + %d blank of '
+                    '%d + %d' % (
+                        self.get_analysis_name(), summary['fov'],
+                        counts['name'], counts['code'], rule['threshold'],
+                        'own' if rule['source'] == 'own'
+                        else 'pooled: ' + rule['reason'],
+                        rule['fit_blank_molecules'],
+                        rule['fit_coding_molecules'],
+                        'n/a' if misid is None else '%.4f' % misid,
+                        counts['kept_coding'], counts['kept_blank'],
+                        counts['in_coding'], counts['in_blank']))
+            print(line, flush=True)
+            if rule['source'] != 'own':
+                logging.getLogger('%s.%d' % (self.get_analysis_name(),
+                                             summary['fov'])).warning(line)
 
     # lets expose this filtering here, it feels more natural than in decode
     # I don't want to waste time filtering during the decode step with gpu nodes
@@ -1430,6 +1906,9 @@ class AdaptiveFilterBarcodesLocal(AdaptiveFilterBarcodes):
 
         if 'misidentification_rate' not in self.parameters:
             self.parameters['misidentification_rate'] = 0.05
+        if self.parameters.get('location_stratified', False):
+            raise ValueError('AdaptiveFilterBarcodesLocal does not support '
+                             'location_stratified')
 
     def get_adaptive_thresholds(self):
         """ Get the adaptive thresholds used for filtering barcodes.
@@ -1462,3 +1941,57 @@ class AdaptiveFilterBarcodesLocal(AdaptiveFilterBarcodes):
             threshold, currentBarcodes, fragmentIndex)
         bcDatabase.write_barcodes(currentBarcodes, fov=fragmentIndex)
         self._write_filtered_images_if_requested(fragmentIndex, currentBarcodes)
+
+
+def location_filter_report(dataSet, filterTaskName: str,
+                           fovs=None) -> pandas.DataFrame:
+    """Per stratum and overall ('all'), summed over fovs (default: every fov
+    of the dataset): barcodes in and kept (coding, blank), the applied
+    misidentification rate of the kept barcodes, and the fit-level estimate
+    (fit_misid) of the threshold task, from the location_filter_summary
+    results of a location-stratified AdaptiveFilterBarcodes. Every fov's
+    summary must exist and carry the same thresholds."""
+    filterTask = dataSet.load_analysis_task(filterTaskName)
+    fovs = list(dataSet.get_fovs()) if fovs is None else [int(f) for f in fovs]
+    summaries = [filterTask.get_location_filter_summary(f) for f in fovs]
+    if not summaries:
+        raise ValueError('no fovs given')
+    thresholds = summaries[0]['thresholds']
+    for s in summaries[1:]:
+        if s['thresholds'] != thresholds:
+            raise RuntimeError('%s: fov %d was filtered with other thresholds '
+                               'than fov %d' % (filterTaskName, s['fov'],
+                                                summaries[0]['fov']))
+    blankWords = thresholds['blank_codewords']
+    codingWords = thresholds['coding_codewords']
+
+    def misid(blank, coding):
+        return np.nan if coding == 0 else \
+            (blank / blankWords) / (coding / codingWords)
+
+    columns = ('in_coding', 'in_blank', 'kept_coding', 'kept_blank')
+    rows = []
+    for rule in thresholds['strata']:
+        row = {'code': rule['code'], 'name': rule['name'],
+               'source': rule['source'], 'reason': rule['reason'],
+               'threshold': rule['threshold']}
+        for c in columns:
+            row[c] = int(sum(next(x for x in s['strata']
+                                  if x['code'] == rule['code'])[c]
+                             for s in summaries))
+        row['misid'] = misid(row['kept_blank'], row['kept_coding'])
+        row['fit_misid'] = np.nan if rule['fit_misid'] is None \
+            else rule['fit_misid']
+        rows.append(row)
+    total = {'code': -1, 'name': 'all', 'source': '', 'reason': None,
+             'threshold': np.nan}
+    for c in columns:
+        total[c] = int(sum(r[c] for r in rows))
+    total['misid'] = misid(total['kept_blank'], total['kept_coding'])
+    total['fit_misid'] = misid(
+        sum(r['fit_kept_blank'] for r in thresholds['strata']),
+        sum(r['fit_kept_coding'] for r in thresholds['strata']))
+    rows.append(total)
+    report = pandas.DataFrame(rows)
+    report['n_fovs'] = len(fovs)
+    return report

@@ -133,6 +133,21 @@ Opt-in tasks; nothing changes unless an analysis lists them
   decoding distance, and area.
 - `l2_regularization`: Controls regularization strength for the logistic filter.
 - `max_iterations`: Limits logistic-model optimization iterations.
+- `location_strata_path` (`GenerateAdaptiveThreshold` and
+  `GenerateMoleculeAdaptiveThreshold`, unset by default): A directory of
+  per-FOV location label volumes (`merlin/util/locationstrata.py`, new). The
+  task also builds one blank / coding histogram per location (same bins; the
+  pooled histograms are unchanged and equal their sum) and records the
+  directory's sidecar digest.
+- `location_stratified`, `location_min_blank_molecules`
+  (`AdaptiveFilterBarcodes`, off by default; minimum 50000): One threshold per
+  location at `misidentification_rate`, each from that location's own
+  histogram with the same solver (`cumulative_bins` only); a location with
+  fewer fit blanks than the minimum, or without coding molecules, keeps the
+  pooled rule. The filter writes a `location_stratum` column (uint8) and a
+  per-FOV `location_filter_summary`; `location_filter_report` sums them. With
+  the options unset, task.json and every output are unchanged. Example:
+  `docs/analysis/location_filter.json`.
 
 ### Molecule deduplication (`merlin/analysis/deduplicate.py`)
 

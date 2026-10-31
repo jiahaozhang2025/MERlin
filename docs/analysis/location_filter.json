@@ -1,0 +1,37 @@
+{
+  "_comment": [
+    "Location-stratified adaptive filter, added to a full analysis. Decode is the",
+    "base analysis's task; a DeduplicateBarcodes task can stand in for it (use",
+    "GenerateMoleculeAdaptiveThreshold). LocationThreshold and LocationFilter list",
+    "only what the filter needs: copy any other parameters from the base threshold",
+    "and filter, so the location rule is compared to the pooled one on equal terms.",
+    "location_strata_path must be an absolute path to a strata directory made",
+    "from the segmentation. Point downstream tasks (partition, exports) at",
+    "LocationFilter. See location_filter.md."
+  ],
+  "analysis_tasks": [
+    {
+      "task": "GenerateAdaptiveThreshold",
+      "module": "merlin.analysis.filterbarcodes",
+      "analysis_name": "LocationThreshold",
+      "parameters": {
+        "decode_task": "Decode",
+        "run_after_task": "Decode",
+        "threshold_solver_method": "cumulative_bins",
+        "location_strata_path": "/absolute/path/location_strata"
+      }
+    },
+    {
+      "task": "AdaptiveFilterBarcodes",
+      "module": "merlin.analysis.filterbarcodes",
+      "analysis_name": "LocationFilter",
+      "parameters": {
+        "decode_task": "Decode",
+        "adaptive_task": "LocationThreshold",
+        "misidentification_rate": 0.05,
+        "location_stratified": true,
+        "location_min_blank_molecules": 50000
+      }
+    }
+  ]
+}
